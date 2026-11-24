@@ -251,13 +251,58 @@ def find_hunyuan_foley(
     }
 
 
-def _detect_vram_gb() -> float:
+def _resolve_torch_device() -> tuple[str, str]:
+    """config.get_torch_device() または torch バックエンドから (device, label) を返す。"""
+    try:
+        from app import config as ciness_config
+
+        fn = getattr(ciness_config, "get_torch_device", None)
+        if callable(fn):
+            res = fn()
+            if isinstance(res, tuple) and len(res) >= 2:
+                return str(res[0]), str(res[1])
+            if isinstance(res, str) and res:
+                return res, res.upper()
+    except Exception:
+        pass
     try:
         import torch
 
         if torch.cuda.is_available():
-            _, total = torch.cuda.mem_get_info(0)
-            return round(total / (1024 ** 3), 2)
+            return "cuda", "NVIDIA CUDA"
+        mps_backend = getattr(torch.backends, "mps", None)
+        if mps_backend is not None and mps_backend.is_available():
+            return "mps", "Apple Silicon MPS"
+    except Exception:
+        pass
+    return "cpu", "CPU"
+
+
+def _detect_vram_gb() -> float:
+    """利用可能メモリ容量 (CUDA VRAM または Apple Silicon ユニファイドメモリ GB) を返す。"""
+    device, _ = _resolve_torch_device()
+    try:
+        if device == "cuda":
+            import torch
+
+            if torch.cuda.is_available():
+                _, total = torch.cuda.mem_get_info(0)
+                return round(total / (1024 ** 3), 2)
+        elif device == "mps":
+            proc = subprocess.run(
+                ["sysctl", "-n", "hw.memsize"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if proc.returncode == 0 and proc.stdout.strip().isdigit():
+                return round(int(proc.stdout.strip()) / (1024 ** 3), 2)
+            try:
+                import psutil
+
+                return round(psutil.virtual_memory().total / (1024 ** 3), 2)
+            except Exception:
+                return 16.0
     except Exception:
         pass
     return 0.0
@@ -275,24 +320,52 @@ def _run_hunyuan_foley_inference(
     log_cb: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     """公式 HunyuanVideo-Foley をローカル推論（チャンク＋1秒クロスフェード対応）で実行する。"""
+    device, device_label = _resolve_torch_device()
     vram_gb = _detect_vram_gb()
     variants = info["variants"]
-    if quality != "fast" and variants.get("XXL") and (vram_gb >= 14.0 or not variants.get("XL")):
-        variant = "XXL"
-        model_dir = variants["XXL"]
-        enable_offload = vram_gb < 20.0
-    elif variants.get("XL"):
-        variant = "XL"
-        model_dir = variants["XL"]
-        enable_offload = vram_gb < 14.0
-    else:
-        variant = "XXL"
-        model_dir = variants["XXL"]
+
+    if device == "mps":
+        # Apple Silicon (MPS) 環境ではフォールバック許可＆ユニファイドメモリに応じた安全な軽量選択
+        if variants.get("XL") and (quality == "fast" or vram_gb < 24.0):
+            variant = "XL"
+            model_dir = variants["XL"]
+        elif variants.get("XXL"):
+            variant = "XXL"
+            model_dir = variants["XXL"]
+        else:
+            variant = "XL"
+            model_dir = variants["XL"]
+        enable_offload = vram_gb < 32.0
+        _emit_log(
+            log_cb,
+            f"{device_label} (ユニファイドメモリ約 {vram_gb:.1f}GB) 向けに PYTORCH_ENABLE_MPS_FALLBACK=1・"
+            f"offload={enable_offload} で Foley ({variant}) を実行します。",
+        )
+    elif device == "cpu":
+        variant = "XL" if variants.get("XL") else "XXL"
+        model_dir = variants[variant]
         enable_offload = True
+        _emit_log(
+            log_cb,
+            f"GPU/MPS 非検出のため CPU モード (offload={enable_offload}) で Foley ({variant}) を実行します（長尺時は時間がかかります）。",
+        )
+    else:
+        if quality != "fast" and variants.get("XXL") and (vram_gb >= 14.0 or not variants.get("XL")):
+            variant = "XXL"
+            model_dir = variants["XXL"]
+            enable_offload = vram_gb < 20.0
+        elif variants.get("XL"):
+            variant = "XL"
+            model_dir = variants["XL"]
+            enable_offload = vram_gb < 14.0
+        else:
+            variant = "XXL"
+            model_dir = variants["XXL"]
+            enable_offload = True
 
     _emit_log(
         log_cb,
-        f"HunyuanVideo-Foley ({variant}, offload={enable_offload}, VRAM={vram_gb:.1f}GB) で音声生成を開始します。prompt='{prompt}'",
+        f"HunyuanVideo-Foley ({variant}, device={device}, offload={enable_offload}, MEM={vram_gb:.1f}GB) で音声生成を開始します。prompt='{prompt}'",
     )
 
     ffmpeg = shutil.which("ffmpeg")
@@ -369,6 +442,8 @@ def _run_hunyuan_foley_inference(
             env = os.environ.copy()
             env["PYTHONUTF8"] = "1"
             env["PYTHONIOENCODING"] = "utf-8"
+            if device == "mps":
+                env.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
             if info.get("hf_home"):
                 env["HF_HOME"] = str(info["hf_home"])
                 env["HF_HUB_OFFLINE"] = "1"

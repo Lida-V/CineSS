@@ -149,6 +149,25 @@ def fit_length(audio: np.ndarray, target_samples: int) -> np.ndarray:
     return np.pad(audio, ((0, pad_len), (0, 0)), mode="constant")
 
 
+def _keyframe_time_sec(kf: dict[str, Any]) -> float:
+    """キーフレーム辞書から時刻（秒）を取得する（t_sec と t の双方に対応）。"""
+    if "t_sec" in kf and kf["t_sec"] is not None:
+        return float(kf["t_sec"])
+    val = kf.get("t", 0.0)
+    return 0.0 if val is None else float(val)
+
+
+def _deduplicate_sorted_keyframes(keyframes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """キーフレームを時刻昇順に並べ、同一時刻の重複は最後の要素を残す。"""
+    sorted_kf = sorted((k for k in keyframes if isinstance(k, dict)), key=_keyframe_time_sec)
+    if len(sorted_kf) <= 1:
+        return sorted_kf
+    t_vals = np.array([_keyframe_time_sec(k) for k in sorted_kf], dtype=np.float64)
+    _, unique_idx = np.unique(t_vals[::-1], return_index=True)
+    keep_idx = np.sort(len(sorted_kf) - 1 - unique_idx)
+    return [sorted_kf[int(i)] for i in keep_idx]
+
+
 def interpolate_keyframes(
     keyframes: list[dict[str, Any]] | None,
     times_sec: np.ndarray,
@@ -163,20 +182,16 @@ def interpolate_keyframes(
         dists = np.full_like(times, 2.0, dtype=np.float64)
         return zeros, zeros.copy(), dists
 
-    sorted_kf = sorted(keyframes, key=lambda k: float(k.get("t", 0.0)))
-    t_kf = np.array([float(k.get("t", 0.0)) for k in sorted_kf], dtype=np.float64)
+    sorted_kf = _deduplicate_sorted_keyframes(keyframes)
+    if not sorted_kf:
+        zeros = np.zeros_like(times, dtype=np.float64)
+        dists = np.full_like(times, 2.0, dtype=np.float64)
+        return zeros, zeros.copy(), dists
+
+    t_kf = np.array([_keyframe_time_sec(k) for k in sorted_kf], dtype=np.float64)
     az_kf = np.array([float(k.get("azimuth_deg", 0.0)) for k in sorted_kf], dtype=np.float64)
     el_kf = np.array([float(k.get("elevation_deg", 0.0)) for k in sorted_kf], dtype=np.float64)
     dist_kf = np.array([float(k.get("distance_m", 2.0)) for k in sorted_kf], dtype=np.float64)
-
-    # 同一時刻の重複キーフレームがある場合は最後を採用しつつ単調増加を保証
-    if len(t_kf) > 1:
-        _, unique_idx = np.unique(t_kf[::-1], return_index=True)
-        keep_idx = np.sort(len(t_kf) - 1 - unique_idx)
-        t_kf = t_kf[keep_idx]
-        az_kf = az_kf[keep_idx]
-        el_kf = el_kf[keep_idx]
-        dist_kf = dist_kf[keep_idx]
 
     if len(t_kf) == 1:
         az = np.full_like(times, wrap_azimuth_deg(float(az_kf[0])), dtype=np.float64)
@@ -189,6 +204,138 @@ def interpolate_keyframes(
     el_interp = clamp_elevation_deg(np.interp(times, t_kf, el_kf))
     dist_interp = clamp_distance_m(np.interp(times, t_kf, dist_kf))
     return np.asarray(az_interp), np.asarray(el_interp), np.asarray(dist_interp)
+
+
+def interpolate_keyframe_gain_db(
+    keyframes: list[dict[str, Any]] | None,
+    times_sec: np.ndarray | list[float],
+    base_gain_db: float = 0.0,
+) -> np.ndarray:
+    """キーフレーム列の `gain_db` を指定時刻配列 `times_sec` で線形時間補間する。
+
+    キーフレームが空または有効要素を含まない場合は `base_gain_db` で埋めた配列を返す。
+    要素内に `gain_db` が無い場合はフォールバックとして `base_gain_db` を使用する。
+    """
+    times = np.asarray(times_sec, dtype=np.float64)
+    base_val = float(base_gain_db)
+    if not keyframes:
+        return np.full(times.shape, base_val, dtype=np.float64)
+
+    sorted_kf = _deduplicate_sorted_keyframes(keyframes)
+    if not sorted_kf:
+        return np.full(times.shape, base_val, dtype=np.float64)
+
+    t_kf = np.array([_keyframe_time_sec(k) for k in sorted_kf], dtype=np.float64)
+    g_kf = np.array(
+        [
+            base_val if k.get("gain_db") is None else float(k["gain_db"])
+            for k in sorted_kf
+        ],
+        dtype=np.float64,
+    )
+
+    if len(t_kf) == 1:
+        return np.full(times.shape, float(g_kf[0]), dtype=np.float64)
+
+    if times.size == 0:
+        return np.empty(times.shape, dtype=np.float64)
+
+    return np.asarray(np.interp(times, t_kf, g_kf), dtype=np.float64)
+
+
+def interpolate_keyframe_duck_exempt(
+    keyframes: list[dict[str, Any]] | None,
+    times_sec: np.ndarray | list[float],
+    default_exempt: bool = False,
+    sample_rate: int = SAMPLE_RATE,
+    smooth_ms: float = 24.0,
+) -> np.ndarray:
+    """キーフレーム単位の `duck_exempt: bool` から時刻ごとの免除率 [0.0, 1.0] を滑らかに算出する。"""
+    times = np.asarray(times_sec, dtype=np.float64)
+    base_val = 1.0 if default_exempt else 0.0
+    if not keyframes:
+        return np.full(times.shape, base_val, dtype=np.float64)
+
+    sorted_kf = _deduplicate_sorted_keyframes(keyframes)
+    if not sorted_kf:
+        return np.full(times.shape, base_val, dtype=np.float64)
+
+    t_kf = np.array([_keyframe_time_sec(k) for k in sorted_kf], dtype=np.float64)
+    ex_kf = np.array(
+        [1.0 if bool(k.get("duck_exempt", default_exempt)) else 0.0 for k in sorted_kf],
+        dtype=np.float64,
+    )
+
+    if np.all(ex_kf == ex_kf[0]):
+        return np.full(times.shape, float(ex_kf[0]), dtype=np.float64)
+    if times.size == 0:
+        return np.empty(times.shape, dtype=np.float64)
+
+    # 区間保持（直前キーフレームの duck_exempt を採用）＋ Hann 窓平滑化でクリックを防止
+    idx = np.clip(np.searchsorted(t_kf, times, side="right") - 1, 0, len(t_kf) - 1)
+    mask = ex_kf[idx]
+    if times.ndim == 1 and times.size >= 4 and smooth_ms > 0.0:
+        win_n = int(round(float(smooth_ms) * 1e-3 * float(sample_rate))) | 1
+        win_n = max(3, min(win_n, times.size if (times.size % 2 == 1) else max(3, times.size - 1)))
+        if win_n >= 3:
+            kern = np.hanning(win_n + 2)[1:-1]
+            k_sum = float(np.sum(kern))
+            if k_sum > 0.0:
+                kern /= k_sum
+                pad = win_n // 2
+                padded = np.pad(mask, (pad, pad), mode="edge")
+                mask = signal.fftconvolve(padded, kern, mode="valid")[: times.size]
+    return np.clip(mask, 0.0, 1.0).astype(np.float64)
+
+
+def resolve_object_gain_db(
+    obj: dict[str, Any],
+    n_samples: int,
+    sample_rate: int = SAMPLE_RATE,
+) -> float | np.ndarray:
+    """オブジェクト辞書の `gain_db`（配列対応）と `keyframes` からスカラーまたはサンプル別 dB 配列を返す。"""
+    raw_gain = obj.get("gain_db", 0.0)
+    if isinstance(raw_gain, (list, tuple, np.ndarray)):
+        return np.asarray(raw_gain, dtype=np.float64)
+    base_db = 0.0 if raw_gain is None else float(raw_gain)
+    keyframes = obj.get("keyframes") or obj.get("gain_keyframes")
+    if isinstance(keyframes, list) and any(isinstance(k, dict) and k.get("gain_db") is not None for k in keyframes):
+        times = np.arange(n_samples, dtype=np.float64) / float(sample_rate)
+        return interpolate_keyframe_gain_db(keyframes, times, base_gain_db=base_db)
+    return base_db
+
+
+def gain_db_to_linear(gain_db: float | np.ndarray, n_samples: int) -> float | np.ndarray:
+    """スカラーまたは配列の dB ゲインを長さ `n_samples` に揃えた線形ゲインへ変換する。"""
+    if np.ndim(gain_db) == 0:
+        return float(10.0 ** (float(gain_db) / 20.0))
+    arr = np.asarray(gain_db, dtype=np.float64).reshape(-1)
+    if n_samples <= 0:
+        return np.empty((0,), dtype=np.float32)
+    if arr.size == 0:
+        return np.ones((n_samples,), dtype=np.float32)
+    if arr.size < n_samples:
+        arr = np.pad(arr, (0, n_samples - arr.size), mode="edge")
+    elif arr.size > n_samples:
+        arr = arr[:n_samples]
+    return np.power(10.0, arr / 20.0).astype(np.float32)
+
+
+def resolve_gain_linear_for_render(
+    n_samples: int,
+    gain_db: float | np.ndarray = 0.0,
+    keyframes: list[dict[str, Any]] | None = None,
+    sample_rate: int = SAMPLE_RATE,
+) -> float | np.ndarray:
+    """レンダリング入力（スカラー/配列 gain_db およびキーフレーム gain_db）から線形ゲインを解決する。"""
+    if np.ndim(gain_db) > 0:
+        return gain_db_to_linear(gain_db, n_samples)
+    base_db = 0.0 if gain_db is None else float(gain_db)
+    if isinstance(keyframes, list) and any(isinstance(k, dict) and k.get("gain_db") is not None for k in keyframes):
+        times = np.arange(n_samples, dtype=np.float64) / float(sample_rate)
+        g_db_arr = interpolate_keyframe_gain_db(keyframes, times, base_gain_db=base_db)
+        return gain_db_to_linear(g_db_arr, n_samples)
+    return float(10.0 ** (base_db / 20.0))
 
 
 def direction_to_unit_vector(azimuth_deg: float, elevation_deg: float) -> np.ndarray:
@@ -209,14 +356,24 @@ def distance_direct_gain(
     ref_distance_m: float = 1.0,
     role: str = "sfx",
 ) -> float:
-    """逆距離則ベースの直接音ゲイン（安全な近距離クランプ＆セリフ専用 Perspective 付き）。
+    """逆距離則ベースの直接音ゲイン（ロール別 Perspective ＆安全クランプ付き）。
 
-    - role != "dialog": 1.0m -> 1.0 (0 dB), 2.0m -> -5.4 dB, 8.0m -> -16.3 dB
+    - role == "sfx_sub": 常に 1.0 (0 dB)
+    - role == "sfx_impact": 2.0m -> 1.0 (0 dB), clip((2.0 / d) ** 0.55, 0.32, 1.45)
     - role == "dialog": 2.0m -> 1.0 (0 dB), clip((2.0 / d) ** 0.50, 0.38, 1.22)
+    - role == "ambience": 2.0m -> 1.0 (0 dB), clip((2.0 / d) ** 0.30, 0.45, 1.10)
+    - その他 ("sfx", "foley" 等): (ref_distance_m / d) ** 0.9
     """
     d = float(clamp_distance_m(distance_m))
-    if str(role or "sfx").strip().lower() == "dialog":
+    role_norm = str(role or "sfx").strip().lower()
+    if role_norm == "sfx_sub":
+        return 1.0
+    if role_norm == "sfx_impact":
+        return float(np.clip((2.0 / d) ** 0.55, 0.32, 1.45))
+    if role_norm == "dialog":
         return float(np.clip((2.0 / d) ** 0.50, 0.38, 1.22))
+    if role_norm == "ambience":
+        return float(np.clip((2.0 / d) ** 0.30, 0.45, 1.10))
     return float((ref_distance_m / d) ** 0.9)
 
 
@@ -227,28 +384,48 @@ def distance_reverb_send(
 ) -> float:
     """距離に応じたリバーブセンド量。
 
-    実空間では拡散音場レベルは距離に対してほぼ一定（遠方で緩やかに増加）のため、
-    直接音が 1/d で減衰するのと相まって Direct-to-Reverb 比が距離で大きく変化しつつ、
-    遠距離の総音量もしっかり減衰する物理バランスを保つ。
-    role == "dialog" の場合は明瞭度保護のため通常の 0.55 倍に抑制する。
+    - role == "sfx_sub": 常に 0.0（重低音の濁り防止）
+    - role == "dialog": 明瞭度保護のため標準の 0.55 倍
+    - role == "sfx_impact": 打撃音の芯を保つため標準の 0.70 倍
+    - role == "ambience": 広めの空間包囲感のため標準の 1.35 倍（上限 0.45）
     """
+    role_norm = str(role or "sfx").strip().lower()
+    if role_norm == "sfx_sub":
+        return 0.0
     d = float(clamp_distance_m(distance_m))
     rt_scale = math.sqrt(max(0.15, min(float(rt60_sec), 3.0)) / 0.45)
     # 1.0m -> 約0.09 (非常にドライ), 8.0m -> 約0.18 (残響比大幅増かつ総音量は1.0mより約10dB減衰)
     base = 0.065 + 0.028 * math.log2(max(d, 0.5) / 0.5)
     send = min(0.32, base * rt_scale)
-    if str(role or "sfx").strip().lower() == "dialog":
+    if role_norm == "dialog":
         send *= 0.55
+    elif role_norm == "sfx_impact":
+        send *= 0.70
+    elif role_norm == "ambience":
+        send = min(0.45, send * 1.35)
     return float(send)
 
 
 def air_absorption_cutoff_hz(distance_m: float, role: str = "sfx") -> float:
     """距離依存の空気吸収 LPF カットオフ周波数 (Hz)。
 
-    1.0m 以下（dialog は 2.0m 以下）はほぼフラット (20kHz)、遠距離では滑らかに高域が減衰する。
+    - role == "sfx_sub": 常に 20000.0 Hz
+    - role == "sfx_impact": 2.2m 以下は 20kHz フラット、超過距離 (d - 2.2) のみ緩やかに減衰
+    - role == "dialog": 2.0m 以下は 20kHz フラット、遠距離では滑らかに高域が減衰
+    - role == "ambience": 背景溶け込み向けの緩やかな高域減衰
+    - role == "sfx" 等: 1.0m 以下は 20kHz フラット
     """
+    role_norm = str(role or "sfx").strip().lower()
+    if role_norm == "sfx_sub":
+        return 20000.0
     d = float(clamp_distance_m(distance_m))
-    ref_d = 2.0 if str(role or "sfx").strip().lower() == "dialog" else 1.0
+    if role_norm == "sfx_impact":
+        excess = max(0.0, d - 2.2)
+        return float(max(2200.0, 20000.0 / (1.0 + 0.55 * excess)))
+    if role_norm == "ambience":
+        excess = max(0.0, d - 0.8)
+        return float(max(2800.0, 20000.0 / (1.0 + 0.50 * excess)))
+    ref_d = 2.0 if role_norm == "dialog" else 1.0
     excess = max(0.0, d - ref_d)
     return float(max(2200.0, 20000.0 / (1.0 + 0.70 * excess)))
 
@@ -754,7 +931,7 @@ class HRTFEngine:
         self,
         mono_audio: np.ndarray,
         keyframes: list[dict[str, Any]] | None,
-        gain_db: float = 0.0,
+        gain_db: float | np.ndarray = 0.0,
         rt60_sec: float = 0.45,
         block_size: int = 2048,
         apply_distance: bool = True,
@@ -771,14 +948,17 @@ class HRTFEngine:
         if n_samples == 0:
             return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=np.float32)
 
-        gain_lin = float(10.0 ** (float(gain_db) / 20.0))
-        if gain_lin == 0.0 or float(np.max(np.abs(x))) < 1e-9:
+        gain_lin = resolve_gain_linear_for_render(
+            n_samples, gain_db=gain_db, keyframes=keyframes, sample_rate=self.sample_rate
+        )
+        x_scaled = x.astype(np.float64) * gain_lin
+        if float(np.max(np.abs(x_scaled))) < 1e-9:
             return np.zeros((n_samples, 2), dtype=np.float32), np.zeros((n_samples,), dtype=np.float32)
 
         hop = block_size // 2
         window = np.hanning(block_size).astype(np.float64)
         # 端点でのフェードイン／アウト欠損を防ぐため両端に hop 分ゼロパディング（厳密 COLA = 1.0）
-        x_pad = np.pad(x.astype(np.float64) * gain_lin, (hop, hop + block_size), mode="constant")
+        x_pad = np.pad(x_scaled, (hop, hop + block_size), mode="constant")
 
         ir_len = self.ir_len
         n_fft = 1 << (block_size + ir_len - 2).bit_length()

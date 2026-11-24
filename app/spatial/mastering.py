@@ -224,8 +224,14 @@ def compute_dialog_ducking_gain(
     attack_ms: float = 15.0,
     release_ms: float = 220.0,
     hold_ms: float = 40.0,
+    impact_override_mono: np.ndarray | None = None,
+    impact_threshold_db: float = -16.0,
 ) -> np.ndarray:
-    """セリフ合算モノラルから発話エンベロープを検出し、発話中のみ滑らかに duck_db 分減衰するゲイン曲線 (N,) を返す。"""
+    """セリフ合算モノラルから発話エンベロープを検出し、発話中のみ滑らかに duck_db 分減衰するゲイン曲線 (N,) を返す。
+
+    `impact_override_mono` が指定された場合、その約 2ms RMS が `impact_threshold_db` を超える瞬間は
+    スマート・インパクト免除としてゲインを滑らかに `1.0` 側へ引き戻す。
+    """
     x = np.asarray(dialog_mono, dtype=np.float64).reshape(-1)
     n = x.shape[0]
     if n == 0:
@@ -275,6 +281,57 @@ def compute_dialog_ducking_gain(
     gain_blk = 10.0 ** (env_db / 20.0)
     blk_centers = (np.arange(n_blks, dtype=np.float64) + 0.5) * blk
     gain_sample = np.interp(np.arange(n, dtype=np.float64), blk_centers, gain_blk)
+
+    # スマート・インパクト免除: 約 2ms RMS が impact_threshold_db を超える瞬間は 1.0 へ引き戻す
+    if impact_override_mono is not None:
+        imp = np.asarray(impact_override_mono, dtype=np.float64).reshape(-1)
+        if imp.size > 0 and float(np.max(np.abs(imp))) >= 1e-8:
+            if imp.shape[0] > n:
+                imp = imp[:n]
+            elif imp.shape[0] < n:
+                imp = np.pad(imp, (0, n - imp.shape[0]), mode="constant")
+
+            blk_imp = max(1, int(round(0.002 * sample_rate)))
+            n_blks_imp = int(math.ceil(n / blk_imp))
+            pad_imp = n_blks_imp * blk_imp - n
+            imp_sq = imp * imp
+            if pad_imp > 0:
+                imp_sq = np.pad(imp_sq, (0, pad_imp), mode="edge")
+            imp_rms_blk = np.sqrt(np.mean(imp_sq.reshape(n_blks_imp, blk_imp), axis=1))
+            imp_db = 20.0 * np.log10(np.maximum(imp_rms_blk, 1e-10))
+
+            imp_active = imp_db > float(impact_threshold_db)
+            if np.any(imp_active):
+                hold_imp_blks = max(0, int(round(0.020 * sample_rate / blk_imp)))
+                held_imp = imp_active.copy()
+                if hold_imp_blks > 0:
+                    rem_i = 0
+                    for i in range(n_blks_imp):
+                        if imp_active[i]:
+                            rem_i = hold_imp_blks
+                            held_imp[i] = True
+                        elif rem_i > 0:
+                            held_imp[i] = True
+                            rem_i -= 1
+
+                att_imp = math.exp(-float(blk_imp) / max(1.0, 0.002 * sample_rate))
+                rel_imp = math.exp(-float(blk_imp) / max(1.0, 0.110 * sample_rate))
+                exempt_env = np.empty(n_blks_imp, dtype=np.float64)
+                cur_ex = 0.0
+                for i in range(n_blks_imp):
+                    tgt_ex = 1.0 if held_imp[i] else 0.0
+                    c_ex = att_imp if tgt_ex > cur_ex else rel_imp
+                    cur_ex = c_ex * cur_ex + (1.0 - c_ex) * tgt_ex
+                    exempt_env[i] = cur_ex
+
+                imp_centers = (np.arange(n_blks_imp, dtype=np.float64) + 0.5) * blk_imp
+                exempt_sample = np.clip(
+                    np.interp(np.arange(n, dtype=np.float64), imp_centers, exempt_env),
+                    0.0,
+                    1.0,
+                )
+                gain_sample = gain_sample + (1.0 - gain_sample) * exempt_sample
+
     min_gain = float(10.0 ** (float(duck_db) / 20.0))
     return np.clip(gain_sample, min_gain, 1.0).astype(np.float32)
 

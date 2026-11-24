@@ -1,5 +1,7 @@
 # cmd.exe は CRLF 前提。GitHub ZIP 等でも CRLF バイトを保持する。
 *.bat -text
+# シェルスクリプトは LF を維持する。
+*.sh text eol=lf
 # Python / JSON / Markdown は LF を維持する。
 *.py text eol=lf
 *.json text eol=lf

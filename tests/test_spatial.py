@@ -25,10 +25,13 @@ from scipy import signal
 from app.spatial import (
     HRTFEngine,
     SAMPLE_RATE,
+    _prepare_stem_overrides,
     acn_sn3d_gains,
     ambisonics_channel_count,
     build_max_re_decoder_matrix,
     compute_dialog_ducking_gain,
+    interpolate_keyframe_duck_exempt,
+    interpolate_keyframe_gain_db,
     master_audio,
     measure_audio_metrics,
     measure_lufs,
@@ -806,6 +809,355 @@ class TestSpatialEngine(unittest.TestCase):
             rms_dlg = math.sqrt(float(np.mean(b_dlg.astype(np.float64) ** 2)))
             rms_sfx = math.sqrt(float(np.mean(b_sfx.astype(np.float64) ** 2)))
             self.assertGreater(20.0 * math.log10(rms_dlg / max(rms_sfx, 1e-12)), 4.0)
+
+    # ------------------------------------------------------------------
+    # 12. キーフレーム gain_db 補間＆duck_exempt マスク検証
+    # ------------------------------------------------------------------
+    def test_interpolate_keyframe_gain_db_and_duck_exempt(self) -> None:
+        times = np.array([0.0, 0.5, 1.0, 1.5, 2.0], dtype=np.float64)
+
+        # 空キーフレームは base_gain_db 配列を返す
+        empty_g = interpolate_keyframe_gain_db([], times, base_gain_db=-4.5)
+        np.testing.assert_allclose(empty_g, np.full(5, -4.5))
+        none_g = interpolate_keyframe_gain_db(None, times, base_gain_db=2.0)
+        np.testing.assert_allclose(none_g, np.full(5, 2.0))
+
+        # t_sec / gain_db 線形補間（範囲外は端点保持・重複時刻は後優先）
+        kfs = [
+            {"t_sec": 0.5, "gain_db": -6.0},
+            {"t_sec": 0.5, "gain_db": -2.0},
+            {"t_sec": 1.5, "gain_db": 4.0},
+        ]
+        interp_g = interpolate_keyframe_gain_db(kfs, times, base_gain_db=0.0)
+        np.testing.assert_allclose(interp_g, [-2.0, -2.0, 1.0, 4.0, 4.0], atol=1e-9)
+
+        # t キーのみかつ gain_db 欠損時は base_gain_db へフォールバック
+        legacy_kfs = [{"t": 0.0, "azimuth_deg": -30.0}, {"t": 2.0, "azimuth_deg": 30.0}]
+        fallback_g = interpolate_keyframe_gain_db(legacy_kfs, times, base_gain_db=-3.0)
+        np.testing.assert_allclose(fallback_g, np.full(5, -3.0))
+
+        # キーフレーム単位 duck_exempt: [0.5, 1.5) 区間のみ True
+        sample_times = np.arange(int(2.0 * SAMPLE_RATE), dtype=np.float64) / float(SAMPLE_RATE)
+        ex_kfs = [
+            {"t_sec": 0.0, "duck_exempt": False},
+            {"t_sec": 0.5, "duck_exempt": True},
+            {"t_sec": 1.5, "duck_exempt": False},
+        ]
+        ex_mask = interpolate_keyframe_duck_exempt(ex_kfs, sample_times, sample_rate=SAMPLE_RATE)
+        self.assertLess(float(ex_mask[int(0.20 * SAMPLE_RATE)]), 0.05)
+        self.assertGreater(float(ex_mask[int(1.00 * SAMPLE_RATE)]), 0.95)
+        self.assertLess(float(ex_mask[int(1.80 * SAMPLE_RATE)]), 0.05)
+
+    # ------------------------------------------------------------------
+    # 13. 新規距離モデル（sfx_impact / sfx_sub / ambience）検証
+    # ------------------------------------------------------------------
+    def test_sfx_impact_sfx_sub_and_ambience_distance_models(self) -> None:
+        # sfx_impact: 2.0m で 0 dB、クリップ [0.32, 1.45]、リバーブ 0.70x、2.2m まで空気吸収なし
+        self.assertAlmostEqual(distance_direct_gain(2.0, role="sfx_impact"), 1.0, places=6)
+        self.assertAlmostEqual(distance_direct_gain(1.0, role="sfx_impact"), 1.45, places=6)
+        self.assertAlmostEqual(distance_direct_gain(8.0, role="sfx_impact"), (2.0 / 8.0) ** 0.55, places=6)
+        self.assertGreaterEqual(distance_direct_gain(15.0, role="sfx_impact"), 0.32)
+        self.assertAlmostEqual(
+            distance_reverb_send(3.5, role="sfx_impact"),
+            0.70 * distance_reverb_send(3.5, role="sfx"),
+            places=6,
+        )
+        self.assertAlmostEqual(air_absorption_cutoff_hz(2.2, role="sfx_impact"), 20000.0, places=3)
+        self.assertAlmostEqual(air_absorption_cutoff_hz(1.5, role="sfx_impact"), 20000.0, places=3)
+        self.assertGreater(
+            air_absorption_cutoff_hz(6.0, role="sfx_impact"),
+            air_absorption_cutoff_hz(6.0, role="sfx"),
+        )
+
+        # sfx_sub: 距離にかかわらず常に 1.0 / 0.0 / 20000.0
+        for d in (0.5, 2.0, 8.0, 15.0):
+            self.assertAlmostEqual(distance_direct_gain(d, role="sfx_sub"), 1.0, places=6)
+            self.assertAlmostEqual(distance_reverb_send(d, role="sfx_sub"), 0.0, places=6)
+            self.assertAlmostEqual(air_absorption_cutoff_hz(d, role="sfx_sub"), 20000.0, places=3)
+
+        # ambience: 緩やかな距離減衰・広めリバーブ・遠距離での高域ロールオフ
+        self.assertGreater(distance_direct_gain(1.0, role="ambience"), distance_direct_gain(8.0, role="ambience"))
+        self.assertGreater(distance_direct_gain(8.0, role="ambience"), distance_direct_gain(8.0, role="sfx"))
+        self.assertGreater(distance_reverb_send(3.0, role="ambience"), distance_reverb_send(3.0, role="sfx"))
+        self.assertLess(air_absorption_cutoff_hz(8.0, role="ambience"), 10000.0)
+
+    # ------------------------------------------------------------------
+    # 14. Atmos 7.1.4 新規ルート（sfx_sub LFE / ambience / sfx_impact aux / 配列ゲイン）
+    # ------------------------------------------------------------------
+    def test_atmos_bed_routing_sfx_sub_ambience_and_impact_lfe(self) -> None:
+        renderer = AtmosRenderer(hrtf_engine=HRTFEngine(), sample_rate=SAMPLE_RATE)
+        n = SAMPLE_RATE
+        t = np.arange(n, dtype=np.float64) / float(SAMPLE_RATE)
+
+        # sfx_sub: 60Hz 低音に対し Front L/R (0.48) + LFE 140Hz LPF (0.88)、他チャンネル 0
+        sub_60 = (0.5 * np.sin(2.0 * math.pi * 60.0 * t)).astype(np.float32)
+        sub_stereo = np.stack([sub_60, sub_60], axis=1)
+        bed_sub = renderer._route_bed_track_714(sub_stereo, gain_db=0.0, role="sfx_sub")
+        np.testing.assert_allclose(bed_sub[:, 0], 0.48 * sub_60, atol=1e-5)
+        np.testing.assert_allclose(bed_sub[:, 1], 0.48 * sub_60, atol=1e-5)
+        for ch in (2, 4, 5, 6, 7, 8, 9, 10, 11):
+            np.testing.assert_allclose(bed_sub[:, ch], 0.0, atol=1e-6)
+
+        rms_in_60 = float(np.sqrt(np.mean(sub_60[4800:] ** 2)))
+        rms_lfe_60 = float(np.sqrt(np.mean(bed_sub[4800:, 3] ** 2)))
+        self.assertAlmostEqual(rms_lfe_60 / rms_in_60, 0.88, delta=0.05)
+
+        # 300Hz 高め音は 140Hz LPF で LFE が大幅減衰し、100Hz は通過することを確認
+        sub_100 = (0.5 * np.sin(2.0 * math.pi * 100.0 * t)).astype(np.float32)
+        sub_300 = (0.5 * np.sin(2.0 * math.pi * 300.0 * t)).astype(np.float32)
+        bed_100 = renderer._route_bed_track_714(sub_100[:, np.newaxis], gain_db=0.0, role="sfx_sub")
+        bed_300 = renderer._route_bed_track_714(sub_300[:, np.newaxis], gain_db=0.0, role="sfx_sub")
+        rms_lfe_100 = float(np.sqrt(np.mean(bed_100[4800:, 3] ** 2)))
+        rms_lfe_300 = float(np.sqrt(np.mean(bed_300[4800:, 3] ** 2)))
+        self.assertGreater(20.0 * math.log10(rms_lfe_100 / max(rms_lfe_300, 1e-12)), 20.0)
+
+        # ambience: リア・サイド・ハイトへの広がりが music より高い（ステレオ・モノとも）
+        amb_noise = _make_speech_like_signal(1.0, seed=101)
+        amb_st = np.stack([amb_noise, _make_speech_like_signal(1.0, seed=102)], axis=1)
+        bed_amb = renderer._route_bed_track_714(amb_st, gain_db=0.0, role="ambience")
+        bed_mus = renderer._route_bed_track_714(amb_st, gain_db=0.0, role="music")
+        surround_ratio_amb = float(np.sum(bed_amb[:, 4:12] ** 2) / max(1e-12, np.sum(bed_amb[:, 0:2] ** 2)))
+        surround_ratio_mus = float(np.sum(bed_mus[:, 4:12] ** 2) / max(1e-12, np.sum(bed_mus[:, 0:2] ** 2)))
+        self.assertGreater(surround_ratio_amb, surround_ratio_mus * 2.0)
+
+        bed_amb_mono = renderer._route_bed_track_714(amb_noise[:, np.newaxis], gain_db=0.0, role="ambience")
+        self.assertGreater(float(np.mean(bed_amb_mono[:, 10] ** 2)), 1e-6)
+
+        # ベッド配列ゲイン（前半 -12dB -> 後半 +3dB）の適用検証
+        gain_curve = np.concatenate([np.full(n // 2, -12.0), np.full(n - n // 2, 3.0)])
+        bed_dyn = renderer._route_bed_track_714(sub_stereo, gain_db=gain_curve, role="sfx_sub")
+        rms_first = float(np.sqrt(np.mean(bed_dyn[: n // 2 - 2400, 3] ** 2)))
+        rms_second = float(np.sqrt(np.mean(bed_dyn[n // 2 + 4800 :, 3] ** 2)))
+        self.assertAlmostEqual(20.0 * math.log10(rms_second / max(rms_first, 1e-12)), 15.0, delta=0.5)
+
+        # _pan_dynamic_object_714: sfx_impact に LFE aux send 0.28
+        kfs = [{"t": 0.0, "azimuth_deg": -30.0, "elevation_deg": 0.0, "distance_m": 2.0}]
+        pan_imp = renderer._pan_dynamic_object_714(sub_60, kfs, role="sfx_impact")
+        pan_sfx = renderer._pan_dynamic_object_714(sub_60, kfs, role="sfx")
+        pan_dlg = renderer._pan_dynamic_object_714(sub_60, kfs, role="dialog")
+        rms_imp_lfe = float(np.sqrt(np.mean(pan_imp[4800:, 3] ** 2)))
+        rms_sfx_lfe = float(np.sqrt(np.mean(pan_sfx[4800:, 3] ** 2)))
+        self.assertAlmostEqual(rms_imp_lfe / max(rms_sfx_lfe, 1e-12), 0.28 / 0.20, delta=0.03)
+        np.testing.assert_allclose(pan_dlg[:, 3], 0.0, atol=1e-7)
+
+    # ------------------------------------------------------------------
+    # 15. Ambisonics sfx_sub (ACN 0 主体) ＆時間変化ゲイン配列検証
+    # ------------------------------------------------------------------
+    def test_ambisonics_bed_sfx_sub_and_time_varying_gain(self) -> None:
+        renderer = AmbisonicsRenderer(order=3, hrtf_engine=HRTFEngine(), sample_rate=SAMPLE_RATE)
+        n = SAMPLE_RATE
+        t = np.arange(n, dtype=np.float64) / float(SAMPLE_RATE)
+        sub_sig = (0.4 * np.sin(2.0 * math.pi * 65.0 * t)).astype(np.float32)
+        sub_st = np.stack([sub_sig, sub_sig], axis=1)
+
+        b_sub = renderer.encode_bed_source(sub_st, gain_db=0.0, role="sfx_sub")
+        self.assertEqual(b_sub.shape, (n, 16))
+        energy_w = float(np.sum(b_sub[:, 0].astype(np.float64) ** 2))
+        energy_others = float(np.sum(b_sub[:, 1:].astype(np.float64) ** 2))
+        self.assertGreater(energy_w, 10.0)
+        self.assertLess(energy_others, 1e-8)
+
+        # 時間変化ゲイン配列とキーフレームゲイン付き render_scene
+        gain_arr = np.concatenate([np.full(n // 2, -12.0), np.full(n - n // 2, 0.0)])
+        b_dyn = renderer.encode_bed_source(sub_st, gain_db=gain_arr, role="sfx_sub")
+        rms_1 = float(np.sqrt(np.mean(b_dyn[: n // 2, 0] ** 2)))
+        rms_2 = float(np.sqrt(np.mean(b_dyn[n // 2 :, 0] ** 2)))
+        self.assertAlmostEqual(20.0 * math.log10(rms_2 / max(rms_1, 1e-12)), 12.0, delta=0.2)
+
+        tone = (0.3 * np.sin(2.0 * math.pi * 500.0 * t)).astype(np.float32)
+        wav_tone = self._write_wav("kf_gain_tone.wav", tone)
+        wav_sub = self._write_wav("kf_gain_sub.wav", sub_st)
+        scene = {
+            "duration_sec": 1.0,
+            "sample_rate": SAMPLE_RATE,
+            "room": {"rt60_sec": 0.2, "size": "small"},
+            "objects": [
+                {
+                    "id": "sub_bed",
+                    "role": "sfx_sub",
+                    "audio_path": str(wav_sub),
+                    "is_bed": True,
+                    "gain_db": 0.0,
+                    "keyframes": [
+                        {"t_sec": 0.0, "gain_db": -12.0},
+                        {"t_sec": 0.5, "gain_db": -12.0},
+                        {"t_sec": 0.55, "gain_db": 0.0},
+                    ],
+                },
+                {
+                    "id": "imp_obj",
+                    "role": "sfx_impact",
+                    "audio_path": str(wav_tone),
+                    "is_bed": False,
+                    "gain_db": 0.0,
+                    "keyframes": [
+                        {"t_sec": 0.0, "azimuth_deg": 0.0, "elevation_deg": 0.0, "distance_m": 2.0, "gain_db": -12.0},
+                        {"t_sec": 0.5, "azimuth_deg": 0.0, "elevation_deg": 0.0, "distance_m": 2.0, "gain_db": -12.0},
+                        {"t_sec": 0.55, "azimuth_deg": 0.0, "elevation_deg": 0.0, "distance_m": 2.0, "gain_db": 0.0},
+                    ],
+                },
+            ],
+        }
+        rendered = renderer.render_scene(scene)
+        bin_out = rendered["binaural"]
+        e_early = float(np.sqrt(np.mean(bin_out[int(0.1 * SAMPLE_RATE) : int(0.4 * SAMPLE_RATE)] ** 2)))
+        e_late = float(np.sqrt(np.mean(bin_out[int(0.65 * SAMPLE_RATE) : int(0.95 * SAMPLE_RATE)] ** 2)))
+        self.assertGreater(20.0 * math.log10(e_late / max(e_early, 1e-12)), 9.0)
+
+    # ------------------------------------------------------------------
+    # 16. スマート・インパクト免除ダッキング ＆ duck_exempt / role 別免除検証
+    # ------------------------------------------------------------------
+    def test_smart_impact_ducking_and_duck_exempt_roles(self) -> None:
+        dur = 2.0
+        n = int(dur * SAMPLE_RATE)
+        speech = _make_speech_like_signal(dur, seed=201)
+
+        # 前半 (0..1.0s) は -28 dBFS（閾値未満）、後半 (1.1..1.5s) は -6 dBFS の衝撃バースト
+        t = np.arange(n, dtype=np.float64) / float(SAMPLE_RATE)
+        imp_sig = (0.04 * np.sin(2.0 * math.pi * 500.0 * t)).astype(np.float32)
+        s_burst0, s_burst1 = int(1.10 * SAMPLE_RATE), int(1.45 * SAMPLE_RATE)
+        imp_sig[s_burst0:s_burst1] = (0.65 * np.sin(2.0 * math.pi * 500.0 * t[s_burst0:s_burst1])).astype(np.float32)
+
+        g_smart = compute_dialog_ducking_gain(
+            speech,
+            sample_rate=SAMPLE_RATE,
+            duck_db=-2.0,
+            impact_override_mono=imp_sig,
+            impact_threshold_db=-16.0,
+        )
+        # 前半の非インパクト区間はしっかりダッキング (-2.0 dB ≈ 0.794)
+        quiet_gain = float(np.mean(g_smart[int(0.30 * SAMPLE_RATE) : int(0.80 * SAMPLE_RATE)]))
+        self.assertLess(quiet_gain, 0.84)
+        # 衝撃バースト区間はスムーズに 1.0 側へ引き戻される
+        burst_gain = float(np.mean(g_smart[int(1.15 * SAMPLE_RATE) : int(1.40 * SAMPLE_RATE)]))
+        self.assertGreater(burst_gain, 0.96)
+
+        # _prepare_stem_overrides: sfx_sub / duck_exempt / ambience / キーフレーム duck_exempt
+        amb_sig = (0.12 * np.sin(2.0 * math.pi * 300.0 * t)).astype(np.float32)
+        sub_sig = (0.25 * np.sin(2.0 * math.pi * 55.0 * t)).astype(np.float32)
+        wav_dlg = self._write_wav("sd_dlg.wav", speech)
+        wav_sub = self._write_wav("sd_sub.wav", sub_sig)
+        wav_imp = self._write_wav("sd_imp.wav", imp_sig)
+        wav_amb = self._write_wav("sd_amb.wav", np.stack([amb_sig, amb_sig], axis=1))
+        wav_ex_obj = self._write_wav("sd_ex_obj.wav", amb_sig)
+        wav_ex_kf = self._write_wav("sd_ex_kf.wav", amb_sig)
+
+        scene = {
+            "duration_sec": dur,
+            "sample_rate": SAMPLE_RATE,
+            "objects": [
+                {"id": "dlg", "role": "dialog", "audio_path": str(wav_dlg), "is_bed": False},
+                {"id": "sub", "role": "sfx_sub", "audio_path": str(wav_sub), "is_bed": True},
+                {"id": "imp", "role": "sfx_impact", "audio_path": str(wav_imp), "is_bed": False},
+                {"id": "amb", "role": "ambience", "audio_path": str(wav_amb), "is_bed": True},
+                {"id": "ex_obj", "role": "ambience", "audio_path": str(wav_ex_obj), "is_bed": True, "duck_exempt": True},
+                {
+                    "id": "ex_kf",
+                    "role": "sfx",
+                    "audio_path": str(wav_ex_kf),
+                    "is_bed": False,
+                    "keyframes": [
+                        {"t_sec": 0.0, "azimuth_deg": 0.0, "elevation_deg": 0.0, "distance_m": 2.0, "duck_exempt": False},
+                        {"t_sec": 0.8, "azimuth_deg": 0.0, "elevation_deg": 0.0, "distance_m": 2.0, "duck_exempt": True},
+                        {"t_sec": 1.4, "azimuth_deg": 0.0, "elevation_deg": 0.0, "distance_m": 2.0, "duck_exempt": False},
+                    ],
+                },
+            ],
+        }
+        overrides, applied = _prepare_stem_overrides(scene, base_dir=None, sample_rate=SAMPLE_RATE, enable_dialog_ducking=True)
+        self.assertTrue(applied)
+        # sfx_sub と obj["duck_exempt"]=True は対象外（overrides に含まれない）
+        self.assertNotIn("sub", overrides)
+        self.assertNotIn("ex_obj", overrides)
+
+        # ambience は穏やかな -2.0 dB 程度のダッキング（約 0.794）
+        amb_ratio = float(np.sqrt(np.mean(overrides["amb"][int(0.4 * SAMPLE_RATE) : int(0.9 * SAMPLE_RATE)] ** 2))) / max(
+            1e-9, float(np.sqrt(np.mean(amb_sig[int(0.4 * SAMPLE_RATE) : int(0.9 * SAMPLE_RATE)] ** 2)))
+        )
+        self.assertGreater(amb_ratio, 0.75)
+        self.assertLess(amb_ratio, 0.85)
+
+        # sfx_impact は前半ダッキング、後半インパクトで 1.0 近くへ引き戻し
+        imp_ov = overrides["imp"][:, 0] if overrides["imp"].ndim == 2 else overrides["imp"]
+        imp_ratio_quiet = float(np.sqrt(np.mean(imp_ov[int(0.35 * SAMPLE_RATE) : int(0.85 * SAMPLE_RATE)] ** 2))) / max(
+            1e-9, float(np.sqrt(np.mean(imp_sig[int(0.35 * SAMPLE_RATE) : int(0.85 * SAMPLE_RATE)] ** 2)))
+        )
+        imp_ratio_burst = float(np.sqrt(np.mean(imp_ov[int(1.15 * SAMPLE_RATE) : int(1.40 * SAMPLE_RATE)] ** 2))) / max(
+            1e-9, float(np.sqrt(np.mean(imp_sig[int(1.15 * SAMPLE_RATE) : int(1.40 * SAMPLE_RATE)] ** 2)))
+        )
+        self.assertLess(imp_ratio_quiet, 0.85)
+        self.assertGreater(imp_ratio_burst, 0.95)
+
+        # キーフレーム上の duck_exempt=True 区間 [0.8, 1.4) が滑らかに 1.0 へ免除されること
+        ex_kf_ov = overrides["ex_kf"][:, 0] if overrides["ex_kf"].ndim == 2 else overrides["ex_kf"]
+        ratio_before = float(np.sqrt(np.mean(ex_kf_ov[int(0.30 * SAMPLE_RATE) : int(0.65 * SAMPLE_RATE)] ** 2))) / max(
+            1e-9, float(np.sqrt(np.mean(amb_sig[int(0.30 * SAMPLE_RATE) : int(0.65 * SAMPLE_RATE)] ** 2)))
+        )
+        ratio_exempt = float(np.sqrt(np.mean(ex_kf_ov[int(0.95 * SAMPLE_RATE) : int(1.25 * SAMPLE_RATE)] ** 2))) / max(
+            1e-9, float(np.sqrt(np.mean(amb_sig[int(0.95 * SAMPLE_RATE) : int(1.25 * SAMPLE_RATE)] ** 2)))
+        )
+        self.assertLess(ratio_before, 0.85)
+        self.assertGreater(ratio_exempt, 0.96)
+
+    # ------------------------------------------------------------------
+    # 17. Atmos render_spatial_mix での SFX 4層・時間変化ゲイン統合検証
+    # ------------------------------------------------------------------
+    def test_atmos_render_spatial_mix_multilayer_sfx_and_keyframe_gains(self) -> None:
+        dur = 1.0
+        n = int(dur * SAMPLE_RATE)
+        t = np.arange(n, dtype=np.float64) / float(SAMPLE_RATE)
+        sub_sig = (0.35 * np.sin(2.0 * math.pi * 60.0 * t)).astype(np.float32)
+        imp_sig = (0.30 * np.sin(2.0 * math.pi * 800.0 * t)).astype(np.float32)
+        amb_sig = _make_speech_like_signal(dur, seed=303) * 0.25
+
+        wav_sub = self._write_wav("e2e_sub.wav", np.stack([sub_sig, sub_sig], axis=1))
+        wav_imp = self._write_wav("e2e_imp.wav", imp_sig)
+        wav_amb = self._write_wav("e2e_amb.wav", np.stack([amb_sig, amb_sig], axis=1))
+
+        scene = {
+            "duration_sec": dur,
+            "sample_rate": SAMPLE_RATE,
+            "room": {"rt60_sec": 0.3, "size": "medium"},
+            "objects": [
+                {
+                    "id": "sfx_sub",
+                    "role": "sfx_sub",
+                    "audio_path": str(wav_sub),
+                    "is_bed": True,
+                    "gain_db": 0.0,
+                    "keyframes": [{"t_sec": 0.0, "gain_db": -6.0}, {"t_sec": 0.5, "gain_db": 0.0}],
+                },
+                {
+                    "id": "sfx_impact_left",
+                    "role": "sfx_impact",
+                    "audio_path": str(wav_imp),
+                    "is_bed": False,
+                    "gain_db": 0.0,
+                    "keyframes": [
+                        {"t_sec": 0.0, "azimuth_deg": -50.0, "elevation_deg": 0.0, "distance_m": 2.0, "gain_db": -6.0},
+                        {"t_sec": 0.8, "azimuth_deg": -45.0, "elevation_deg": 0.0, "distance_m": 1.6, "gain_db": 2.0},
+                    ],
+                },
+                {
+                    "id": "sfx_ambience",
+                    "role": "ambience",
+                    "audio_path": str(wav_amb),
+                    "is_bed": True,
+                    "gain_db": -3.0,
+                },
+            ],
+        }
+        res = render_spatial_mix(
+            scene,
+            out_dir=str(self.tmpdir / "atmos_multilayer"),
+            spatial_format="atmos",
+            target_lufs=-18.0,
+        )
+        adm_rep = validate_adm_bwf(Path(res["master_spatial_wav"]))
+        self.assertTrue(adm_rep["valid"], f"ADM BWF 検証エラー: {adm_rep['errors']}")
+        self.assertEqual(res["metrics"]["channels"], 13)
+        bin_sig, _ = sf.read(res["binaural_wav"], dtype="float64")
+        self.assertGreater(_measure_lr_diff_db(bin_sig), 2.0)
 
 
 if __name__ == "__main__":

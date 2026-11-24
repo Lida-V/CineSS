@@ -17,6 +17,7 @@ OpenCV + FFmpeg で以下の合成動画を動的に生成して E2E 検証す�
 from __future__ import annotations
 
 import copy
+import json
 import math
 import shutil
 import subprocess
@@ -31,16 +32,26 @@ import numpy as np
 import soundfile as sf
 
 from app.audio.foley_engine import MISSING_FOLEY_MESSAGE, find_hunyuan_foley, generate_foley
+from app.audio.sfx_splitter import split_sfx_layers
 from app.audio.speaker_splitter import (
     apply_dialog_pan_mode_to_keyframes,
     map_dialog_azimuth,
     split_speakers,
 )
 from app.config import SAMPLE_RATE
-from app.pipeline import remix_job, run_job
+from app.director import (
+    apply_director_plan_to_scene,
+    build_auto_director_plan,
+    validate_director_plan,
+)
+from app.pipeline import apply_director_plan_and_remix, remix_job, run_job
 from app.spatial.adm_bwf import validate_adm_bwf
 from app.spatial.mastering import measure_lufs
-from app.vision.analyzer import analyze_video_spatial, inspect_video
+from app.vision.analyzer import (
+    analyze_video_spatial,
+    export_director_contact_sheet,
+    inspect_video,
+)
 
 
 def _draw_synthetic_face(img: np.ndarray, cx: int, cy: int, radius: int, mouth_open: float = 0.0) -> None:
@@ -693,6 +704,276 @@ class TestCineSSPipeline(unittest.TestCase):
         vid_b = _encode_frames_to_mp4(frames_b, fps, self.root / "anime_fallback_flash.mp4")
         res_b = analyze_video_spatial(vid_b, sample_fps=6.0)
         self.assertEqual(len(res_b["person_tracks"]), 0, "単発フラッシュを誤検出すべきではありません")
+
+    def test_10_sfx_splitter_lossless_and_silent_fold(self) -> None:
+        """SFX 4層分解の厳密総和ロスレス性および -62dBFS 未満 L/R 無音畳み込みを検証する。"""
+        sr = SAMPLE_RATE
+        dur = 2.2
+        n = int(dur * sr)
+        t = np.arange(n, dtype=np.float64) / sr
+
+        # ケースA: 低域 Sub (75Hz) + 持続 Ambience (650Hz) + 左右中央の衝撃クリック
+        sig_a = np.zeros((n, 2), dtype=np.float32)
+        sub = (0.22 * np.sin(2.0 * math.pi * 75.0 * t)).astype(np.float32)
+        amb = (0.10 * np.sin(2.0 * math.pi * 650.0 * t)).astype(np.float32)
+        sig_a[:, 0] += sub + amb
+        sig_a[:, 1] += sub + amb
+
+        def _click(length: int = 320, amp: float = 0.65) -> np.ndarray:
+            lt = np.arange(length, dtype=np.float64)
+            return (amp * np.exp(-lt / 42.0) * (1.0 - np.exp(-lt / 4.0))).astype(np.float32)
+
+        clk = _click()
+        i_l, i_c, i_r = int(0.45 * sr), int(1.10 * sr), int(1.75 * sr)
+        sig_a[i_l : i_l + len(clk), 0] += clk
+        sig_a[i_c : i_c + len(clk), 0] += clk * 0.8
+        sig_a[i_c : i_c + len(clk), 1] += clk * 0.8
+        sig_a[i_r : i_r + len(clk), 1] += clk
+
+        dir_a = self.root / "sfx_split_a"
+        dir_a.mkdir(parents=True, exist_ok=True)
+        wav_a = dir_a / "effect.wav"
+        sf.write(str(wav_a), sig_a, sr, subtype="FLOAT")
+
+        res_a = split_sfx_layers(wav_a, dir_a / "out", sample_rate=sr)
+        self.assertLess(res_a["reconstruction_error_db"], -100.0)
+        names_a = {layer["name"] for layer in res_a["layers"]}
+        self.assertEqual(
+            names_a,
+            {"sfx_sub", "sfx_ambience", "sfx_impact_left", "sfx_impact_center", "sfx_impact_right"},
+        )
+        # 出力WAVの全層加算和が元の信号と一致
+        sum_a = np.zeros_like(sig_a, dtype=np.float64)
+        for layer in res_a["layers"]:
+            arr, r_sr = sf.read(layer["path"], dtype="float32", always_2d=True)
+            self.assertEqual(r_sr, sr)
+            sum_a += arr
+        self.assertLess(float(np.max(np.abs(sum_a - sig_a))), 1e-5)
+
+        sides = [ev["dominant_side"] for ev in res_a["impact_events"]]
+        self.assertIn("left", sides)
+        self.assertIn("right", sides)
+
+        # ケースB: 完全中央パン (L == R) では L/R 出力がスキップされて center に畳み込まれ、総和は一致
+        sig_b = np.zeros((n, 2), dtype=np.float32)
+        sig_b[:, 0] = sub + amb
+        sig_b[:, 1] = sub + amb
+        sig_b[i_c : i_c + len(clk), 0] += clk
+        sig_b[i_c : i_c + len(clk), 1] += clk
+
+        dir_b = self.root / "sfx_split_b"
+        dir_b.mkdir(parents=True, exist_ok=True)
+        wav_b = dir_b / "effect.wav"
+        sf.write(str(wav_b), sig_b, sr, subtype="FLOAT")
+
+        res_b = split_sfx_layers(wav_b, dir_b / "out", sample_rate=sr)
+        self.assertIn("left", res_b["folded_channels"])
+        self.assertIn("right", res_b["folded_channels"])
+        self.assertFalse((dir_b / "out" / "sfx_impact_left.wav").exists())
+        self.assertFalse((dir_b / "out" / "sfx_impact_right.wav").exists())
+        sum_b = np.zeros_like(sig_b, dtype=np.float64)
+        for layer in res_b["layers"]:
+            arr, _ = sf.read(layer["path"], dtype="float32", always_2d=True)
+            sum_b += arr
+        self.assertLess(float(np.max(np.abs(sum_b - sig_b))), 1e-5)
+
+    def test_11_vision_sfx_distance_intensity_and_contact_sheet(self) -> None:
+        """激しいアクション近接(1.3..2.2m)・静寂遠景(3.2..5.2m)・シーン温度・コンタクトシートを検証する。"""
+        fps = 8
+        # 動画1: 激しいアクション＋フラッシュ (2.0秒)
+        act_frames: list[np.ndarray] = []
+        for fi in range(16):
+            flash = 165 if fi in (4, 10, 11) else 25
+            img = np.full((240, 426, 3), (flash, flash, flash), dtype=np.uint8)
+            x1 = int((fi * 55) % 360) + 30
+            y1 = int(60 + 90 * math.sin(fi * 1.1))
+            x2 = 400 - x1
+            cv2.rectangle(img, (x1 - 45, y1 - 45), (x1 + 45, y1 + 45), (40, 120, 250), -1)
+            cv2.circle(img, (x2, 120), 42, (240, 230, 60), -1)
+            act_frames.append(img)
+        act_vid = _encode_frames_to_mp4(act_frames, fps, self.root / "vision_action.mp4")
+
+        # 動画2: 静かな微小動き (2.0秒)
+        quiet_frames: list[np.ndarray] = []
+        for fi in range(16):
+            img = np.full((240, 426, 3), (30, 34, 40), dtype=np.uint8)
+            cx = 200 + (fi % 3)
+            cv2.circle(img, (cx, 120), 10, (90, 110, 130), -1)
+            quiet_frames.append(img)
+        quiet_vid = _encode_frames_to_mp4(quiet_frames, fps, self.root / "vision_quiet.mp4")
+
+        res_act = analyze_video_spatial(act_vid, sample_fps=8.0)
+        res_quiet = analyze_video_spatial(quiet_vid, sample_fps=8.0)
+
+        act_dists = [m["distance_m"] for m in res_act["motion_track"]]
+        quiet_dists = [m["distance_m"] for m in res_quiet["motion_track"]]
+        act_mean_d = float(np.mean(act_dists))
+        quiet_mean_d = float(np.mean(quiet_dists))
+
+        self.assertLess(act_mean_d, 2.35, f"激しいアクションは近接すべき: {act_mean_d:.2f}m")
+        self.assertGreaterEqual(min(act_dists), 1.3)
+        self.assertGreater(quiet_mean_d, 3.2, f"静かなシーンは遠景になるべき: {quiet_mean_d:.2f}m")
+        self.assertLessEqual(max(quiet_dists), 5.2)
+        self.assertLess(act_mean_d, quiet_mean_d - 1.2)
+
+        self.assertTrue(res_act.get("intensity_track"))
+        self.assertTrue(res_act.get("scene_segments"))
+        self.assertTrue(res_quiet.get("scene_segments"))
+        self.assertGreater(
+            max(p["temperature"] for p in res_act["intensity_track"]),
+            max(p["temperature"] for p in res_quiet["intensity_track"]),
+        )
+        self.assertEqual(res_quiet["scene_segments"][0]["label"], "静寂")
+
+        # コンタクトシート生成検証 (<= 1280px, <= 8枚)
+        sheet_path = self.root / "test_contact_sheet.jpg"
+        sheet = export_director_contact_sheet(act_vid, res_act, sheet_path, max_frames=8)
+        self.assertTrue(sheet_path.is_file() and sheet_path.stat().st_size > 0)
+        self.assertLessEqual(sheet["width"], 1280)
+        self.assertLessEqual(sheet["frame_count"], 8)
+        self.assertGreaterEqual(sheet["frame_count"], 2)
+
+    def test_12_director_plan_idempotency_and_remix(self) -> None:
+        """AI監督プランの検証・複数回適用冪等性・run_job統合・apply_director_plan_and_remix を検証する。"""
+        # 1) validate_director_plan のクランプ＆ソート検証
+        dirty_plan = {
+            "tracks": {
+                "sfx_impact": [
+                    {"t_sec": 100.0, "gain_db": 40.0, "distance_m": 0.1, "duck_exempt": True},
+                    {"t_sec": -2.0, "gain_db": -40.0, "distance_m": 99.0, "duck_exempt": False},
+                ]
+            }
+        }
+        clean = validate_director_plan(dirty_plan, duration_sec=4.0)
+        kfs = clean["tracks"]["sfx_impact"]
+        self.assertEqual([k["t_sec"] for k in kfs], [0.0, 4.0])
+        self.assertEqual(kfs[0]["gain_db"], -18.0)
+        self.assertEqual(kfs[0]["distance_m"], 12.0)
+        self.assertEqual(kfs[1]["gain_db"], 12.0)
+        self.assertEqual(kfs[1]["distance_m"], 0.6)
+
+        # 2) apply_director_plan_to_scene の複数回適用冪等性検証
+        dummy_vr = {
+            "duration_sec": 4.0,
+            "scene_segments": [
+                {"segment_id": 0, "start_sec": 0.0, "end_sec": 2.0, "mean_temperature": 0.15, "label": "静寂", "label_code": "quiet"},
+                {"segment_id": 1, "start_sec": 2.0, "end_sec": 4.0, "mean_temperature": 0.85, "label": "クライマックス", "label_code": "climax"},
+            ],
+        }
+        auto_plan = build_auto_director_plan(dummy_vr, sfx_info={"impact_events": [{"t_sec": 2.8, "peak_db": -8.0, "dominant_side": "left"}]})
+        base_scene = {
+            "version": 1,
+            "duration_sec": 4.0,
+            "sample_rate": SAMPLE_RATE,
+            "objects": [
+                {
+                    "id": "sfx_impact_center",
+                    "role": "sfx_impact",
+                    "is_bed": False,
+                    "gain_db": 0.0,
+                    "keyframes": [{"t": 0.0, "azimuth_deg": 0.0, "elevation_deg": 0.0, "distance_m": 2.5}],
+                },
+                {
+                    "id": "sfx_ambience",
+                    "role": "ambience",
+                    "is_bed": True,
+                    "gain_db": -0.5,
+                    "keyframes": [{"t": 0.0, "azimuth_deg": 0.0, "elevation_deg": 0.0, "distance_m": 4.5}],
+                },
+            ],
+        }
+        once = apply_director_plan_to_scene(base_scene, auto_plan)
+        twice = apply_director_plan_to_scene(once, auto_plan)
+        thrice = apply_director_plan_to_scene(twice, auto_plan)
+        self.assertEqual(once["objects"][0]["keyframes"], twice["objects"][0]["keyframes"])
+        self.assertEqual(once["objects"][0]["keyframes"], thrice["objects"][0]["keyframes"])
+        self.assertEqual(once["objects"][1]["keyframes"], thrice["objects"][1]["keyframes"])
+
+        # 別プラン適用後に元のプランに戻しても完全一致
+        alt_plan = {"tracks": {"sfx_impact": [{"t_sec": 0.0, "gain_db": -6.0, "distance_m": 5.0, "duck_exempt": False}]}}
+        swapped = apply_director_plan_to_scene(twice, alt_plan)
+        restored = apply_director_plan_to_scene(swapped, auto_plan)
+        self.assertEqual(once["objects"][0]["keyframes"], restored["objects"][0]["keyframes"])
+
+        # 3) run_job + apply_director_plan_and_remix 統合テスト
+        # 効果音イベントも確実に含まれる有音動画を簡易合成
+        fps = 10
+        dur = 2.4
+        n_frames = int(dur * fps)
+        frames = []
+        for fi in range(n_frames):
+            img = np.full((240, 426, 3), (38, 42, 52), dtype=np.uint8)
+            cx = 90 if fi < 12 else 330
+            _draw_synthetic_face(img, cx, 120, 48, mouth_open=0.5 + 0.5 * math.sin(fi))
+            frames.append(img)
+        n_s = int(dur * SAMPLE_RATE)
+        t_ax = np.arange(n_s, dtype=np.float64) / SAMPLE_RATE
+        voice = _synth_voice_wave(t_ax, 150.0, [(1, 0.8), (2, 1.0), (4, 0.7)], 3.5)
+        st = np.stack([voice * 0.6, voice * 0.6], axis=1).astype(np.float32)
+        # 80Hz sub + 左右非対称クリック (SFX分離対象)
+        st[:, 0] += (0.14 * np.sin(2.0 * math.pi * 80.0 * t_ax)).astype(np.float32)
+        st[:, 1] += (0.14 * np.sin(2.0 * math.pi * 80.0 * t_ax)).astype(np.float32)
+        hit = int(1.2 * SAMPLE_RATE)
+        st[hit : hit + 300, 0] += (0.35 * np.exp(-np.arange(300) / 45.0)).astype(np.float32)
+
+        wav_mix = self.root / "dir_test_src.wav"
+        sf.write(str(wav_mix), st, SAMPLE_RATE, subtype="FLOAT")
+        vid_mix = _encode_frames_to_mp4(frames, fps, self.root / "dir_test_vid.mp4", audio_wav=wav_mix)
+
+        job_dir = self.root / "job_director_e2e"
+        res = run_job(
+            job_dir,
+            {
+                "video_path": str(vid_mix),
+                "mode": "voiced",
+                "spatial_format": "atmos",
+                "quality_preset": "fast",
+                "target_lufs": -18.0,
+                "enable_dereverb": False,
+                "force_dsp_fallback": True,
+                "enable_sfx_multilayer": True,
+                "enable_director": True,
+            },
+        )
+        self.assertTrue(res["ok"])
+        self.assertTrue(res["enable_sfx_multilayer"])
+        self.assertTrue(res["enable_director"])
+        self.assertTrue((job_dir / "work" / "director_sheet.jpg").is_file())
+        self.assertTrue((job_dir / "work" / "director_context.json").is_file())
+        self.assertTrue((job_dir / "work" / "scene_base.json").is_file())
+        self.assertGreaterEqual(len(res["sfx_layers"]), 3)
+
+        ctx = json.loads((job_dir / "work" / "director_context.json").read_text(encoding="utf-8"))
+        self.assertIn("intensity_track", ctx)
+        self.assertIn("scene_segments", ctx)
+        self.assertIn("director_plan", ctx)
+
+        # apply_director_plan_and_remix が再解析・再分離なしで高速動作＆冪等であることを確認
+        custom_plan = {
+            "source": "test_custom_director",
+            "summary_ja": "テスト用カスタム監督プラン",
+            "tracks": {
+                "sfx_impact": [{"t_sec": 0.0, "gain_db": 5.0, "distance_m": 1.3, "duck_exempt": True}],
+                "sfx_sub": [{"t_sec": 0.0, "gain_db": 4.0, "duck_exempt": True}],
+                "ambience": [{"t_sec": 0.0, "gain_db": -3.0, "duck_exempt": False}],
+            },
+        }
+        with (
+            mock.patch("app.pipeline.analyze_video_spatial", side_effect=AssertionError("再映像解析してはならない")),
+            mock.patch("app.pipeline.separate_dme", side_effect=AssertionError("再分離してはならない")),
+        ):
+            r1 = apply_director_plan_and_remix(job_dir, custom_plan)
+            scene_after_1 = json.loads((job_dir / "scene.json").read_text(encoding="utf-8"))
+            r2 = apply_director_plan_and_remix(job_dir, custom_plan)
+            scene_after_2 = json.loads((job_dir / "scene.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(r1["ok"])
+        self.assertTrue(r2["ok"])
+        self.assertEqual(r2["director_plan"]["source"], "test_custom_director")
+        self.assertEqual(scene_after_1["objects"], scene_after_2["objects"])
+        self.assertTrue(Path(r2["binaural_output_mp4"]).is_file())
+        ctx_after = json.loads((job_dir / "work" / "director_context.json").read_text(encoding="utf-8"))
+        self.assertEqual(ctx_after["director_plan"]["source"], "test_custom_director")
 
 
 if __name__ == "__main__":

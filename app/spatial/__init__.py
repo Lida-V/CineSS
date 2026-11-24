@@ -37,8 +37,12 @@ from .hrtf import (
     HRTFEngine,
     RoomReverbEngine,
     SAMPLE_RATE,
+    interpolate_keyframe_duck_exempt,
+    interpolate_keyframe_gain_db,
     load_audio_48k,
     resample_audio,
+    resolve_gain_linear_for_render,
+    resolve_object_gain_db,
 )
 from .mastering import (
     LOUDNESS_PRESETS,
@@ -81,6 +85,8 @@ __all__ = [
     "measure_true_peak_dbtp",
     "measure_audio_metrics",
     "master_audio",
+    "interpolate_keyframe_gain_db",
+    "interpolate_keyframe_duck_exempt",
     "load_audio_48k",
     "resample_audio",
     "resolve_spatial_format",
@@ -222,14 +228,16 @@ def _prepare_stem_overrides(
     if float(np.min(duck_music)) >= 0.995:
         return overrides, False
 
-    duck_sfx = compute_dialog_ducking_gain(dialog_bus, sample_rate=sample_rate, duck_db=-2.0)
+    duck_ambience = compute_dialog_ducking_gain(dialog_bus, sample_rate=sample_rate, duck_db=-2.0)
     ducking_applied = False
 
     for idx, obj in enumerate(objects):
         if obj.get("muted", False) or not obj.get("enabled", True):
             continue
         role = str(obj.get("role", "")).strip().lower()
-        if role not in ("music", "sfx", "foley"):
+        if role == "sfx_sub" or bool(obj.get("duck_exempt", False)):
+            continue
+        if role not in ("music", "ambience", "sfx", "sfx_impact", "foley"):
             continue
         audio_path = obj.get("audio_path")
         if not audio_path:
@@ -240,17 +248,55 @@ def _prepare_stem_overrides(
         if n_sig == 0:
             continue
 
-        gain_curve = duck_music if role == "music" else duck_sfx
-        if gain_curve.shape[0] >= n_sig:
-            g = gain_curve[:n_sig]
+        keyframes = obj.get("keyframes") or obj.get("gain_keyframes")
+        if role in ("music", "ambience"):
+            base_curve = duck_music if role == "music" else duck_ambience
+            if base_curve.shape[0] >= n_sig:
+                g = base_curve[:n_sig]
+            else:
+                g = np.pad(base_curve, (0, n_sig - base_curve.shape[0]), mode="constant", constant_values=1.0)
         else:
-            g = np.pad(gain_curve, (0, n_sig - gain_curve.shape[0]), mode="constant", constant_values=1.0)
+            raw_mono = (
+                audio[:, 0].astype(np.float64)
+                if audio.ndim == 1 or audio.shape[1] == 1
+                else np.mean(audio, axis=1, dtype=np.float64)
+            )
+            eff_gain_db = resolve_object_gain_db(obj, n_sig, sample_rate=sample_rate)
+            eff_gain_lin = resolve_gain_linear_for_render(
+                n_sig, gain_db=eff_gain_db, keyframes=None, sample_rate=sample_rate
+            )
+            impact_mono = raw_mono * eff_gain_lin
+            dlg_sig = (
+                dialog_bus[:n_sig]
+                if dialog_bus.shape[0] >= n_sig
+                else np.pad(dialog_bus, (0, n_sig - dialog_bus.shape[0]), mode="constant")
+            )
+            imp_thr = float(obj.get("impact_threshold_db", -16.0))
+            g = compute_dialog_ducking_gain(
+                dlg_sig,
+                sample_rate=sample_rate,
+                duck_db=-2.0,
+                impact_override_mono=impact_mono,
+                impact_threshold_db=imp_thr,
+            )
+
+        if isinstance(keyframes, list) and any(isinstance(k, dict) and k.get("duck_exempt") for k in keyframes):
+            sample_times = np.arange(n_sig, dtype=np.float64) / float(sample_rate)
+            exempt_mask = interpolate_keyframe_duck_exempt(
+                keyframes, sample_times, default_exempt=False, sample_rate=sample_rate
+            )
+            g_f64 = g.astype(np.float64)
+            g = (g_f64 + (1.0 - g_f64) * exempt_mask).astype(np.float32)
+
+        if float(np.min(g)) >= 0.9999:
+            continue
 
         if audio.ndim == 1:
             overrides[obj_id] = (audio * g).astype(np.float32)
         else:
             overrides[obj_id] = (audio * g[:, np.newaxis]).astype(np.float32)
-        ducking_applied = True
+        if float(np.min(g)) < 0.995:
+            ducking_applied = True
 
     return overrides, ducking_applied
 

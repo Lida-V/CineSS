@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime
 import inspect
 import json
@@ -103,6 +104,9 @@ class CreateJobRequest(BaseModel):
     preview_start: float = 0.0
     preview_duration: Optional[float] = None
     enable_dereverb: bool = True
+    enable_sfx_multilayer: bool = True
+    enable_director: bool = True
+    director_plan: Optional[dict[str, Any]] = None
     execution_mode: str = "auto"  # "auto" | "agent" | "local"
 
 
@@ -574,6 +578,62 @@ def _resolve_media_path(job_id: str, state: dict[str, Any], kind: str) -> Option
     return None
 
 
+def _resolve_director_sheet_path(job_id: str) -> Optional[Path]:
+    """ジョブ内の監督コンタクトシート (director_sheet.jpg) の実ファイルパスを安全に解決する。"""
+    jdir = _job_dir(job_id)
+    ctx = _read_json(jdir / "work" / "director_context.json", default=None)
+    candidates: list[Path] = []
+    if isinstance(ctx, dict):
+        for key in ("director_sheet_path", "sheet_path", "contact_sheet_path"):
+            raw = ctx.get(key)
+            if isinstance(raw, str) and raw.strip():
+                p = Path(raw.strip())
+                if p.is_absolute():
+                    candidates.append(p)
+                else:
+                    candidates.append(jdir / p)
+                    candidates.append(jdir / "work" / p)
+    candidates.extend(
+        [
+            jdir / "work" / "director_sheet.jpg",
+            jdir / "director_sheet.jpg",
+        ]
+    )
+    result = _read_json(jdir / "result.json", default=None)
+    extracted = _extract_result_path(
+        result, ("director_sheet", "director_sheet_jpg", "contact_sheet")
+    )
+    if extracted:
+        candidates.append(extracted)
+
+    for cand in candidates:
+        try:
+            if cand.is_file():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def _read_director_context(job_id: str) -> Optional[dict[str, Any]]:
+    """work/director_context.json を読み込み、API契約用の URL 等を補完する。"""
+    jdir = _job_dir(job_id)
+    ctx = _read_json(jdir / "work" / "director_context.json", default=None)
+    if not isinstance(ctx, dict):
+        return None
+    out = dict(ctx)
+    out.setdefault("job_id", job_id)
+    sheet_path = _resolve_director_sheet_path(job_id)
+    if sheet_path is not None:
+        out["has_director_sheet"] = True
+        out["director_sheet_url"] = f"/api/jobs/{job_id}/media/director_sheet"
+    else:
+        out["has_director_sheet"] = False
+        if not out.get("director_sheet_url"):
+            out["director_sheet_url"] = None
+    return out
+
+
 def _collect_stems(job_id: str, scene: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
     """ジョブ内の個別ステムWAVを一覧化する。"""
     jdir = _job_dir(job_id)
@@ -649,6 +709,22 @@ def _enrich_job_payload(job_id: str, state: dict[str, Any]) -> dict[str, Any]:
             media_urls[kind] = f"/api/jobs/{job_id}/media/{kind}{qs}"
     out["available_media"] = available_media
     out["media_urls"] = media_urls
+
+    sheet_path = _resolve_director_sheet_path(job_id)
+    available_media["director_sheet"] = bool(sheet_path and sheet_path.is_file())
+    if available_media["director_sheet"]:
+        media_urls["director_sheet"] = f"/api/jobs/{job_id}/media/director_sheet{qs}"
+
+    dctx = _read_director_context(job_id)
+    if dctx is not None:
+        if available_media["director_sheet"]:
+            dctx["director_sheet_url"] = f"/api/jobs/{job_id}/media/director_sheet"
+        out["director_context"] = dctx
+        out["has_director_context"] = True
+    else:
+        out["director_context"] = None
+        out["has_director_context"] = False
+
     out["stems"] = _collect_stems(job_id, scene)
     return out
 
@@ -932,12 +1008,25 @@ def api_system_shutdown(req: Optional[ShutdownRequest] = Body(default=None)):
 # ---------------------------------------------------------------------------
 # 1. ハードウェア診断＆モデル管理
 # ---------------------------------------------------------------------------
-@app.get("/api/system/check")
-def api_system_check() -> dict[str, Any]:
-    """実PCのCPU/GPU/RAM/FFmpeg/ディスク診断＋エージェント接続状態を返す。"""
+def _build_system_report() -> dict[str, Any]:
+    """実PCのCPU/GPU/RAM/FFmpeg/ディスク診断＋Mac MPS/非NVIDIA GPU情報＋エージェント接続状態を返す。"""
     from app.hardware_advisor import check_system
 
     report = dict(check_system())
+    gpu = dict(report.get("gpu") or {})
+    cuda_ok = bool(gpu.get("cuda", False))
+    mps_ok = bool(gpu.get("mps", False))
+    gpu.setdefault("cuda", cuda_ok)
+    gpu.setdefault("mps", mps_ok)
+    gpu.setdefault("non_nvidia_gpu", False)
+    gpu.setdefault("unified_memory", False)
+    gpu.setdefault("backend", "cuda" if cuda_ok else ("mps" if mps_ok else "cpu"))
+    report["gpu"] = gpu
+
+    mem = dict(report.get("memory") or {})
+    mem.setdefault("unified_memory", bool(gpu.get("unified_memory", False)))
+    report["memory"] = mem
+
     agent = _get_agent_info()
     report["agent_connected"] = agent["agent_connected"]
     report["agent_last_seen"] = agent["agent_last_seen"]
@@ -946,6 +1035,18 @@ def api_system_check() -> dict[str, Any]:
     report["active_job_id"] = agent["active_job_id"]
     report["agent"] = agent
     return report
+
+
+@app.get("/api/system")
+def api_system() -> dict[str, Any]:
+    """PC動作環境診断レポートを返す（/api/system/check エイリアス）。"""
+    return _build_system_report()
+
+
+@app.get("/api/system/check")
+def api_system_check() -> dict[str, Any]:
+    """実PCのCPU/GPU/RAM/FFmpeg/ディスク診断＋エージェント接続状態を返す。"""
+    return _build_system_report()
 
 
 @app.post("/api/system/recommend")
@@ -1199,8 +1300,12 @@ def api_create_job(req: CreateJobRequest) -> dict[str, Any]:
         "preview_start": preview_start,
         "preview_duration": preview_duration,
         "enable_dereverb": bool(req.enable_dereverb),
+        "enable_sfx_multilayer": bool(req.enable_sfx_multilayer),
+        "enable_director": bool(req.enable_director),
         "execution_mode": exec_mode,
     }
+    if req.director_plan is not None:
+        request_payload["director_plan"] = req.director_plan
     _atomic_write_json(jdir / "request.json", request_payload)
 
     agent = _get_agent_info()
@@ -1724,6 +1829,181 @@ def api_agent_complete(job_id: str, req: AgentCompleteRequest) -> dict[str, Any]
     return {"ok": True, "job_id": job_id, "state": _enrich_job_payload(job_id, st)}
 
 
+@app.get("/api/jobs/{job_id}/director-context")
+def api_job_director_context(job_id: str) -> dict[str, Any]:
+    """ジョブの AI ダビング監督コンテキスト (work/director_context.json) を返す。"""
+    jdir = _job_dir(job_id)
+    st = _read_job_state(job_id)
+    if not st and not jdir.is_dir():
+        raise HTTPException(status_code=404, detail=f"ジョブが見つかりません: {job_id}")
+    ctx = _read_director_context(job_id)
+    if ctx is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"ジョブ '{job_id}' には監督コンテキストが存在しません",
+        )
+    return ctx
+
+
+@app.post("/api/jobs/{job_id}/director-plan")
+def api_job_director_plan(job_id: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """監督演出プランを適用し、分離済みトラックから空間リミックス＆再結合を実行する。"""
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="JSON オブジェクトを指定してください")
+
+    if "director_plan" in body:
+        if not isinstance(body["director_plan"], dict):
+            raise HTTPException(status_code=400, detail="director_plan は JSON オブジェクトで指定してください")
+        plan_payload = body["director_plan"]
+    elif "plan" in body and isinstance(body["plan"], dict):
+        plan_payload = body["plan"]
+    else:
+        plan_payload = body
+
+    jdir = _job_dir(job_id)
+    with _state_lock:
+        st = _read_job_state(job_id)
+        if not st and not jdir.is_dir():
+            raise HTTPException(status_code=404, detail=f"ジョブが見つかりません: {job_id}")
+        if st and st.get("status") in ("agent_running", "local_running", "remixing"):
+            raise HTTPException(
+                status_code=409,
+                detail="ジョブが現在処理中のため、完了後に監督演出を再適用してください",
+            )
+        prev_state = copy.deepcopy(st) if st is not None else None
+        had_state_file = st is not None
+        if st is None:
+            if not (
+                (jdir / "scene.json").is_file()
+                or (jdir / "work" / "scene_base.json").is_file()
+                or (jdir / "work" / "director_context.json").is_file()
+            ):
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"ジョブ '{job_id}' は未完了またはシーン情報がありません",
+                )
+            now = _now_ts()
+            st = {
+                "job_id": job_id,
+                "filename": job_id,
+                "status": "done",
+                "stage": "done",
+                "progress": 100.0,
+                "remix_version": 0,
+                "created_at": now,
+                "updated_at": now,
+                "request": _read_json(jdir / "request.json", default={}) or {},
+                "logs": [],
+                "result": _read_json(jdir / "result.json", default=None),
+                "error": None,
+            }
+        st["status"] = "remixing"
+        st["stage"] = "remix"
+        st["progress"] = 10.0
+        st["message"] = "AIダビング監督演出プランを適用し再MixMaster＆MP4再結合を実行中..."
+        st["cancel_requested"] = False
+        _append_log(
+            st,
+            "監督演出プランを適用して空間リミックスを開始しました。",
+            actor="user",
+            stage="remix",
+        )
+        _write_job_state(job_id, st)
+
+    t0 = _now_ts()
+    progress_cb, log_cb = _make_callbacks(job_id, default_actor="director")
+    try:
+        import app.pipeline as pipeline_mod
+
+        apply_fn = getattr(pipeline_mod, "apply_director_plan_and_remix", None)
+        if apply_fn is None:
+            raise RuntimeError("app.pipeline.apply_director_plan_and_remix が未実装です")
+
+        sig_params = inspect.signature(apply_fn).parameters
+        has_var_kw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values()
+        )
+        call_kwargs: dict[str, Any] = {}
+        if "progress_cb" in sig_params or has_var_kw:
+            call_kwargs["progress_cb"] = progress_cb
+        if "log_cb" in sig_params or has_var_kw:
+            call_kwargs["log_cb"] = log_cb
+
+        apply_out = apply_fn(jdir, plan_payload, **call_kwargs)
+        if isinstance(apply_out, dict) and isinstance(apply_out.get("result"), dict):
+            new_result = apply_out["result"]
+            returned_plan = apply_out.get("director_plan")
+        else:
+            new_result = apply_out if isinstance(apply_out, dict) else {}
+            returned_plan = (
+                new_result.get("director_plan") if isinstance(new_result, dict) else None
+            )
+
+        updated_ctx = _read_director_context(job_id)
+        updated_plan = (
+            returned_plan
+            or (updated_ctx.get("director_plan") if isinstance(updated_ctx, dict) else None)
+            or plan_payload
+        )
+
+        with _state_lock:
+            st = _read_job_state(job_id) or {"job_id": job_id}
+            st["status"] = "done"
+            st["stage"] = "done"
+            st["progress"] = 100.0
+            st["remix_version"] = int(st.get("remix_version") or 0) + 1
+            st["result"] = new_result or _read_json(jdir / "result.json", default=st.get("result"))
+            st["error"] = None
+            elapsed = round(_now_ts() - t0, 2)
+            st["message"] = f"監督演出プランの適用＆再MixMasterが完了しました（{elapsed}秒）"
+            _append_log(
+                st,
+                f"監督演出プランによる空間リミックス＆再結合が完了しました（{elapsed}秒）。",
+                actor="director",
+                stage="done",
+            )
+            _write_job_state(job_id, st)
+
+        enriched = _enrich_job_payload(job_id, st)
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "status": "done",
+            "remix_version": enriched.get("remix_version", 1),
+            "elapsed_sec": elapsed,
+            "director_plan": updated_plan,
+            "director_context": enriched.get("director_context") or updated_ctx,
+            "result": enriched.get("result"),
+            "scene": enriched.get("scene"),
+            "media_urls": enriched.get("media_urls"),
+            "state": enriched,
+        }
+    except (ValueError, FileNotFoundError) as exc:
+        err_msg = str(exc) or exc.__class__.__name__
+        with _state_lock:
+            if had_state_file and prev_state is not None:
+                _append_log(
+                    prev_state,
+                    f"監督演出プラン検証エラー: {err_msg}",
+                    actor="director",
+                    stage=prev_state.get("stage"),
+                )
+                _write_job_state(job_id, prev_state)
+        status_code = 404 if isinstance(exc, FileNotFoundError) else 400
+        raise HTTPException(status_code=status_code, detail=err_msg) from exc
+    except Exception as exc:
+        err_msg = str(exc) or exc.__class__.__name__
+        with _state_lock:
+            st = _read_job_state(job_id) or {"job_id": job_id}
+            st["status"] = "error"
+            st["stage"] = "error"
+            st["error"] = err_msg
+            st["message"] = f"監督演出リミックスエラー: {err_msg}"
+            _append_log(st, f"監督演出リミックスに失敗しました: {err_msg}", actor="director", stage="error")
+            _write_job_state(job_id, st)
+        raise HTTPException(status_code=500, detail=f"監督演出リミックスに失敗しました: {err_msg}") from exc
+
+
 # ---------------------------------------------------------------------------
 # 4. メディア配信・ダウンロード
 # ---------------------------------------------------------------------------
@@ -1746,6 +2026,34 @@ _MEDIA_DOWNLOAD_NAME = {
     "surround_714": "ciness_surround_714.wav",
     "stems_zip": "ciness_stems.zip",
 }
+
+
+@app.get("/api/jobs/{job_id}/media/director_sheet")
+def api_job_media_director_sheet(
+    job_id: str,
+    download: int = Query(0),
+) -> FileResponse:
+    """ジョブの監督コンタクトシート画像 (work/director_sheet.jpg) を JPEG で返す。"""
+    jdir = _job_dir(job_id)
+    st = _read_job_state(job_id)
+    if not st and not jdir.is_dir():
+        raise HTTPException(status_code=404, detail=f"ジョブが見つかりません: {job_id}")
+    sheet_path = _resolve_director_sheet_path(job_id)
+    if not sheet_path or not sheet_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"ジョブ '{job_id}' の監督コンタクトシートが見つかりません",
+        )
+    headers = {"Cache-Control": "no-store"}
+    if download:
+        stem_base = Path((st or {}).get("filename") or job_id).stem
+        return FileResponse(
+            str(sheet_path),
+            media_type="image/jpeg",
+            filename=f"{stem_base}_director_sheet.jpg",
+            headers=headers,
+        )
+    return FileResponse(str(sheet_path), media_type="image/jpeg", headers=headers)
 
 
 @app.get("/api/jobs/{job_id}/media/{kind}")

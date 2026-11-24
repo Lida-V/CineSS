@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -19,7 +20,7 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
-from app.config import ENGINE_DIR, MODELS_DIR, find_soundseparator_dir
+from app.config import ENGINE_DIR, MODELS_DIR, find_soundseparator_dir, find_venv_python
 
 ProgressCallback = Callable[[int, str], None]
 
@@ -442,6 +443,21 @@ def _fetch_file(
     raise RuntimeError(f"{target.name} の取得に失敗しました: {last_error}")
 
 
+def _select_foley_torch_index_url(
+    system_name: str | None = None,
+    has_nvidia: bool | None = None,
+) -> str | None:
+    """実行環境に応じた HunyuanVideo-Foley 用 PyTorch index URL を返す（標準 PyPI 時は None）。"""
+    sys_name = system_name or platform.system()
+    if sys_name == "Darwin":
+        # macOS は標準 PyPI の wheel が MPS / CPU に対応している
+        return None
+    nvidia_ok = bool(shutil.which("nvidia-smi")) if has_nvidia is None else bool(has_nvidia)
+    if nvidia_ok:
+        return "https://download.pytorch.org/whl/cu124"
+    return "https://download.pytorch.org/whl/cpu"
+
+
 def _download_hunyuan_foley(spec: dict, progress_cb: ProgressCallback | None = None) -> dict:
     """HunyuanVideo-Foley の推論コード・独立 venv・モデル重み・補助エンコーダを取得構築する。"""
     uv_bin = shutil.which("uv")
@@ -458,14 +474,14 @@ def _download_hunyuan_foley(spec: dict, progress_cb: ProgressCallback | None = N
     except ImportError as exc:
         raise RuntimeError(
             f"{spec['label']} の自動取得には huggingface_hub が必要です。\n"
-            "既存のCUDA版PyTorchを壊さないよう以下を実行してから再試行してください:\n"
+            "既存のPyTorch環境を壊さないよう以下を実行してから再試行してください:\n"
             "  uv pip install --python .venv huggingface-hub"
         ) from exc
 
     foley_root = ENGINE_DIR / "hunyuan_foley"
     app_dir = foley_root / "app"
     venv_dir = foley_root / ".venv"
-    venv_py = venv_dir / ("Scripts" if os.name == "nt" else "bin") / ("python.exe" if os.name == "nt" else "python")
+    venv_py = find_venv_python(foley_root)
     model_dir = foley_root / "models" / "HunyuanVideo-Foley"
     hf_hub_cache = foley_root / "hf-cache" / "hub"
 
@@ -480,7 +496,10 @@ def _download_hunyuan_foley(spec: dict, progress_cb: ProgressCallback | None = N
     variant_file = "hunyuanvideo_foley.pth" if spec["id"] == "hunyuan_foley_xxl" else "hunyuanvideo_foley_xl.pth"
 
     def _run_step(cmd: list[str], label: str) -> None:
-        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        env = os.environ.copy()
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        proc = subprocess.run(cmd, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if proc.returncode != 0:
             tail = (proc.stderr or proc.stdout or "").strip()[-500:]
             raise RuntimeError(f"{label} に失敗しました: {tail}")
@@ -504,15 +523,15 @@ def _download_hunyuan_foley(spec: dict, progress_cb: ProgressCallback | None = N
     _emit(progress_cb, 15, "HunyuanVideo-Foley 用 Python 3.11 環境を構築中...")
     if not venv_py.is_file():
         _run_step([uv_bin, "venv", "--python", "3.11", str(venv_dir)], "uv venv")
+        venv_py = find_venv_python(foley_root)
 
-    has_nvidia = bool(shutil.which("nvidia-smi"))
-    torch_index = "https://download.pytorch.org/whl/cu124" if has_nvidia else "https://download.pytorch.org/whl/cpu"
+    torch_index = _select_foley_torch_index_url()
     torch_pkgs = ["torch==2.6.0", "torchvision==0.21.0", "torchaudio==2.6.0"]
     _emit(progress_cb, 22, "PyTorch と推論依存パッケージを導入しています...")
-    _run_step(
-        [uv_bin, "pip", "install", "--python", str(venv_py), *torch_pkgs, "--index-url", torch_index],
-        "PyTorch 導入",
-    )
+    torch_cmd = [uv_bin, "pip", "install", "--python", str(venv_py), *torch_pkgs]
+    if torch_index:
+        torch_cmd.extend(["--index-url", torch_index])
+    _run_step(torch_cmd, "PyTorch 導入")
 
     req_src = app_dir / "requirements.txt"
     if req_src.is_file():
@@ -523,14 +542,13 @@ def _download_hunyuan_foley(spec: dict, progress_cb: ProgressCallback | None = N
         ]
         runtime_req = foley_root / "requirements.runtime.txt"
         runtime_req.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        _run_step(
-            [
-                uv_bin, "pip", "install", "--python", str(venv_py),
-                "-r", str(runtime_req), "soundfile", *torch_pkgs,
-                "--extra-index-url", torch_index, "--index-strategy", "unsafe-best-match",
-            ],
-            "HunyuanVideo-Foley 依存パッケージ導入",
-        )
+        dep_cmd = [
+            uv_bin, "pip", "install", "--python", str(venv_py),
+            "-r", str(runtime_req), "soundfile", *torch_pkgs,
+        ]
+        if torch_index:
+            dep_cmd.extend(["--extra-index-url", torch_index, "--index-strategy", "unsafe-best-match"])
+        _run_step(dep_cmd, "HunyuanVideo-Foley 依存パッケージ導入")
 
     # 3. 本体・Synchformer・VAE 重みのダウンロード
     _emit(progress_cb, 40, f"{spec['label']} 重みを HuggingFace から取得しています（大容量）...")
@@ -664,7 +682,7 @@ def download_model(model_id: str, progress_cb: ProgressCallback | None = None) -
         except ImportError as exc:
             raise RuntimeError(
                 f"{spec['label']} の自動取得には huggingface_hub が必要です。\n"
-                "既存のCUDA版PyTorchを壊さないよう以下を実行してから再試行してください:\n"
+                "既存のPyTorch環境を壊さないよう以下を実行してから再試行してください:\n"
                 "  uv pip install --python .venv huggingface-hub\n"
                 f"または {spec['source_url']} から手動取得し、{dest_dir} に配置してください。"
             ) from exc

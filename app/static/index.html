@@ -91,13 +91,15 @@
           <div class="hw-card-head">
             <div class="hw-label">
               <span class="hw-icon">🎮</span>
-              <span>GPU（CUDA / VRAM）</span>
+              <span>GPU（CUDA / MPS / VRAM）</span>
             </div>
             <span id="gpu-status-badge" class="verdict-badge is-loading">確認中</span>
           </div>
           <div id="gpu-value" class="hw-value">計測中…</div>
           <div id="gpu-meta" class="hw-meta">VRAM 空き -- / 総容量 -- GB</div>
+          <div id="gpu-accel-badges" class="hw-accel-badges hidden"></div>
           <p id="gpu-note" class="hw-note">GPUアクセラレーションと空きVRAMを確認しています…</p>
+          <div id="gpu-platform-note" class="hw-platform-banner hidden"></div>
         </article>
 
         <article id="hw-card-ram" class="hw-card">
@@ -110,6 +112,7 @@
           </div>
           <div id="ram-value" class="hw-value">計測中…</div>
           <div id="ram-meta" class="hw-meta">利用可能 -- / 総容量 -- GB</div>
+          <div id="ram-accel-badges" class="hw-accel-badges hidden"></div>
           <p id="ram-note" class="hw-note">長尺音声処理・モデル展開に必要なメモリを確認しています…</p>
         </article>
       </div>
@@ -481,6 +484,14 @@
                 <input id="chk-dialog-ducking" type="checkbox" checked>
                 <span class="toggle-label">セリフ優先ダッキングを有効にする <small>発話中のみBGM・効果音を自然に抑えて声を明瞭化</small></span>
               </label>
+              <label class="toggle-line">
+                <input id="chk-sfx-multilayer" type="checkbox" checked>
+                <span class="toggle-label">SFXを映画方式で4層分解する（Sub / Impact L・C・R / Ambience） <small>効果音を重低音・衝撃音(L/C/R)・環境音へ損失なく分離し迫力と定位を最適化</small></span>
+              </label>
+              <label class="toggle-line">
+                <input id="chk-enable-director" type="checkbox" checked>
+                <span class="toggle-label">映像シーン温度によるAIダビング監督演出を有効にする <small>映像の動き・フラッシュ・カット展開に応じて効果音と重低音を自動演出</small></span>
+              </label>
             </div>
 
             <!-- 無音Foleyオプション -->
@@ -758,6 +769,74 @@
         </div>
       </div>
 
+      <!-- 中段：AIダビング監督演出 ＆ シーン温度分析（監督コンテキスト対応ジョブのみ表示） -->
+      <section id="director-plan-card" class="director-card hidden" aria-labelledby="director-card-heading">
+        <div class="director-card-head">
+          <div>
+            <span class="eyebrow">AI DUBBING DIRECTOR · SCENE TEMPERATURE &amp; CONTACT SHEET</span>
+            <h3 id="director-card-heading">🎬 AIダビング監督演出 ＆ シーン温度分析</h3>
+          </div>
+          <div class="director-head-badges">
+            <span id="director-status-badge" class="status-pill is-ok">演出適用済み</span>
+            <span id="director-temp-peak-badge" class="meta-chip">最高温度 --</span>
+            <span id="director-segments-badge" class="meta-chip">区間 --</span>
+          </div>
+        </div>
+
+        <div class="director-card-grid">
+          <!-- 左：コンタクトシート ＆ シーン温度タイムライン -->
+          <div class="director-visual-col">
+            <div id="director-sheet-wrap" class="director-sheet-wrap hidden">
+              <div class="director-subhead">
+                <span>🎞️ 映像コンタクトシート（シーン温度オーバーレイ）</span>
+                <a id="director-sheet-link" class="btn btn-xs btn-ghost" href="#" target="_blank" rel="noopener noreferrer">拡大画像 ↗</a>
+              </div>
+              <a id="director-sheet-img-link" class="director-sheet-frame" href="#" target="_blank" rel="noopener noreferrer" title="別タブでコンタクトシートを開く">
+                <img id="director-sheet-img" alt="監督コンタクトシート">
+              </a>
+            </div>
+
+            <div class="director-temp-section">
+              <div class="director-subhead">
+                <span>🌡️ シーン温度サマリー ＆ 展開区間</span>
+                <span id="director-sfx-events-badge" class="meta-chip hidden">衝撃イベント 0件</span>
+              </div>
+              <div id="director-temp-timeline" class="director-temp-timeline" title="区間をクリックすると該当時刻へシークします"></div>
+              <div id="director-segments-list" class="director-segments-list"></div>
+              <div id="director-sfx-layers-row" class="director-sfx-layers hidden"></div>
+            </div>
+          </div>
+
+          <!-- 右：監督演出コメント・キーフレーム概要・カスタム再適用 -->
+          <div class="director-control-col">
+            <div class="director-notes-box">
+              <div class="director-subhead">
+                <span>📝 監督演出コメント ＆ 適用キーフレーム概要</span>
+              </div>
+              <div id="director-notes-list" class="director-notes-list"></div>
+              <div id="director-keyframes-summary" class="director-keyframes-summary"></div>
+            </div>
+
+            <div class="director-edit-box">
+              <div class="director-subhead">
+                <label for="director-plan-json">🎛️ 監督演出プラン JSON（調整して再適用・リミックス可能）</label>
+                <div class="director-json-tools">
+                  <button id="btn-director-format-json" class="btn btn-xs btn-ghost" type="button">整形</button>
+                  <button id="btn-director-reset-json" class="btn btn-xs btn-ghost" type="button">↺ 自動プランに戻す</button>
+                </div>
+              </div>
+              <textarea id="director-plan-json" class="studio-textarea" rows="7" spellcheck="false" aria-label="監督演出プランJSON"></textarea>
+              <div class="director-apply-row">
+                <span class="director-apply-hint">再分離・再解析なしでこの監督プランを空間配置・ダッキング・音量へ即反映します。</span>
+                <button id="btn-director-reapply" class="btn btn-outline-cyan btn-sm" type="button">
+                  <span>✨ 監督演出を再適用 / リミックス</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <!-- 下段：インタラクティブ 3D 空間レーダー（Canvas）＋ 右側トラックミキサー -->
       <div class="spatial-editor-grid">
         <!-- 左：トップダウン3D空間レーダー -->
@@ -769,8 +848,11 @@
             </div>
             <div class="radar-legend">
               <span class="legend-item"><i class="dot-dialog"></i>話者/セリフ</span>
+              <span class="legend-item"><i class="dot-sfx-impact"></i>SFX衝撃</span>
+              <span class="legend-item"><i class="dot-sfx-sub"></i>SFX重低音</span>
               <span class="legend-item"><i class="dot-sfx"></i>効果音/Foley</span>
-              <span class="legend-item"><i class="dot-music"></i>BGM/環境音</span>
+              <span class="legend-item"><i class="dot-ambience"></i>環境音</span>
+              <span class="legend-item"><i class="dot-music"></i>BGM</span>
             </div>
           </div>
           <div class="radar-canvas-wrap">

@@ -387,6 +387,33 @@ def _diarize_acoustic_clustering(
 # ---------------------------------------------------------------------------
 # Step 2: 重なり分離強化＋10msクロスフェード時間振り分け
 # ---------------------------------------------------------------------------
+def _resolve_torch_device() -> tuple[str, str]:
+    """config.get_torch_device() または torch バックエンドからデバイス (cuda/mps/cpu) を解決する。"""
+    try:
+        from app import config as ciness_config
+
+        fn = getattr(ciness_config, "get_torch_device", None)
+        if callable(fn):
+            res = fn()
+            if isinstance(res, tuple) and len(res) >= 2:
+                return str(res[0]), str(res[1])
+            if isinstance(res, str) and res:
+                return res, res.upper()
+    except Exception:
+        pass
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda", "NVIDIA CUDA"
+        mps_backend = getattr(torch.backends, "mps", None)
+        if mps_backend is not None and mps_backend.is_available():
+            return "mps", "Apple Silicon MPS"
+    except Exception:
+        pass
+    return "cpu", "CPU"
+
+
 def _try_load_local_sepformer() -> Any | None:
     """ローカル保存済みの SpeechBrain SepFormer がある場合のみ読み込む（暗黙DLしない）。"""
     sep_dir = MODELS_DIR / "sepformer" / "sepformer-whamr"
@@ -394,16 +421,27 @@ def _try_load_local_sepformer() -> Any | None:
     if not sep_dir.is_dir() or not all((sep_dir / f).is_file() for f in required):
         return None
     try:
-        import torch
         from speechbrain.inference.separation import SepformerSeparation
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        return SepformerSeparation.from_hparams(
-            source=str(sep_dir),
-            savedir=str(sep_dir),
-            run_opts={"device": device},
-            local_strategy="copy",
-        )
+        device, _ = _resolve_torch_device()
+        if device == "mps":
+            os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        try:
+            return SepformerSeparation.from_hparams(
+                source=str(sep_dir),
+                savedir=str(sep_dir),
+                run_opts={"device": device},
+                local_strategy="copy",
+            )
+        except Exception:
+            if device != "cpu":
+                return SepformerSeparation.from_hparams(
+                    source=str(sep_dir),
+                    savedir=str(sep_dir),
+                    run_opts={"device": "cpu"},
+                    local_strategy="copy",
+                )
+            raise
     except Exception:
         return None
 
@@ -511,9 +549,12 @@ def _separate_overlap_slice_sepformer(
     if len(mono_8k) < 400:
         return _separate_overlap_slice_wiener(slice_stereo, sr, sp_pair, templates)
 
-    with torch.inference_mode():
-        wav_t = torch.from_numpy(mono_8k).unsqueeze(0)
-        est = sepformer.separate_batch(wav_t)[0].detach().cpu().numpy()  # (samples_8k, 2)
+    try:
+        with torch.inference_mode():
+            wav_t = torch.from_numpy(mono_8k).unsqueeze(0)
+            est = sepformer.separate_batch(wav_t)[0].detach().cpu().numpy()  # (samples_8k, 2)
+    except Exception:
+        return _separate_overlap_slice_wiener(slice_stereo, sr, sp_pair, templates)
     if est.ndim != 2 or est.shape[1] < 2:
         return _separate_overlap_slice_wiener(slice_stereo, sr, sp_pair, templates)
 

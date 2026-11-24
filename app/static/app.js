@@ -27,6 +27,8 @@
     radarDraggingId: null,
     radarHoverId: null,
     radarAnimFrame: null,
+    directorContext: null,
+    initialDirectorPlan: null,
 
     // Step 3: Web Audio A/B 比較試聴
     abSource: "binaural", // "original" | "binaural"
@@ -49,11 +51,29 @@
   // 役割別パレット（話者が複数いる場合はシアン〜ブルー〜ミント系で視認区別）
   const DIALOG_COLORS = ["#22d3ee", "#38bdf8", "#34d399", "#2dd4bf", "#60a5fa", "#a3e635"];
   const ROLE_COLORS = {
+    sfx_sub: "#f43f5e",
+    sfx_impact: "#f97316",
     sfx: "#f59e0b",
-    foley: "#fb923c",
-    music: "#a78bfa",
+    foley: "#fbbf24",
+    music: "#818cf8",
     ambience: "#c084fc",
   };
+  const ROLE_LABELS_JA = {
+    dialog: "話者/セリフ",
+    speaker: "話者/セリフ",
+    voice: "話者/セリフ",
+    sfx_sub: "SFX重低音 (Sub)",
+    sfx_impact: "SFX衝撃 (Impact)",
+    sfx: "効果音 (SFX)",
+    foley: "Foley効果音",
+    music: "BGM",
+    ambience: "環境音 (Ambience)",
+  };
+
+  function formatRoleLabelJa(role) {
+    const r = String(role || "audio").toLowerCase();
+    return ROLE_LABELS_JA[r] || role || "audio";
+  }
 
   // --------------------------------------------------------------------------
   // DOM ユーティリティ
@@ -218,24 +238,89 @@
     $("cpu-meta").textContent = `${cpu.cores ?? "--"} 物理コア / ${cpu.threads ?? "--"} 論理スレッド`;
     $("cpu-note").textContent = cpu.note || "";
 
-    // GPU
+    // GPU（NVIDIA CUDA / Apple Silicon MPS / 非NVIDIA GPU / CPU）
     const gpu = data.gpu || {};
+    const mem = data.memory || {};
+    const isMps = Boolean(gpu.mps || String(gpu.backend || "").toLowerCase() === "mps");
+    const isCuda = Boolean(gpu.cuda);
+    const isUnified = Boolean(gpu.unified_memory || mem.unified_memory);
+    const isNonNvidia = Boolean(gpu.non_nvidia_gpu);
+
     applyCardStatus($("hw-card-gpu"), $("gpu-status-badge"), gpu.status);
-    $("gpu-value").textContent = gpu.name || "未検出（CPUモード）";
-    if (gpu.cuda || (gpu.vram_total_gb && gpu.vram_total_gb > 0)) {
+    $("gpu-value").textContent = gpu.name || (isMps ? "Apple Silicon GPU (MPS)" : "未検出（CPUモード）");
+    if (isCuda || (!isMps && gpu.vram_total_gb && gpu.vram_total_gb > 0)) {
       const drv = gpu.driver ? ` · Driver ${gpu.driver}` : "";
       $("gpu-meta").textContent =
-        `CUDA ${gpu.cuda ? "有効" : "無効"} · VRAM 空き ${Number(gpu.vram_free_gb || 0).toFixed(1)} / 総容量 ${Number(gpu.vram_total_gb || 0).toFixed(1)} GB${drv}`;
+        `CUDA ${isCuda ? "有効" : "無効"} · VRAM 空き ${Number(gpu.vram_free_gb || 0).toFixed(1)} / 総容量 ${Number(gpu.vram_total_gb || 0).toFixed(1)} GB${drv}`;
+    } else if (isMps) {
+      const memTotal = Number(gpu.unified_memory_gb || mem.total_gb || gpu.vram_total_gb || 0).toFixed(1);
+      $("gpu-meta").textContent = isUnified
+        ? `MPS 有効 · ユニファイドメモリ ${memTotal} GB（CPU/GPU共有）`
+        : "Apple Silicon MPS 有効";
+    } else if (isNonNvidia) {
+      $("gpu-meta").textContent = "非NVIDIA GPU（CUDA非対応 · CPU/DSP推論モード）";
     } else {
-      $("gpu-meta").textContent = "CUDA 非対応 / VRAM 0.0 GB";
+      $("gpu-meta").textContent = "CUDA / MPS 非対応 / VRAM 0.0 GB";
+    }
+
+    const gpuBadges = $("gpu-accel-badges");
+    if (gpuBadges) {
+      const pills = [];
+      if (isCuda) pills.push(`<span class="accel-pill is-cuda">⚡ NVIDIA CUDA</span>`);
+      if (isMps) pills.push(`<span class="accel-pill is-mps">🍎 Apple Silicon MPS</span>`);
+      if (isUnified) pills.push(`<span class="accel-pill is-unified">🧠 ユニファイドメモリ共有</span>`);
+      if (isNonNvidia && !isCuda && !isMps) {
+        pills.push(`<span class="accel-pill is-non-nvidia">🧩 非NVIDIA GPU（AMD / Intel等）</span>`);
+        pills.push(`<span class="accel-pill is-cpu">💻 CPUフォールバック</span>`);
+      } else if (!isCuda && !isMps) {
+        pills.push(`<span class="accel-pill is-cpu">💻 CPU動作モード</span>`);
+      }
+      if (pills.length) {
+        gpuBadges.innerHTML = pills.join("");
+        gpuBadges.classList.remove("hidden");
+      } else {
+        gpuBadges.innerHTML = "";
+        gpuBadges.classList.add("hidden");
+      }
     }
     $("gpu-note").textContent = gpu.note || "";
 
+    const platformBanner = $("gpu-platform-note");
+    if (platformBanner) {
+      if (isMps) {
+        platformBanner.className = "hw-platform-banner";
+        platformBanner.textContent =
+          "Apple Silicon MPS 環境です。PYTORCH_ENABLE_MPS_FALLBACK=1 により未対応演算を補完しつつ実行します（高負荷時はユニファイドメモリ残量にご注意ください）。";
+      } else if (isUnified && !isMps && !isCuda) {
+        platformBanner.className = "hw-platform-banner is-warn";
+        platformBanner.textContent =
+          "Apple Silicon 環境ですが PyTorch MPS が未有効のため CPU / DSP フォールバックモードで動作します。";
+      } else if (isNonNvidia && !isCuda) {
+        platformBanner.className = "hw-platform-banner is-warn";
+        platformBanner.textContent =
+          "非NVIDIA GPU 環境のため CUDA は使用できません。有音リミックスは CPU / DSP 分離で動作し、無音AI Foley生成はテスト用フォールバックのみ利用できます。";
+      } else {
+        platformBanner.className = "hw-platform-banner hidden";
+        platformBanner.textContent = "";
+      }
+    }
+
     // RAM
-    const mem = data.memory || {};
     applyCardStatus($("hw-card-ram"), $("ram-status-badge"), mem.status);
-    $("ram-value").textContent = `総容量 ${Number(mem.total_gb || 0).toFixed(1)} GB`;
+    $("ram-value").textContent = isUnified
+      ? `ユニファイドメモリ ${Number(mem.total_gb || 0).toFixed(1)} GB`
+      : `総容量 ${Number(mem.total_gb || 0).toFixed(1)} GB`;
     $("ram-meta").textContent = `利用可能 ${Number(mem.available_gb || 0).toFixed(1)} GB / 総容量 ${Number(mem.total_gb || 0).toFixed(1)} GB`;
+    const ramBadges = $("ram-accel-badges");
+    if (ramBadges) {
+      if (isUnified) {
+        ramBadges.innerHTML = `<span class="accel-pill is-unified">🧠 CPU / GPU 共有ユニファイドメモリ</span>`;
+        ramBadges.classList.remove("hidden");
+      } else {
+        ramBadges.innerHTML = "";
+        ramBadges.classList.add("hidden");
+      }
+    }
     $("ram-note").textContent = mem.note || "";
 
     // FFmpeg / ディスク / SoundSeparator バッジ
@@ -655,6 +740,8 @@
       preview_start: trimEnabled ? Math.max(0, Number($("input-preview-start").value) || 0) : 0.0,
       preview_duration: trimEnabled ? Math.max(2, Number($("input-preview-duration").value) || 15) : null,
       enable_dereverb: $("chk-dereverb").checked,
+      enable_sfx_multilayer: $("chk-sfx-multilayer") ? $("chk-sfx-multilayer").checked : true,
+      enable_director: $("chk-enable-director") ? $("chk-enable-director").checked : true,
       execution_mode: getRadioValue("execution_mode", "auto"),
     };
 
@@ -766,10 +853,10 @@
     if (s === "done") return 6;
     if (s === "queued") return -1;
     if (["inspect", "vision", "agent_plan", "preview", "init"].includes(s)) return 0;
-    if (["separate", "separation", "dereverb", "foley", "audio"].includes(s)) return 1;
+    if (["separate", "separation", "dereverb", "foley", "audio", "sfx_split", "sfx"].includes(s)) return 1;
     if (["speakers", "diarization", "split", "speaker_split"].includes(s)) return 2;
-    if (["mapping", "scene", "match", "tracking"].includes(s)) return 3;
-    if (["spatial", "atmos", "ambisonics", "master", "mastering", "remix"].includes(s)) return 4;
+    if (["mapping", "scene", "match", "tracking", "director", "director_plan"].includes(s)) return 3;
+    if (["spatial", "atmos", "ambisonics", "master", "mastering", "remix", "director_remix"].includes(s)) return 4;
     if (["mux", "export", "package", "zip", "video"].includes(s)) return 5;
     const p = Number(progress) || 0;
     if (p >= 92) return 5;
@@ -1028,6 +1115,8 @@
   async function enterStudioView(job) {
     state.activeJobId = job.job_id;
     state.activeJob = job;
+    state.directorContext = null;
+    state.initialDirectorPlan = null;
     setStep(3);
     pollLightHealth();
 
@@ -1045,6 +1134,19 @@
     syncRemixControlsFromJob(job);
 
     renderMetricsAndDownloads(job);
+
+    let dctx = job.director_context || null;
+    if (!dctx && job.has_director_context && job.job_id) {
+      try {
+        dctx = await apiJson(`/api/jobs/${encodeURIComponent(job.job_id)}/director-context`);
+      } catch (_) {
+        dctx = null;
+      }
+    }
+    const fallbackPlan =
+      (scene && scene.director_plan) || (job.result && job.result.director_plan) || null;
+    renderDirectorCard(job, dctx, fallbackPlan);
+
     renderTrackList();
     syncInspectorToSelected();
     renderIndividualStems(job.stems || []);
@@ -1052,6 +1154,438 @@
     await loadStudioMedia(job);
     resizeRadarCanvas();
     drawSpatialRadar();
+  }
+
+  function seekStudioTo(sec) {
+    const video = $("studio-video");
+    if (!video) return;
+    const maxDur = Number(video.duration) || Number(state.scene && state.scene.duration_sec) || 9999;
+    const target = clamp(Number(sec) || 0, 0, maxDur);
+    video.currentTime = target;
+    $("time-current").textContent = formatTimecode(target);
+    if (state.webAudioPlaying) startWebAudioAt(target);
+    drawSpatialRadar();
+    syncInspectorToSelected();
+  }
+
+  function classifyTempLevel(temp, label) {
+    const lbl = String(label || "").toLowerCase();
+    if (lbl.includes("クライマックス") || lbl.includes("climax")) return "level-climax";
+    if (lbl.includes("高揚") || lbl.includes("high") || lbl.includes("rising") || lbl.includes("action")) {
+      return "level-high";
+    }
+    if (lbl.includes("静寂") || lbl.includes("quiet") || lbl.includes("calm")) return "level-quiet";
+    const t = Number(temp);
+    if (isFinite(t)) {
+      if (t >= 0.75) return "level-climax";
+      if (t >= 0.5) return "level-high";
+      if (t <= 0.25) return "level-quiet";
+    }
+    return "level-normal";
+  }
+
+  function collectDirectorNotes(plan, dctx) {
+    const raw = [];
+    const pushVal = (v) => {
+      if (!v) return;
+      if (typeof v === "string") {
+        if (v.trim()) raw.push(v.trim());
+      } else if (Array.isArray(v)) {
+        v.forEach(pushVal);
+      } else if (typeof v === "object") {
+        const text = String(v.message || v.note || v.comment || v.reason || v.summary || "").trim();
+        if (text) {
+          const hasTimeBracket = text.startsWith("[");
+          const prefix = !hasTimeBracket && v.t_sec != null ? `[${Number(v.t_sec).toFixed(1)}s] ` : "";
+          raw.push(`${prefix}${text}`);
+        }
+      }
+    };
+    if (plan) {
+      pushVal(plan.summary_ja);
+      pushVal(plan.notes);
+      pushVal(plan.director_notes);
+      pushVal(plan.comments);
+      pushVal(plan.summary);
+    }
+    if (dctx) {
+      pushVal(dctx.notes);
+      pushVal(dctx.director_notes);
+    }
+    return Array.from(new Set(raw));
+  }
+
+  function collectDirectorKeyframeSummaries(plan, scene) {
+    const rows = [];
+    if (plan && Array.isArray(plan.keyframes)) {
+      plan.keyframes.forEach((kf) => {
+        rows.push({
+          target: kf.target || kf.object_id || kf.role || "演出対象",
+          t_sec: kf.t_sec ?? kf.t,
+          end_sec: kf.end_sec,
+          gain_db: kf.gain_db,
+          distance_m: kf.distance_m,
+          duck_exempt: Boolean(kf.duck_exempt),
+          note: kf.note || kf.reason || "",
+        });
+      });
+    }
+    const trackMaps = [
+      plan && plan.tracks,
+      plan && plan.object_overrides,
+      plan && plan.overrides,
+      plan && plan.roles,
+    ];
+    trackMaps.forEach((m) => {
+      if (!m || typeof m !== "object" || Array.isArray(m)) return;
+      Object.entries(m).forEach(([key, val]) => {
+        if (Array.isArray(val)) {
+          // 各トラックから特徴的なキーフレーム（理由付き/強調/免除）を優先して最大4件ずつ抽出
+          const prioritized = val.filter(
+            (kf) =>
+              kf &&
+              (kf.reason || kf.duck_exempt || Math.abs(Number(kf.gain_db || 0)) >= 0.5 || kf.distance_m != null)
+          );
+          const picked = (prioritized.length ? prioritized : val).slice(0, 4);
+          picked.forEach((kf) => {
+            rows.push({
+              target: formatRoleLabelJa(key),
+              t_sec: kf.t_sec ?? kf.t,
+              end_sec: kf.end_sec,
+              gain_db: kf.gain_db,
+              distance_m: kf.distance_m,
+              duck_exempt: Boolean(kf.duck_exempt),
+              note: kf.note || kf.reason || "",
+            });
+          });
+        } else if (val && typeof val === "object") {
+          const kfs = (Array.isArray(val.keyframes) ? val.keyframes : [val]).slice(0, 4);
+          kfs.forEach((kf) => {
+            rows.push({
+              target: formatRoleLabelJa(val.role || key),
+              t_sec: kf.t_sec ?? kf.t,
+              end_sec: kf.end_sec,
+              gain_db: kf.gain_db,
+              distance_m: kf.distance_m,
+              duck_exempt: Boolean(kf.duck_exempt || val.duck_exempt),
+              note: kf.note || kf.reason || val.note || "",
+            });
+          });
+        }
+      });
+    });
+    if (!rows.length && scene && Array.isArray(scene.objects)) {
+      scene.objects.forEach((obj) => {
+        (obj.keyframes || []).forEach((kf) => {
+          if (kf.gain_db != null || kf.duck_exempt) {
+            rows.push({
+              target: obj.label || formatRoleLabelJa(obj.role),
+              t_sec: kf.t_sec ?? kf.t,
+              gain_db: kf.gain_db,
+              distance_m: kf.distance_m,
+              duck_exempt: Boolean(kf.duck_exempt),
+              note: "",
+            });
+          }
+        });
+      });
+    }
+    return rows;
+  }
+
+  function renderDirectorCard(job, dctx, fallbackPlan = null) {
+    const card = $("director-plan-card");
+    if (!card) return;
+
+    const plan = (dctx && dctx.director_plan) || fallbackPlan || null;
+    if (!dctx && !plan) {
+      state.directorContext = null;
+      state.initialDirectorPlan = null;
+      card.classList.add("hidden");
+      return;
+    }
+
+    state.directorContext = dctx || null;
+    if (plan && !state.initialDirectorPlan) {
+      state.initialDirectorPlan = deepClone(plan);
+    }
+    card.classList.remove("hidden");
+
+    const statusBadge = $("director-status-badge");
+    const enabled = plan ? plan.enabled !== false : true;
+    statusBadge.className = `status-pill ${enabled ? "is-ok" : "is-warn"}`;
+    statusBadge.textContent = enabled ? "✅ 演出適用済み" : "⏸ 演出オフ";
+
+    // コンタクトシート
+    const sheetWrap = $("director-sheet-wrap");
+    const sheetImg = $("director-sheet-img");
+    const sheetLink = $("director-sheet-link");
+    const sheetImgLink = $("director-sheet-img-link");
+    const hasSheetMedia = Boolean(
+      (dctx && dctx.director_sheet_url) ||
+        (job && job.available_media && job.available_media.director_sheet && job.media_urls && job.media_urls.director_sheet)
+    );
+    const rawSheetUrl =
+      (dctx && dctx.director_sheet_url) ||
+      (hasSheetMedia && job.media_urls && job.media_urls.director_sheet) ||
+      "";
+    if (rawSheetUrl) {
+      sheetImg.onerror = () => sheetWrap.classList.add("hidden");
+      sheetImg.src = rawSheetUrl;
+      sheetLink.href = rawSheetUrl;
+      sheetImgLink.href = rawSheetUrl;
+      sheetWrap.classList.remove("hidden");
+    } else {
+      sheetImg.removeAttribute("src");
+      sheetWrap.classList.add("hidden");
+    }
+
+    // シーン温度サマリー ＆ 区間
+    const segments = Array.isArray(dctx && dctx.scene_segments) ? dctx.scene_segments : [];
+    const track = Array.isArray(dctx && dctx.intensity_track) ? dctx.intensity_track : [];
+    const totalDur =
+      Number((dctx && dctx.duration_sec) || (state.scene && state.scene.duration_sec)) || 15.0;
+
+    let peakTemp = 0;
+    track.forEach((pt) => {
+      const val = typeof pt === "number" ? pt : Number(pt.temperature ?? pt.intensity ?? 0);
+      if (isFinite(val) && val > peakTemp) peakTemp = val;
+    });
+    segments.forEach((seg) => {
+      const val = Number(seg.peak_temperature ?? seg.mean_temperature ?? seg.temperature ?? 0);
+      if (isFinite(val) && val > peakTemp) peakTemp = val;
+    });
+
+    $("director-temp-peak-badge").textContent = `最高温度 ${(peakTemp * 100).toFixed(0)}%`;
+    $("director-segments-badge").textContent = `区間 ${segments.length}件`;
+
+    const timelineEl = $("director-temp-timeline");
+    const segListEl = $("director-segments-list");
+    timelineEl.innerHTML = "";
+    segListEl.innerHTML = "";
+
+    if (segments.length) {
+      segments.forEach((seg, idx) => {
+        const sTime = Number(seg.start_sec ?? seg.start ?? 0);
+        const eTime = Number(seg.end_sec ?? seg.end ?? sTime);
+        const temp = Number(seg.mean_temperature ?? seg.temperature ?? 0);
+        const label = seg.label || "通常";
+        const span = Math.max(0.1, eTime - sTime);
+        const widthPct = Math.max(2, (span / Math.max(0.1, totalDur)) * 100);
+        const lvlCls = classifyTempLevel(temp, seg.label_code || label);
+
+        const bar = document.createElement("div");
+        bar.className = `temp-seg-bar ${lvlCls}`;
+        bar.style.width = `${widthPct.toFixed(2)}%`;
+        bar.title = `${sTime.toFixed(1)}s〜${eTime.toFixed(1)}s · ${label} (温度 ${(temp * 100).toFixed(0)}%)`;
+        bar.addEventListener("click", () => seekStudioTo(sTime));
+        timelineEl.appendChild(bar);
+
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = `director-seg-chip ${lvlCls}`;
+        chip.textContent = `${sTime.toFixed(1)}-${eTime.toFixed(1)}s ${label} (${(temp * 100).toFixed(0)}%)`;
+        chip.title = "クリックして再生位置を移動";
+        chip.addEventListener("click", () => seekStudioTo(sTime));
+        segListEl.appendChild(chip);
+
+        if (idx === 0 && !timelineEl.childElementCount) {
+          timelineEl.appendChild(bar);
+        }
+      });
+    } else if (track.length) {
+      const stepW = 100 / track.length;
+      track.forEach((pt) => {
+        const t = typeof pt === "number" ? 0 : Number(pt.t_sec ?? pt.t ?? 0);
+        const val = typeof pt === "number" ? pt : Number(pt.temperature ?? pt.intensity ?? 0);
+        const bar = document.createElement("div");
+        bar.className = `temp-seg-bar ${classifyTempLevel(val, "")}`;
+        bar.style.width = `${stepW.toFixed(2)}%`;
+        bar.title = `${t.toFixed(1)}s · 温度 ${(val * 100).toFixed(0)}%`;
+        bar.addEventListener("click", () => seekStudioTo(t));
+        timelineEl.appendChild(bar);
+      });
+      segListEl.innerHTML = `<span class="meta-chip">温度サンプル ${track.length}点</span>`;
+    } else {
+      segListEl.innerHTML = `<span class="meta-chip">温度区間情報なし</span>`;
+    }
+
+    // SFX 4層分解＆衝撃イベント
+    const sfxEvents =
+      Array.isArray(dctx && dctx.sfx_events) && dctx.sfx_events.length
+        ? dctx.sfx_events
+        : Array.isArray(plan && plan.events)
+        ? plan.events
+        : [];
+    const evBadge = $("director-sfx-events-badge");
+    if (sfxEvents.length) {
+      evBadge.textContent = `衝撃イベント ${sfxEvents.length}件`;
+      evBadge.classList.remove("hidden");
+    } else {
+      evBadge.classList.add("hidden");
+    }
+
+    const layersRow = $("director-sfx-layers-row");
+    const rawLayers = dctx && dctx.sfx_layers;
+    let layerItems = [];
+    if (Array.isArray(rawLayers)) {
+      layerItems = rawLayers;
+    } else if (rawLayers && typeof rawLayers === "object") {
+      layerItems = Object.entries(rawLayers).map(([k, v]) =>
+        typeof v === "object" && v !== null ? { name: k, ...v } : { name: k }
+      );
+    }
+    layersRow.innerHTML = "";
+    if (layerItems.length) {
+      layersRow.classList.remove("hidden");
+      layerItems.forEach((ly) => {
+        const role = ly.role || ly.name || "sfx";
+        const color = ROLE_COLORS[String(role).toLowerCase()] || "#f59e0b";
+        const pill = document.createElement("span");
+        pill.className = "sfx-layer-pill";
+        const rmsStr = ly.rms_db != null && isFinite(ly.rms_db) ? ` (${Number(ly.rms_db).toFixed(1)} dB)` : "";
+        pill.innerHTML = `<i class="track-swatch" style="background:${color};width:8px;height:8px"></i><span>${escapeHtml(ly.label || formatRoleLabelJa(role) || ly.name)}${escapeHtml(rmsStr)}</span>`;
+        layersRow.appendChild(pill);
+      });
+    } else {
+      layersRow.classList.add("hidden");
+    }
+
+    // 監督コメント
+    const notesList = $("director-notes-list");
+    const notes = collectDirectorNotes(plan, dctx);
+    notesList.innerHTML = "";
+    if (notes.length) {
+      notes.forEach((txt) => {
+        const div = document.createElement("div");
+        div.className = "director-note-item";
+        div.textContent = txt;
+        notesList.appendChild(div);
+      });
+    } else {
+      notesList.innerHTML = `<div class="director-note-item">映像の温度変化に応じたダビング演出プランが設定されています。</div>`;
+    }
+
+    // 演出キーフレーム概要
+    const kfBox = $("director-keyframes-summary");
+    const kfRows = collectDirectorKeyframeSummaries(plan, state.scene);
+    kfBox.innerHTML = "";
+    if (kfRows.length) {
+      kfRows.slice(0, 24).forEach((kf) => {
+        const row = document.createElement("div");
+        row.className = "director-kf-row";
+        const timePart =
+          kf.t_sec != null
+            ? kf.end_sec != null
+              ? `${Number(kf.t_sec).toFixed(1)}〜${Number(kf.end_sec).toFixed(1)}s`
+              : `${Number(kf.t_sec).toFixed(1)}s`
+            : "全区間";
+        const parts = [timePart];
+        if (kf.gain_db != null && isFinite(kf.gain_db)) {
+          const g = Number(kf.gain_db);
+          parts.push(`${g >= 0 ? "+" : ""}${g.toFixed(1)} dB`);
+        }
+        if (kf.distance_m != null && isFinite(kf.distance_m)) {
+          parts.push(`${Number(kf.distance_m).toFixed(1)} m`);
+        }
+        const exemptHtml = kf.duck_exempt
+          ? `<span class="director-exempt-tag">ダッキング免除</span>`
+          : "";
+        row.innerHTML = `
+          <span class="director-kf-target">${escapeHtml(kf.target)}</span>
+          <span class="director-kf-meta">${escapeHtml(parts.join(" · "))} ${exemptHtml}</span>
+        `;
+        kfBox.appendChild(row);
+      });
+    } else {
+      kfBox.innerHTML = `<div class="director-kf-row"><span class="director-kf-target">キーフレーム調整</span><span class="director-kf-meta">自動標準バランス</span></div>`;
+    }
+
+    // JSON エディタへ現在プランを反映
+    const jsonArea = $("director-plan-json");
+    if (jsonArea) {
+      jsonArea.value = JSON.stringify(plan || {}, null, 2);
+    }
+  }
+
+  async function applyDirectorPlan() {
+    if (!state.activeJobId) return;
+    const jsonArea = $("director-plan-json");
+    let parsedPlan;
+    try {
+      parsedPlan = JSON.parse((jsonArea && jsonArea.value) || "{}");
+      if (!parsedPlan || typeof parsedPlan !== "object" || Array.isArray(parsedPlan)) {
+        throw new Error("ルートは JSON オブジェクト ({...}) である必要があります。");
+      }
+    } catch (err) {
+      showToast(`監督プランJSONの構文エラー: ${err.message}`, "error", 5500);
+      if (jsonArea) jsonArea.focus();
+      return;
+    }
+
+    const btn = $("btn-director-reapply");
+    btn.disabled = true;
+    const origHtml = btn.innerHTML;
+    btn.innerHTML = `<span class="spinner-sm"></span><span>監督演出リミックス中…</span>`;
+
+    const video = $("studio-video");
+    const resumeTime = video ? Number(video.currentTime) || 0 : 0;
+    pauseStudioPlayback();
+
+    try {
+      const resp = await apiJson(
+        `/api/jobs/${encodeURIComponent(state.activeJobId)}/director-plan`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ director_plan: parsedPlan }),
+        }
+      );
+
+      const updatedJob = resp.state || state.activeJob || { job_id: state.activeJobId };
+      if (resp.media_urls) updatedJob.media_urls = resp.media_urls;
+      if (resp.result) updatedJob.result = resp.result;
+      if (resp.director_context) updatedJob.director_context = resp.director_context;
+      if (resp.scene) {
+        updatedJob.scene = resp.scene;
+        state.scene = deepClone(resp.scene);
+        state.originalScene = deepClone(resp.scene);
+      }
+      state.activeJob = updatedJob;
+      state.sceneDirty = false;
+      $("scene-dirty-badge").classList.add("hidden");
+
+      syncRemixControlsFromJob(updatedJob);
+      renderMetricsAndDownloads(updatedJob);
+      renderDirectorCard(
+        updatedJob,
+        resp.director_context || updatedJob.director_context,
+        resp.director_plan || parsedPlan
+      );
+      renderTrackList();
+      syncInspectorToSelected();
+      drawSpatialRadar();
+      await loadStudioMedia(updatedJob);
+      if (video && resumeTime > 0) {
+        video.addEventListener(
+          "loadedmetadata",
+          () => {
+            video.currentTime = Math.min(resumeTime, video.duration || resumeTime);
+          },
+          { once: true }
+        );
+      }
+      showToast(
+        `監督演出プランを適用して再MixMasterが完了しました（${resp.elapsed_sec ?? ""}秒）！`,
+        "ok",
+        4500
+      );
+    } catch (err) {
+      showToast(`監督演出の再適用に失敗しました: ${err.message}`, "error", 6500);
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = origHtml;
+    }
   }
 
   function renderMetricsAndDownloads(job) {
@@ -1437,7 +1971,8 @@
       ? obj.keyframes
       : [{ t: 0, azimuth_deg: 0, elevation_deg: 0, distance_m: 2.0 }];
 
-    if (kfs.length === 1 || tSec <= Number(kfs[0].t || 0)) {
+    const kfTime = (kf) => Number(kf.t ?? kf.t_sec ?? 0);
+    if (kfs.length === 1 || tSec <= kfTime(kfs[0])) {
       return {
         azimuth_deg: Number(kfs[0].azimuth_deg ?? 0),
         elevation_deg: Number(kfs[0].elevation_deg ?? 0),
@@ -1445,7 +1980,7 @@
       };
     }
     const last = kfs[kfs.length - 1];
-    if (tSec >= Number(last.t || 0)) {
+    if (tSec >= kfTime(last)) {
       return {
         azimuth_deg: Number(last.azimuth_deg ?? 0),
         elevation_deg: Number(last.elevation_deg ?? 0),
@@ -1456,8 +1991,8 @@
     for (let i = 0; i < kfs.length - 1; i++) {
       const a = kfs[i];
       const b = kfs[i + 1];
-      const ta = Number(a.t || 0);
-      const tb = Number(b.t || 0);
+      const ta = kfTime(a);
+      const tb = kfTime(b);
       if (tSec >= ta && tSec <= tb) {
         const span = Math.max(1e-6, tb - ta);
         const alpha = (tSec - ta) / span;
@@ -1915,7 +2450,7 @@
       let nearest = null;
       let nearestDiff = Infinity;
       obj.keyframes.forEach((kf) => {
-        const diff = Math.abs(Number(kf.t || 0) - curT);
+        const diff = Math.abs(Number(kf.t ?? kf.t_sec ?? 0) - curT);
         if (diff < nearestDiff) {
           nearestDiff = diff;
           nearest = kf;
@@ -1932,7 +2467,7 @@
           elevation_deg: Math.round(clamp(newElev ?? curPose.elevation_deg, -45, 45) * 10) / 10,
           distance_m: Math.round(clamp(newDist ?? curPose.distance_m, 0.5, 12.0) * 10) / 10,
         });
-        obj.keyframes.sort((a, b) => Number(a.t || 0) - Number(b.t || 0));
+        obj.keyframes.sort((a, b) => Number(a.t ?? a.t_sec ?? 0) - Number(b.t ?? b.t_sec ?? 0));
       }
     }
 
@@ -1967,7 +2502,7 @@
           <span class="track-swatch" style="background:${color}"></span>
           <div>
             <div class="track-title">${escapeHtml(obj.label || obj.id)}</div>
-            <div class="track-sub">${escapeHtml(obj.role || "audio")} · ${typeStr}</div>
+            <div class="track-sub">${escapeHtml(formatRoleLabelJa(obj.role))} · ${typeStr}</div>
           </div>
         </div>
         <div class="track-right">${Math.round(pose.azimuth_deg)}° / ${pose.distance_m.toFixed(1)}m / ${gainStr}</div>
@@ -1997,7 +2532,7 @@
     const gain = Number(obj.gain_db ?? 0);
 
     $("insp-title").textContent = obj.label || obj.id;
-    $("insp-role-badge").textContent = `${obj.role || "audio"} · ${obj.is_bed ? "Bed" : "Dynamic Object"}`;
+    $("insp-role-badge").textContent = `${formatRoleLabelJa(obj.role)} · ${obj.is_bed ? "Bed" : "Dynamic Object"}`;
 
     $("slider-gain").value = String(clamp(gain, -24, 12));
     $("val-gain").textContent = `${gain >= 0 ? "+" : ""}${gain.toFixed(1)} dB`;
@@ -2524,6 +3059,29 @@
     $("remix-dialog-pan-mode").addEventListener("change", handleRemixDialogPanModeChange);
     $("chk-remix-ducking").addEventListener("change", () => markSceneDirty());
     $("btn-remix-apply").addEventListener("click", applyRemix);
+
+    if ($("btn-director-reapply")) {
+      $("btn-director-reapply").addEventListener("click", applyDirectorPlan);
+    }
+    if ($("btn-director-format-json")) {
+      $("btn-director-format-json").addEventListener("click", () => {
+        const el = $("director-plan-json");
+        if (!el) return;
+        try {
+          el.value = JSON.stringify(JSON.parse(el.value || "{}"), null, 2);
+        } catch (err) {
+          showToast(`JSON整形エラー: ${err.message}`, "error");
+        }
+      });
+    }
+    if ($("btn-director-reset-json")) {
+      $("btn-director-reset-json").addEventListener("click", () => {
+        const el = $("director-plan-json");
+        if (!el || !state.initialDirectorPlan) return;
+        el.value = JSON.stringify(state.initialDirectorPlan, null, 2);
+        showToast("監督演出プランを初期の自動生成内容に戻しました。", "info");
+      });
+    }
   }
 
   // --------------------------------------------------------------------------

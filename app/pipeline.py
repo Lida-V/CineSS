@@ -30,13 +30,23 @@ import soundfile as sf
 
 from app.audio.foley_engine import generate_foley
 from app.audio.separator_bridge import extract_audio_from_video, separate_dme
+from app.audio.sfx_splitter import split_sfx_layers
 from app.audio.speaker_splitter import (
     _normalize_dialog_pan_mode,
     apply_dialog_pan_mode_to_keyframes,
     split_speakers,
 )
 from app.config import MODELS_DIR, SAMPLE_RATE
-from app.vision.analyzer import analyze_video_spatial, inspect_video
+from app.director import (
+    apply_director_plan_to_scene,
+    build_auto_director_plan,
+    validate_director_plan,
+)
+from app.vision.analyzer import (
+    analyze_video_spatial,
+    export_director_contact_sheet,
+    inspect_video,
+)
 
 SPEAKER_COLORS = [
     "#38bdf8",
@@ -465,14 +475,148 @@ def _estimate_room_params(scene_summary: dict[str, Any] | None) -> dict[str, Any
     return {"rt60_sec": 0.45, "size": "medium"}
 
 
+def _mono_pan_compensation_db(wav_path: str | Path) -> float:
+    """片ch寄りのステレオ効果音WAVを点音源モノ化 (0.5*(L+R)) した際のエネルギー減衰を最大+3dB補う。"""
+    p = Path(wav_path)
+    if not p.is_file():
+        return 0.0
+    try:
+        audio, _ = sf.read(str(p), dtype="float32", always_2d=True)
+        if audio.size == 0 or audio.shape[1] < 2:
+            return 0.0
+        stereo_rms = float(np.sqrt(np.mean(0.5 * (audio[:, 0].astype(np.float64) ** 2 + audio[:, 1].astype(np.float64) ** 2))))
+        mono_rms = float(np.sqrt(np.mean((0.5 * (audio[:, 0].astype(np.float64) + audio[:, 1].astype(np.float64))) ** 2)))
+        if mono_rms < 1e-10 or stereo_rms < 1e-10:
+            return 0.0
+        comp = 20.0 * math.log10(stereo_rms / mono_rms)
+        return round(max(0.0, min(3.0, comp)), 2)
+    except Exception:
+        return 0.0
+
+
+def _append_sfx_objects(
+    objects: list[dict[str, Any]],
+    job_dir: Path,
+    stems_dir: Path,
+    sfx_path: Path,
+    vision_result: dict[str, Any],
+    enable_sfx_multilayer: bool,
+    single_id: str = "sfx",
+    single_label: str = "効果音 (SFX)",
+    single_role: str = "sfx",
+    single_gain_db: float = 0.0,
+    single_spread: float = 0.25,
+    default_distance: float = 3.0,
+    log_cb: Callable[..., Any] | None = None,
+) -> dict[str, Any] | None:
+    """効果音WAVを 4層ロスレス分解または単一トラックとして scene objects へ追加する。"""
+    motion_kfs = _motion_track_to_keyframes(vision_result.get("motion_track") or [], default_distance=default_distance)
+
+    if not enable_sfx_multilayer:
+        objects.append({
+            "id": single_id,
+            "label": single_label,
+            "role": single_role,
+            "audio_path": _rel_or_abs(sfx_path, job_dir),
+            "is_bed": False,
+            "gain_db": float(single_gain_db),
+            "spread": float(single_spread),
+            "color": "#fbbf24",
+            "keyframes": motion_kfs,
+        })
+        return None
+
+    sfx_info = split_sfx_layers(sfx_path, stems_dir, sample_rate=SAMPLE_RATE)
+    color_map = {
+        "sfx_sub": "#f97316",
+        "sfx_ambience": "#2dd4bf",
+        "sfx_impact_left": "#f59e0b",
+        "sfx_impact_center": "#fbbf24",
+        "sfx_impact_right": "#eab308",
+    }
+
+    for layer in sfx_info.get("layers") or []:
+        layer_path = Path(layer["path"])
+        name = str(layer["name"])
+        role = str(layer["role"])
+        is_bed = bool(layer["is_bed"])
+        if not layer_path.is_file():
+            continue
+
+        if is_bed:
+            base_dist = float(layer.get("distance_m", 2.0 if role == "sfx_sub" else 4.5))
+            entry: dict[str, Any] = {
+                "id": name,
+                "label": layer.get("label", name),
+                "role": role,
+                "audio_path": _rel_or_abs(layer_path, job_dir),
+                "is_bed": True,
+                "gain_db": 0.0 if role == "sfx_sub" else -0.5,
+                "spread": float(layer.get("spread", 0.5 if role == "sfx_sub" else 0.9)),
+                "color": color_map.get(name, "#2dd4bf"),
+                "keyframes": [{"t": 0.0, "t_sec": 0.0, "azimuth_deg": 0.0, "elevation_deg": 0.0, "distance_m": base_dist}],
+            }
+            if role == "sfx_sub":
+                entry["duck_exempt"] = True
+            objects.append(entry)
+            continue
+
+        # 衝撃層 (sfx_impact_left / center / right)
+        if float(layer.get("rms_db", -120.0)) < -85.0:
+            continue
+
+        if name == "sfx_impact_left":
+            kfs = [
+                {
+                    **kf,
+                    "t_sec": kf["t"],
+                    "azimuth_deg": round(max(-60.0, min(-15.0, -35.0 * 0.55 + float(kf["azimuth_deg"]) * 0.45)), 2),
+                }
+                for kf in motion_kfs
+            ]
+        elif name == "sfx_impact_right":
+            kfs = [
+                {
+                    **kf,
+                    "t_sec": kf["t"],
+                    "azimuth_deg": round(max(15.0, min(60.0, 35.0 * 0.55 + float(kf["azimuth_deg"]) * 0.45)), 2),
+                }
+                for kf in motion_kfs
+            ]
+        else:
+            kfs = [{**kf, "t_sec": kf["t"]} for kf in motion_kfs]
+
+        objects.append({
+            "id": name,
+            "label": layer.get("label", name),
+            "role": role,
+            "audio_path": _rel_or_abs(layer_path, job_dir),
+            "is_bed": False,
+            "gain_db": _mono_pan_compensation_db(layer_path),
+            "spread": float(layer.get("spread", 0.22)),
+            "color": color_map.get(name, "#fbbf24"),
+            "keyframes": kfs,
+        })
+
+    _emit_log(
+        log_cb,
+        f"SFX 4層ロスレス分解完了: 層数={len(sfx_info.get('layers') or [])} / "
+        f"再構成誤差={sfx_info.get('reconstruction_error_db')} dB / 衝撃イベント={len(sfx_info.get('impact_events') or [])}件",
+    )
+    return sfx_info
+
+
 def _build_voiced_scene(
     job_dir: Path,
+    stems_dir: Path,
     duration_sec: float,
     vision_result: dict[str, Any],
     sep_result: dict[str, Any],
     speaker_result: dict[str, Any],
-) -> dict[str, Any]:
-    """有音モード用の 3D scene.json を構築する。"""
+    enable_sfx_multilayer: bool = True,
+    log_cb: Callable[..., Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """有音モード用の 3D scene.json と SFX 層メタデータを構築する。"""
     objects: list[dict[str, Any]] = []
 
     # 1) 人物別の話者オブジェクト（48kHz モノラル点音源）
@@ -549,22 +693,26 @@ def _build_voiced_scene(
                 "keyframes": [{"t": 0.0, "azimuth_deg": 0.0, "elevation_deg": 0.0, "distance_m": 1.8}],
             })
 
-    # 2) 効果音（SFX）: 映像の動き重心トラックへ同期配置
+    # 2) 効果音（SFX）: 映画方式4層分解 または 単一SFX配置
+    sfx_info: dict[str, Any] | None = None
     if sep_result.get("effect_wav"):
         sfx_p = Path(sep_result["effect_wav"])
         if sfx_p.is_file() and _wav_rms_db(sfx_p) > -72.0:
-            sfx_kfs = _motion_track_to_keyframes(vision_result.get("motion_track") or [], default_distance=3.0)
-            objects.append({
-                "id": "sfx",
-                "label": "効果音 (SFX)",
-                "role": "sfx",
-                "audio_path": _rel_or_abs(sfx_p, job_dir),
-                "is_bed": False,
-                "gain_db": 0.0,
-                "spread": 0.25,
-                "color": "#fbbf24",
-                "keyframes": sfx_kfs,
-            })
+            sfx_info = _append_sfx_objects(
+                objects=objects,
+                job_dir=job_dir,
+                stems_dir=stems_dir,
+                sfx_path=sfx_p,
+                vision_result=vision_result,
+                enable_sfx_multilayer=enable_sfx_multilayer,
+                single_id="sfx",
+                single_label="効果音 (SFX)",
+                single_role="sfx",
+                single_gain_db=0.0,
+                single_spread=0.25,
+                default_distance=2.6,
+                log_cb=log_cb,
+            )
 
     # 3) BGM / 音楽: サラウンドベッドとして空間展開
     if sep_result.get("music_wav"):
@@ -579,10 +727,10 @@ def _build_voiced_scene(
                 "gain_db": 0.0,
                 "spread": 0.85,
                 "color": "#c084fc",
-                "keyframes": [{"t": 0.0, "azimuth_deg": 0.0, "elevation_deg": 0.0, "distance_m": 4.0}],
+                "keyframes": [{"t": 0.0, "t_sec": 0.0, "azimuth_deg": 0.0, "elevation_deg": 0.0, "distance_m": 4.0}],
             })
 
-    return {
+    scene = {
         "version": 1,
         "mode": "voiced",
         "duration_sec": round(float(duration_sec), 3),
@@ -590,32 +738,41 @@ def _build_voiced_scene(
         "room": _estimate_room_params(vision_result.get("scene_summary")),
         "objects": objects,
     }
+    return scene, sfx_info
 
 
 def _build_silent_foley_scene(
     job_dir: Path,
+    stems_dir: Path,
     duration_sec: float,
     vision_result: dict[str, Any],
     foley_result: dict[str, Any],
     sfx_wav: Path | None,
     ambience_wav: Path | None,
-) -> dict[str, Any]:
-    """無音Foleyモード用の 3D scene.json を構築する。"""
+    enable_sfx_multilayer: bool = True,
+    log_cb: Callable[..., Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """無音Foleyモード用の 3D scene.json と SFX 層メタデータを構築する。"""
     objects: list[dict[str, Any]] = []
     motion_kfs = _motion_track_to_keyframes(vision_result.get("motion_track") or [], default_distance=2.6)
+    sfx_info: dict[str, Any] | None = None
 
     if sfx_wav and sfx_wav.is_file() and _wav_rms_db(sfx_wav) > -75.0:
-        objects.append({
-            "id": "foley_sfx",
-            "label": "Foley モーション効果音",
-            "role": "foley",
-            "audio_path": _rel_or_abs(sfx_wav, job_dir),
-            "is_bed": False,
-            "gain_db": 0.5,
-            "spread": 0.20,
-            "color": "#fbbf24",
-            "keyframes": motion_kfs,
-        })
+        sfx_info = _append_sfx_objects(
+            objects=objects,
+            job_dir=job_dir,
+            stems_dir=stems_dir,
+            sfx_path=sfx_wav,
+            vision_result=vision_result,
+            enable_sfx_multilayer=enable_sfx_multilayer,
+            single_id="foley_sfx",
+            single_label="Foley モーション効果音",
+            single_role="foley",
+            single_gain_db=0.5,
+            single_spread=0.20,
+            default_distance=2.6,
+            log_cb=log_cb,
+        )
 
     if ambience_wav and ambience_wav.is_file() and _wav_rms_db(ambience_wav) > -75.0:
         objects.append({
@@ -627,24 +784,42 @@ def _build_silent_foley_scene(
             "gain_db": -1.0,
             "spread": 0.90,
             "color": "#2dd4bf",
-            "keyframes": [{"t": 0.0, "azimuth_deg": 0.0, "elevation_deg": 0.0, "distance_m": 4.5}],
+            "keyframes": [{"t": 0.0, "t_sec": 0.0, "azimuth_deg": 0.0, "elevation_deg": 0.0, "distance_m": 4.5}],
         })
 
     if not objects and foley_result.get("audio_wav"):
         full_p = Path(foley_result["audio_wav"])
-        objects.append({
-            "id": "foley_main",
-            "label": "Foley 音声",
-            "role": "foley",
-            "audio_path": _rel_or_abs(full_p, job_dir),
-            "is_bed": False,
-            "gain_db": 0.0,
-            "spread": 0.35,
-            "color": "#fbbf24",
-            "keyframes": motion_kfs,
-        })
+        if full_p.is_file():
+            if enable_sfx_multilayer:
+                sfx_info = _append_sfx_objects(
+                    objects=objects,
+                    job_dir=job_dir,
+                    stems_dir=stems_dir,
+                    sfx_path=full_p,
+                    vision_result=vision_result,
+                    enable_sfx_multilayer=True,
+                    single_id="foley_main",
+                    single_label="Foley 音声",
+                    single_role="foley",
+                    single_gain_db=0.0,
+                    single_spread=0.35,
+                    default_distance=2.6,
+                    log_cb=log_cb,
+                )
+            else:
+                objects.append({
+                    "id": "foley_main",
+                    "label": "Foley 音声",
+                    "role": "foley",
+                    "audio_path": _rel_or_abs(full_p, job_dir),
+                    "is_bed": False,
+                    "gain_db": 0.0,
+                    "spread": 0.35,
+                    "color": "#fbbf24",
+                    "keyframes": motion_kfs,
+                })
 
-    return {
+    scene = {
         "version": 1,
         "mode": "silent_foley",
         "duration_sec": round(float(duration_sec), 3),
@@ -652,6 +827,7 @@ def _build_silent_foley_scene(
         "room": _estimate_room_params(vision_result.get("scene_summary")),
         "objects": objects,
     }
+    return scene, sfx_info
 
 
 def _collect_stem_files(stems_dir: Path) -> dict[str, str]:
@@ -660,11 +836,75 @@ def _collect_stem_files(stems_dir: Path) -> dict[str, str]:
     return {p.name: str(p.resolve()) for p in sorted(stems_dir.glob("*.wav"))}
 
 
+def _public_sfx_layers(sfx_info: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """director_context / result.json 用の簡潔な SFX 層メタデータ一覧を返す。"""
+    if not isinstance(sfx_info, dict):
+        return []
+    out: list[dict[str, Any]] = []
+    for layer in sfx_info.get("layers") or []:
+        if not isinstance(layer, dict):
+            continue
+        out.append({
+            "name": layer.get("name"),
+            "label": layer.get("label"),
+            "filename": layer.get("filename"),
+            "path": layer.get("path"),
+            "role": layer.get("role"),
+            "is_bed": bool(layer.get("is_bed", False)),
+            "azimuth_deg": layer.get("azimuth_deg"),
+            "elevation_deg": layer.get("elevation_deg"),
+            "distance_m": layer.get("distance_m"),
+            "rms_db": layer.get("rms_db"),
+            "peak_db": layer.get("peak_db"),
+            "energy_ratio": layer.get("energy_ratio"),
+        })
+    return out
+
+
+def _write_director_context(
+    *,
+    job_dir: Path,
+    work_dir: Path,
+    job_id: str,
+    duration_sec: float,
+    enable_sfx_multilayer: bool,
+    enable_director: bool,
+    vision_result: dict[str, Any] | None,
+    sfx_info: dict[str, Any] | None,
+    director_plan: dict[str, Any] | None,
+    sheet_info: dict[str, Any] | None,
+    sheet_path: Path,
+) -> dict[str, Any]:
+    """work/director_context.json を構築・保存し、その内容を返す。"""
+    vr = vision_result or {}
+    has_sheet = sheet_path.is_file()
+    context = {
+        "job_id": job_id,
+        "duration_sec": round(float(duration_sec), 3),
+        "enable_sfx_multilayer": bool(enable_sfx_multilayer),
+        "enable_director": bool(enable_director),
+        "intensity_track": vr.get("intensity_track") or [],
+        "scene_segments": vr.get("scene_segments") or [],
+        "scene_summary": vr.get("scene_summary") or {},
+        "sfx_layers": _public_sfx_layers(sfx_info),
+        "sfx_events": list((sfx_info or {}).get("impact_events") or []),
+        "director_plan": director_plan,
+        "director_sheet": sheet_info,
+        "director_sheet_path": str(sheet_path.resolve()) if has_sheet else None,
+        "director_sheet_url": f"/api/jobs/{job_id}/media/director_sheet" if has_sheet else None,
+    }
+    _atomic_write_json(work_dir / "director_context.json", context)
+    return context
+
+
 def run_job(
     job_dir: Path | str,
     request: dict[str, Any],
     progress_cb: Callable[..., Any] | None = None,
     log_cb: Callable[..., Any] | None = None,
+    enable_sfx_multilayer: bool | None = None,
+    enable_director: bool | None = None,
+    director_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """CineSS 統合パイプラインのメイン実行関数。"""
     t0 = time.time()
@@ -679,6 +919,7 @@ def run_job(
     if not video_path.is_file():
         raise FileNotFoundError(f"入力動画が見つかりません: {video_path}")
 
+    job_id = str(request.get("job_id") or jdir.name)
     req_mode = _normalize_mode(request.get("mode"))
     spatial_format = _normalize_spatial_format(request.get("spatial_format"))
     ambisonics_order = _resolve_ambisonics_order(spatial_format, request.get("ambisonics_order"))
@@ -695,6 +936,18 @@ def run_job(
     force_dsp_fallback = bool(request.get("force_dsp_fallback", False))
     use_depth_model = bool(request.get("use_depth_model", False))
 
+    eff_sfx_multilayer = (
+        bool(enable_sfx_multilayer)
+        if enable_sfx_multilayer is not None
+        else bool(request.get("enable_sfx_multilayer", True))
+    )
+    eff_director = (
+        bool(enable_director)
+        if enable_director is not None
+        else bool(request.get("enable_director", True))
+    )
+    eff_director_plan = director_plan if director_plan is not None else request.get("director_plan")
+
     # --- 1) 映像検査 & 有音/無音自動判定 ---
     _emit_progress(progress_cb, 3, "vision", "動画メタデータと音声レベルを検査中...")
     video_info = inspect_video(video_path)
@@ -708,7 +961,8 @@ def run_job(
         log_cb,
         f"映像検査完了: {video_info['width']}x{video_info['height']} / {video_info['duration_sec']:.1f}秒 / "
         f"音声RMS={video_info['audio_rms_db']} dBFS → モード={effective_mode}, 品質={quality}, "
-        f"規格={spatial_format}, セリフ定位={dialog_pan_mode}, ラウドネス={loudness_mode}",
+        f"規格={spatial_format}, セリフ定位={dialog_pan_mode}, ラウドネス={loudness_mode}, "
+        f"SFX4層={'ON' if eff_sfx_multilayer else 'OFF'}, AI監督={'ON' if eff_director else 'OFF'}",
     )
 
     # --- 2) 任意のプレビュー区間切り出し ---
@@ -729,11 +983,11 @@ def run_job(
 
     duration_sec = float(video_info["duration_sec"])
 
-    # --- 3) 映像空間解析（人物・顔追跡 / 口元モーション / 動き重心） ---
+    # --- 3) 映像空間解析（人物・顔追跡 / 口元モーション / 動き重心 / シーン温度） ---
     sample_fps = {"fast": 3.0, "standard": 4.0, "high": 5.0}.get(quality, 4.0)
     if duration_sec > 180.0:
         sample_fps = min(sample_fps, 2.5)
-    _emit_progress(progress_cb, 8, "vision", "OpenCV で人物・口元モーション・動き重心を解析中...")
+    _emit_progress(progress_cb, 8, "vision", "OpenCV で人物・口元モーション・動き重心・シーン温度を解析中...")
     vision_result = analyze_video_spatial(
         working_video,
         sample_fps=sample_fps,
@@ -744,8 +998,16 @@ def run_job(
     person_tracks = vision_result.get("person_tracks") or []
     _emit_log(
         log_cb,
-        f"映像解析完了: 検出人物={len(person_tracks)}名 / {vision_result['scene_summary']['description_ja']}",
+        f"映像解析完了: 検出人物={len(person_tracks)}名 / 区間数={len(vision_result.get('scene_segments') or [])} / "
+        f"{vision_result['scene_summary']['description_ja']}",
     )
+
+    sheet_path = work_dir / "director_sheet.jpg"
+    sheet_info: dict[str, Any] | None = None
+    try:
+        sheet_info = export_director_contact_sheet(working_video, vision_result, sheet_path, max_frames=8)
+    except Exception as exc:
+        _emit_log(log_cb, f"コンタクトシート生成をスキップしました: {exc}")
 
     original_preview_wav = jdir / "original_preview.wav"
     models_used: dict[str, Any] = {
@@ -755,12 +1017,15 @@ def run_job(
         "diarization": None,
         "overlap": None,
         "foley": None,
+        "sfx_splitter": None,
+        "director": None,
         "hrtf": None,
         "spatial_format": spatial_format,
     }
     speakers_summary: list[dict[str, Any]] = []
     original_lufs: float | None = None
     effective_target_lufs: float
+    sfx_info: dict[str, Any] | None = None
 
     # --- 4) 有音モード or 無音Foleyモード ---
     if effective_mode == "voiced":
@@ -801,7 +1066,7 @@ def run_job(
             quality=quality,
             force_fallback=force_dsp_fallback,
             dialog_pan_mode=dialog_pan_mode,
-            progress_cb=_make_sub_progress(progress_cb, "speakers", 54.0, 70.0),
+            progress_cb=_make_sub_progress(progress_cb, "speakers", 54.0, 68.0),
             log_cb=log_cb,
         )
         models_used["diarization"] = speaker_result["method"]
@@ -821,8 +1086,17 @@ def run_job(
             for sp in speaker_result.get("speakers") or []
         ]
 
-        _emit_progress(progress_cb, 72, "mapping", "人物別3D空間シーン (scene.json) を構築中...")
-        scene = _build_voiced_scene(jdir, duration_sec, vision_result, sep_result, speaker_result)
+        _emit_progress(progress_cb, 70, "mapping", "人物別3D空間シーンと SFX 多層分解を構築中...")
+        scene, sfx_info = _build_voiced_scene(
+            jdir,
+            stems_dir,
+            duration_sec,
+            vision_result,
+            sep_result,
+            speaker_result,
+            enable_sfx_multilayer=eff_sfx_multilayer,
+            log_cb=log_cb,
+        )
     else:
         # 無音比較用の無音 original_preview.wav を作成
         n_silent = max(SAMPLE_RATE // 2, int(round(duration_sec * SAMPLE_RATE)))
@@ -870,8 +1144,21 @@ def run_job(
         else:
             _emit_progress(progress_cb, 68, "speakers", "Foley効果音と環境音レイヤーを準備完了")
 
-        _emit_progress(progress_cb, 72, "mapping", "動き重心同期 3D空間シーン (scene.json) を構築中...")
-        scene = _build_silent_foley_scene(jdir, duration_sec, vision_result, foley_result, sfx_wav, amb_wav)
+        _emit_progress(progress_cb, 70, "mapping", "動き重心同期 3D空間シーンと SFX 多層分解を構築中...")
+        scene, sfx_info = _build_silent_foley_scene(
+            jdir,
+            stems_dir,
+            duration_sec,
+            vision_result,
+            foley_result,
+            sfx_wav,
+            amb_wav,
+            enable_sfx_multilayer=eff_sfx_multilayer,
+            log_cb=log_cb,
+        )
+
+    if sfx_info is not None:
+        models_used["sfx_splitter"] = "hpss_4layer_lossless"
 
     scene["mix_settings"] = {
         "dialog_pan_mode": dialog_pan_mode,
@@ -879,10 +1166,37 @@ def run_job(
         "loudness_mode": loudness_mode,
         "original_lufs": original_lufs,
         "target_lufs": effective_target_lufs,
+        "enable_sfx_multilayer": eff_sfx_multilayer,
+        "enable_director": eff_director,
     }
+
+    # 監督プラン適用前のクリーンなベースシーンを保存（再適用時の冪等ベース復元用）
+    _atomic_write_json(work_dir / "scene_base.json", scene)
+
+    active_director_plan: dict[str, Any] | None = None
+    if eff_director:
+        _emit_progress(progress_cb, 73, "mapping", "AIダビング監督がシーン温度に基づく時間変化演出を設計中...")
+        raw_plan = eff_director_plan if eff_director_plan is not None else build_auto_director_plan(vision_result, sfx_info=sfx_info)
+        active_director_plan = validate_director_plan(raw_plan, duration_sec)
+        scene = apply_director_plan_to_scene(scene, active_director_plan)
+        models_used["director"] = active_director_plan.get("source", "auto_director")
+        _emit_log(log_cb, f"AIダビング監督演出を適用しました: {active_director_plan.get('summary_ja')}")
 
     scene_path = jdir / "scene.json"
     _atomic_write_json(scene_path, scene)
+    _write_director_context(
+        job_dir=jdir,
+        work_dir=work_dir,
+        job_id=job_id,
+        duration_sec=duration_sec,
+        enable_sfx_multilayer=eff_sfx_multilayer,
+        enable_director=eff_director,
+        vision_result=vision_result,
+        sfx_info=sfx_info,
+        director_plan=active_director_plan,
+        sheet_info=sheet_info,
+        sheet_path=sheet_path,
+    )
     _emit_log(log_cb, f"3D空間シーンを構築しました（音源オブジェクト数={len(scene['objects'])}）。")
 
     # --- 5) サラウンド MixMaster ＆ バイノーラルレンダリング ---
@@ -921,6 +1235,7 @@ def run_job(
     binaural_mp4 = _mux_video_with_binaural(working_video, binaural_wav, jdir / "binaural_output.mp4", log_cb=log_cb)
     stems_zip = _build_stems_zip(jdir, stems_dir, scene_path, jdir / "stems.zip")
 
+    director_ctx_path = work_dir / "director_context.json"
     elapsed = round(time.time() - t0, 2)
     result = {
         "ok": True,
@@ -934,6 +1249,8 @@ def run_job(
         "original_lufs": original_lufs,
         "dialog_pan_mode": dialog_pan_mode,
         "enable_dialog_ducking": enable_dialog_ducking,
+        "enable_sfx_multilayer": eff_sfx_multilayer,
+        "enable_director": eff_director,
         "duration_sec": duration_sec,
         "is_preview_sliced": is_preview_sliced,
         "elapsed_sec": elapsed,
@@ -941,6 +1258,12 @@ def run_job(
         "scene_path": str(scene_path.resolve()),
         "video_info": video_info,
         "vision_summary": vision_result.get("scene_summary"),
+        "scene_segments": vision_result.get("scene_segments") or [],
+        "sfx_layers": _public_sfx_layers(sfx_info),
+        "sfx_events": list((sfx_info or {}).get("impact_events") or []),
+        "director_plan": active_director_plan,
+        "director_context_path": str(director_ctx_path.resolve()),
+        "director_sheet_path": str(sheet_path.resolve()) if sheet_path.is_file() else None,
         "person_tracks_count": len(person_tracks),
         "speakers": speakers_summary,
         "models_used": models_used,
@@ -961,6 +1284,8 @@ def run_job(
             "master_spatial": str(master_spatial_wav.resolve()),
             "surround_714": str(surround_714_wav.resolve()) if surround_714_wav else None,
             "stems_zip": str(stems_zip.resolve()),
+            "director_sheet": str(sheet_path.resolve()) if sheet_path.is_file() else None,
+            "director_context": str(director_ctx_path.resolve()),
             "stem_files": _collect_stem_files(stems_dir),
         },
     }
@@ -1132,6 +1457,11 @@ def remix_job(
         "original_preview_wav": orig_audio,
         "stems_zip": str(stems_zip.resolve()),
         "artifacts": {
+            **{
+                k: v
+                for k, v in (prev_result.get("artifacts") or {}).items()
+                if k in ("director_sheet", "director_context")
+            },
             "original_video": str(working_video.resolve()),
             "binaural_video": str(binaural_mp4.resolve()),
             "original_audio": orig_audio,
@@ -1146,3 +1476,99 @@ def remix_job(
     _emit_progress(progress_cb, 100, "done", f"再MixMasterが完了しました（{elapsed:.1f}秒）")
     _emit_log(log_cb, f"再MixMaster完了（{elapsed:.1f}秒）: LUFS={metrics.get('integrated_lufs')}, L/R={metrics.get('binaural_lr_balance_db')} dB")
     return result
+
+
+def apply_director_plan_and_remix(
+    job_dir: Path | str,
+    director_plan: dict[str, Any],
+    progress_cb: Callable[..., Any] | None = None,
+    log_cb: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """既存の work/ 済みデータとベースシーンを再利用し、監督プランを再適用して高速リミックスする。"""
+    jdir = Path(job_dir).resolve()
+    work_dir = jdir / "work"
+    prev_result = _read_json(jdir / "result.json", default={}) or {}
+    req_data = _read_json(jdir / "request.json", default={}) or {}
+
+    scene_json = _read_json(jdir / "scene.json", default=None)
+    scene_base = _read_json(work_dir / "scene_base.json", default=None)
+
+    source_scene: dict[str, Any] | None = None
+    if isinstance(scene_json, dict) and scene_json.get("objects"):
+        has_base = any(isinstance(o, dict) and "base_keyframes" in o for o in scene_json["objects"])
+        if has_base or scene_base is None:
+            source_scene = scene_json
+        else:
+            source_scene = scene_base
+    elif isinstance(scene_base, dict) and scene_base.get("objects"):
+        source_scene = scene_base
+
+    if not isinstance(source_scene, dict) or not source_scene.get("objects"):
+        raise FileNotFoundError(f"リミックス元の scene.json / scene_base.json が見つかりません（job_dir={jdir}）。")
+
+    duration_sec = float(source_scene.get("duration_sec") or prev_result.get("duration_sec") or 1.0)
+    validated_plan = validate_director_plan(director_plan, duration_sec)
+    updated_scene = apply_director_plan_to_scene(source_scene, validated_plan)
+
+    mix_cfg = dict(updated_scene.get("mix_settings") or {})
+    mix_cfg["enable_director"] = True
+    updated_scene["mix_settings"] = mix_cfg
+
+    spatial_format = str(prev_result.get("spatial_format") or req_data.get("spatial_format") or "atmos")
+    ambisonics_order = prev_result.get("ambisonics_order") or req_data.get("ambisonics_order")
+    loudness_mode = prev_result.get("loudness_mode") or mix_cfg.get("loudness_mode") or req_data.get("loudness_mode")
+    target_lufs: float | str | None = (
+        None
+        if loudness_mode == "match_original"
+        else prev_result.get("target_lufs", mix_cfg.get("target_lufs", -18.0))
+    )
+    enable_dialog_ducking = mix_cfg.get("enable_dialog_ducking", prev_result.get("enable_dialog_ducking", True))
+    dialog_pan_mode = mix_cfg.get("dialog_pan_mode", prev_result.get("dialog_pan_mode", "cinema"))
+
+    _emit_log(log_cb, f"AIダビング監督プランを再適用してリミックスします: {validated_plan.get('summary_ja')}")
+    remix_res = remix_job(
+        jdir,
+        updated_scene,
+        spatial_format=spatial_format,
+        target_lufs=target_lufs,
+        ambisonics_order=ambisonics_order,
+        loudness_mode=loudness_mode,
+        enable_dialog_ducking=enable_dialog_ducking,
+        dialog_pan_mode=dialog_pan_mode,
+        progress_cb=progress_cb,
+        log_cb=log_cb,
+    )
+
+    # director_context.json と result.json に最新の監督プランを同期
+    ctx_path = work_dir / "director_context.json"
+    ctx = _read_json(ctx_path, default={}) or {}
+    if not ctx:
+        vr = _read_json(work_dir / "vision_analysis.json", default={}) or {}
+        job_id = str(req_data.get("job_id") or jdir.name)
+        sheet_path = work_dir / "director_sheet.jpg"
+        ctx = {
+            "job_id": job_id,
+            "duration_sec": round(duration_sec, 3),
+            "enable_sfx_multilayer": bool(prev_result.get("enable_sfx_multilayer", True)),
+            "enable_director": True,
+            "intensity_track": vr.get("intensity_track") or [],
+            "scene_segments": vr.get("scene_segments") or prev_result.get("scene_segments") or [],
+            "scene_summary": vr.get("scene_summary") or prev_result.get("vision_summary") or {},
+            "sfx_layers": prev_result.get("sfx_layers") or [],
+            "sfx_events": prev_result.get("sfx_events") or [],
+            "director_sheet_path": str(sheet_path.resolve()) if sheet_path.is_file() else None,
+            "director_sheet_url": f"/api/jobs/{job_id}/media/director_sheet" if sheet_path.is_file() else None,
+        }
+    ctx["enable_director"] = True
+    ctx["director_plan"] = validated_plan
+    _atomic_write_json(ctx_path, ctx)
+
+    models_used = dict(remix_res.get("models_used") or {})
+    models_used["director"] = validated_plan.get("source", "custom_director")
+    remix_res["models_used"] = models_used
+    remix_res["enable_director"] = True
+    remix_res["director_plan"] = validated_plan
+    remix_res["director_context_path"] = str(ctx_path.resolve())
+    _atomic_write_json(jdir / "result.json", remix_res)
+
+    return remix_res

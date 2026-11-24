@@ -9,6 +9,8 @@
 - ciness_claim_and_run_job: キューにあるジョブ（または指定ID）を受注してパイプラインを実行
 - ciness_job_status: ジョブの進捗・ログ・成果物パスを取得
 - ciness_cancel_job: 実行中/待機中ジョブのキャンセル
+- ciness_get_director_context: シーン温度・SFX4層・監督コンテキストとコンタクトシートURLを取得
+- ciness_apply_director_plan: AIダビング監督プランを適用して空間リミックスを再実行
 """
 from __future__ import annotations
 
@@ -29,16 +31,34 @@ if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
 from app.config import DEFAULT_PORT, JOBS_DIR, OUTPUT_DIR, ensure_directories  # noqa: E402
-from ciness_agent import (  # noqa: E402
-    AgentError,
-    _default_server_url,
-    _extract_job_payload,
-    _http_json,
-    _send_heartbeat,
-    cmd_run_job,
-    cmd_start_server,
-    cmd_status,
-)
+try:
+    from tools.ciness_agent import (  # noqa: E402
+        AgentError,
+        _default_server_url,
+        _extract_job_payload,
+        _http_json,
+        _send_heartbeat,
+        _validate_job_id,
+        cmd_apply_director,
+        cmd_director_context,
+        cmd_run_job,
+        cmd_start_server,
+        cmd_status,
+    )
+except ImportError:
+    from ciness_agent import (  # noqa: E402
+        AgentError,
+        _default_server_url,
+        _extract_job_payload,
+        _http_json,
+        _send_heartbeat,
+        _validate_job_id,
+        cmd_apply_director,
+        cmd_director_context,
+        cmd_run_job,
+        cmd_start_server,
+        cmd_status,
+    )
 
 PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
 AGENT_CLI = TOOLS_DIR / "ciness_agent.py"
@@ -127,6 +147,34 @@ TOOLS: list[dict[str, Any]] = [
         ),
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
     },
+    {
+        "name": "ciness_get_director_context",
+        "description": "指定ジョブの映像シーン温度カーブ（intensity_track / scene_segments）、SFX 4層分解情報、AIダビング監督プラン、およびコンタクトシート画像（director_sheet.jpg）のURL・ローカルパスを取得する。",
+        "inputSchema": _schema(
+            {
+                "job_id": {"type": "string", "description": "対象の job_id"},
+                "server_url": {"type": "string", "description": "省略時は http://127.0.0.1:8780"},
+            },
+            ["job_id"],
+        ),
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+    },
+    {
+        "name": "ciness_apply_director_plan",
+        "description": "AIダビング監督プラン（director_plan）を指定ジョブへ適用し、再分離なしで空間リミックス・マスタリングを実行して更新後メトリクスと結果を返す。",
+        "inputSchema": _schema(
+            {
+                "job_id": {"type": "string", "description": "対象の job_id"},
+                "director_plan": {
+                    "type": "object",
+                    "description": "適用する監督プランJSONオブジェクト（keyframes / notes 等）",
+                },
+                "server_url": {"type": "string", "description": "省略時は http://127.0.0.1:8780"},
+            },
+            ["job_id", "director_plan"],
+        ),
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+    },
 ]
 
 
@@ -146,12 +194,6 @@ def _pid_alive(pid: int) -> bool:
         return True
     except OSError:
         return False
-
-
-def _validate_job_id(job_id: str) -> str:
-    if not isinstance(job_id, str) or not job_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in job_id):
-        raise AgentError("job_id の形式が正しくありません。")
-    return job_id
 
 
 class CineSSMcpServer:
@@ -234,6 +276,7 @@ class CineSSMcpServer:
         env = os.environ.copy()
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
+        env.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
         cmd = [
             sys.executable,
@@ -338,6 +381,17 @@ class CineSSMcpServer:
             "server_response": server_result,
         }
 
+    def get_director_context(self, job_id: str, server_url: str | None = None) -> dict[str, Any]:
+        return cmd_director_context(job_id, server_url=server_url)
+
+    def apply_director_plan(
+        self,
+        job_id: str,
+        director_plan: dict[str, Any],
+        server_url: str | None = None,
+    ) -> dict[str, Any]:
+        return cmd_apply_director(job_id, director_plan, server_url=server_url)
+
 
 class ProtocolError(Exception):
     def __init__(self, code: int, message: str) -> None:
@@ -365,6 +419,7 @@ def dispatch(request: Any, server: CineSSMcpServer) -> dict[str, Any] | None:
                 "ローカル映像サラウンドMixMaster＆バイノーラル出力アプリ CineSS。"
                 "まず ciness_status で環境確認し、ciness_start_server でWeb UIを起動する。"
                 "ユーザーがWeb UIで「▶ 処理開始」を押したら ciness_wait_job → ciness_claim_and_run_job → ciness_job_status で完了まで伴走する。"
+                "完了後は ciness_get_director_context でシーン温度・コンタクトシートを確認し、必要に応じて ciness_apply_director_plan で監督リミックスを調整できる。"
                 "推論時の暗黙モデルダウンロードは行わない。"
             ),
         }
@@ -382,6 +437,8 @@ def dispatch(request: Any, server: CineSSMcpServer) -> dict[str, Any] | None:
         "ciness_claim_and_run_job": server.claim_and_run_job,
         "ciness_job_status": server.job_status,
         "ciness_cancel_job": server.cancel_job,
+        "ciness_get_director_context": server.get_director_context,
+        "ciness_apply_director_plan": server.apply_director_plan,
     }
     name = params.get("name")
     args = params.get("arguments", {})

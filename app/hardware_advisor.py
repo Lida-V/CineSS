@@ -117,8 +117,27 @@ def estimate_spatial_wav_size(
 # ---------------------------------------------------------------------------
 
 
+def _run_sysctl(key: str) -> str | None:
+    if platform.system() != "Darwin":
+        return None
+    try:
+        proc = subprocess.run(
+            ["sysctl", "-n", key],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        if proc.returncode == 0:
+            val = proc.stdout.strip()
+            return val if val else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return None
+
+
 def _read_windows_cpu_name() -> str | None:
-    if os.name != "nt":
+    if os.name != "nt" or platform.system() != "Windows":
         return None
     try:
         import winreg  # noqa: PLC0415
@@ -133,8 +152,34 @@ def _read_windows_cpu_name() -> str | None:
     return None
 
 
+def _read_linux_cpu_name() -> str | None:
+    if platform.system() != "Linux":
+        return None
+    try:
+        cpuinfo = Path("/proc/cpuinfo")
+        if not cpuinfo.is_file():
+            return None
+        for line in cpuinfo.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.lower().startswith("model name") and ":" in line:
+                name = line.split(":", 1)[1].strip()
+                if name:
+                    return re.sub(r"\s+", " ", name)
+    except OSError:
+        return None
+    return None
+
+
 def _probe_cpu() -> dict[str, Any]:
-    name = _read_windows_cpu_name() or platform.processor() or platform.machine() or "不明なCPU"
+    sys_name = platform.system()
+    name = (
+        _read_windows_cpu_name()
+        or (_run_sysctl("machdep.cpu.brand_string") if sys_name == "Darwin" else None)
+        or (_run_sysctl("hw.model") if sys_name == "Darwin" else None)
+        or _read_linux_cpu_name()
+        or platform.processor()
+        or platform.machine()
+        or "不明なCPU"
+    )
     cores = 0
     threads = 0
     try:
@@ -144,6 +189,15 @@ def _probe_cpu() -> dict[str, Any]:
         threads = int(psutil.cpu_count(logical=True) or 0)
     except ImportError:
         pass
+    if sys_name == "Darwin":
+        if cores <= 0:
+            raw_cores = _run_sysctl("hw.physicalcpu")
+            if raw_cores and raw_cores.isdigit():
+                cores = int(raw_cores)
+        if threads <= 0:
+            raw_threads = _run_sysctl("hw.logicalcpu")
+            if raw_threads and raw_threads.isdigit():
+                threads = int(raw_threads)
     if threads <= 0:
         threads = int(os.cpu_count() or 1)
     if cores <= 0:
@@ -205,6 +259,80 @@ def _probe_torch_cuda() -> dict[str, Any]:
         return {"torch_installed": False, "cuda": False}
 
 
+def _probe_torch_mps() -> dict[str, Any]:
+    try:
+        import torch  # noqa: PLC0415
+
+        backends = getattr(torch, "backends", None)
+        mps_backend = getattr(backends, "mps", None) if backends is not None else None
+        available = bool(mps_backend is not None and mps_backend.is_available())
+        return {"torch_installed": True, "mps": available}
+    except Exception:
+        return {"torch_installed": False, "mps": False}
+
+
+def _probe_non_nvidia_gpu() -> str | None:
+    """Windows / macOS / Linux で AMD / Intel 等の非 NVIDIA GPU 名を検出する。"""
+    sys_name = platform.system()
+    ignore_tokens = ("nvidia", "microsoft basic", "virtual", "remote", "parsec", "vmware", "citrix")
+
+    if sys_name == "Windows":
+        try:
+            import winreg  # noqa: PLC0415
+
+            base_key = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base_key) as root_key:
+                for idx in range(16):
+                    sub_name = f"{idx:04d}"
+                    try:
+                        with winreg.OpenKey(root_key, sub_name) as sub_key:
+                            desc, _ = winreg.QueryValueEx(sub_key, "DriverDesc")
+                            if isinstance(desc, str):
+                                cleaned = re.sub(r"\s+", " ", desc.strip())
+                                low = cleaned.lower()
+                                if cleaned and not any(tok in low for tok in ignore_tokens):
+                                    return cleaned
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+        return None
+
+    if sys_name == "Darwin":
+        try:
+            proc = subprocess.run(
+                ["system_profiler", "SPDisplaysDataType"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                for line in proc.stdout.splitlines():
+                    if "Chipset Model:" in line:
+                        chip = line.split(":", 1)[1].strip()
+                        if chip and "nvidia" not in chip.lower():
+                            return chip
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return None
+
+    if sys_name == "Linux":
+        lspci = shutil.which("lspci")
+        if lspci:
+            try:
+                proc = subprocess.run([lspci], capture_output=True, text=True, timeout=3, check=False)
+                if proc.returncode == 0 and proc.stdout:
+                    for line in proc.stdout.splitlines():
+                        low = line.lower()
+                        if any(k in low for k in ("vga compatible controller", "3d controller", "display controller")):
+                            if "nvidia" not in low and ":" in line:
+                                return line.split(":", 2)[-1].strip()
+            except (OSError, subprocess.SubprocessError):
+                pass
+    return None
+
+
 def _probe_gpu() -> dict[str, Any]:
     smi_info = _probe_nvidia_smi()
     torch_info = _probe_torch_cuda()
@@ -218,6 +346,10 @@ def _probe_gpu() -> dict[str, Any]:
         return {
             "name": smi_info["name"],
             "cuda": cuda_ok,
+            "mps": False,
+            "backend": "cuda" if cuda_ok else "cpu",
+            "unified_memory": False,
+            "non_nvidia_gpu": False,
             "vram_total_gb": smi_info["vram_total_gb"],
             "vram_free_gb": smi_info["vram_free_gb"],
             "driver": smi_info["driver"],
@@ -228,15 +360,82 @@ def _probe_gpu() -> dict[str, Any]:
         return {
             "name": torch_info.get("name", "NVIDIA CUDA GPU"),
             "cuda": True,
+            "mps": False,
+            "backend": "cuda",
+            "unified_memory": False,
+            "non_nvidia_gpu": False,
             "vram_total_gb": float(torch_info.get("vram_total_gb", 0.0)),
             "vram_free_gb": float(torch_info.get("vram_free_gb", 0.0)),
             "driver": None,
             "nvidia_detected": True,
         }
 
+    sys_name = platform.system()
+    mps_info = _probe_torch_mps()
+    cpu_brand = _run_sysctl("machdep.cpu.brand_string") if sys_name == "Darwin" else None
+    is_apple_silicon = sys_name == "Darwin" and (
+        platform.machine().lower() in ("arm64", "aarch64")
+        or (cpu_brand is not None and "apple" in cpu_brand.lower())
+    )
+
+    if mps_info.get("mps"):
+        chip_name = cpu_brand or "Apple Silicon"
+        mem_info = _probe_memory()
+        um_gb = float(mem_info.get("total_gb", 0.0))
+        return {
+            "name": f"{chip_name} (MPS ユニファイドメモリ)",
+            "cuda": False,
+            "mps": True,
+            "backend": "mps",
+            "unified_memory": True,
+            "unified_memory_gb": um_gb,
+            "non_nvidia_gpu": False,
+            "vram_total_gb": 0.0,
+            "vram_free_gb": 0.0,
+            "driver": "Metal (MPS)",
+            "nvidia_detected": False,
+        }
+
+    if is_apple_silicon:
+        chip_name = cpu_brand or "Apple Silicon"
+        mem_info = _probe_memory()
+        um_gb = float(mem_info.get("total_gb", 0.0))
+        return {
+            "name": f"{chip_name} (MPS未有効・CPUモード)",
+            "cuda": False,
+            "mps": False,
+            "backend": "cpu",
+            "unified_memory": True,
+            "unified_memory_gb": um_gb,
+            "non_nvidia_gpu": True,
+            "vram_total_gb": 0.0,
+            "vram_free_gb": 0.0,
+            "driver": None,
+            "nvidia_detected": False,
+        }
+
+    other_gpu = _probe_non_nvidia_gpu()
+    if other_gpu:
+        return {
+            "name": f"{other_gpu} (非NVIDIA・CPU動作)",
+            "cuda": False,
+            "mps": False,
+            "backend": "cpu",
+            "unified_memory": False,
+            "non_nvidia_gpu": True,
+            "vram_total_gb": 0.0,
+            "vram_free_gb": 0.0,
+            "driver": None,
+            "nvidia_detected": False,
+        }
+
     return {
         "name": "未検出（CPUモード）",
         "cuda": False,
+        "mps": False,
+        "backend": "cpu",
+        "unified_memory": False,
+        "non_nvidia_gpu": False,
         "vram_total_gb": 0.0,
         "vram_free_gb": 0.0,
         "driver": None,
@@ -244,8 +443,41 @@ def _probe_gpu() -> dict[str, Any]:
     }
 
 
+def _probe_memory_macos_sysctl() -> dict[str, float] | None:
+    if platform.system() != "Darwin":
+        return None
+    raw_mem = _run_sysctl("hw.memsize")
+    if not raw_mem:
+        return None
+    try:
+        total_bytes = int(raw_mem.strip())
+    except ValueError:
+        return None
+    if total_bytes <= 0:
+        return None
+    total_gb = round(total_bytes / (1024**3), 2)
+    avail_gb = round(total_gb * 0.5, 2)
+    try:
+        proc = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=3, check=False)
+        if proc.returncode == 0 and proc.stdout:
+            page_size = 4096
+            m_page = re.search(r"page size of (\d+) bytes", proc.stdout)
+            if m_page:
+                page_size = int(m_page.group(1))
+            free_pages = 0
+            for key in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
+                m_cnt = re.search(rf"{re.escape(key)}:\s+(\d+)", proc.stdout)
+                if m_cnt:
+                    free_pages += int(m_cnt.group(1))
+            if free_pages > 0:
+                avail_gb = round(min(total_bytes, free_pages * page_size) / (1024**3), 2)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    return {"total_gb": total_gb, "available_gb": avail_gb}
+
+
 def _probe_memory_windows_ctypes() -> dict[str, float] | None:
-    if os.name != "nt":
+    if os.name != "nt" or platform.system() != "Windows":
         return None
     try:
         class MEMORYSTATUSEX(ctypes.Structure):
@@ -284,6 +516,9 @@ def _probe_memory() -> dict[str, float]:
         }
     except ImportError:
         pass
+    mac_mem = _probe_memory_macos_sysctl()
+    if mac_mem is not None:
+        return mac_mem
     win_mem = _probe_memory_windows_ctypes()
     if win_mem is not None:
         return win_mem
@@ -369,6 +604,11 @@ def _eval_cpu(raw: dict[str, Any]) -> dict[str, Any]:
 def _eval_gpu(raw: dict[str, Any]) -> dict[str, Any]:
     name = str(raw.get("name", "未検出"))
     cuda = bool(raw.get("cuda", False))
+    mps = bool(raw.get("mps", False))
+    unified_memory = bool(raw.get("unified_memory", mps))
+    unified_memory_gb = round(float(raw.get("unified_memory_gb", 0.0) or 0.0), 2)
+    non_nvidia_gpu = bool(raw.get("non_nvidia_gpu", False))
+    backend = str(raw.get("backend") or ("cuda" if cuda else ("mps" if mps else "cpu")))
     total = round(float(raw.get("vram_total_gb", 0.0)), 2)
     free = round(float(raw.get("vram_free_gb", 0.0)), 2)
     driver = raw.get("driver")
@@ -399,22 +639,55 @@ def _eval_gpu(raw: dict[str, Any]) -> dict[str, Any]:
             f"ミドル帯CUDA GPU（空き {free:.1f} GB / 総VRAM {total:.1f} GB）。"
             "有音リミックス（標準品質）は動作しますが、無音Foleyはオフロード必須かつ短尺推奨です。"
         )
+    elif mps:
+        um_label = f"{unified_memory_gb:.1f} GB" if unified_memory_gb > 0 else "計測中"
+        if unified_memory_gb >= 23.0:
+            status = "ok"
+            note = (
+                f"Apple Silicon MPS（ユニファイドメモリ {um_label}）を検出。"
+                "有音AI分離・話者分離をMPSで高速実行できます（PYTORCH_ENABLE_MPS_FALLBACK=1 推奨、"
+                "無音Foley生成時は省メモリ設定・短尺推奨）。"
+            )
+        elif unified_memory_gb >= 15.0:
+            status = "warn"
+            note = (
+                f"Apple Silicon MPS（ユニファイドメモリ {um_label}）を検出。"
+                "有音リミックスはMPSで動作しますが、OSとメモリ共有のため無音Foley等は省メモリ・短尺推奨です"
+                "（PYTORCH_ENABLE_MPS_FALLBACK=1 推奨）。"
+            )
+        else:
+            status = "warn"
+            note = (
+                f"Apple Silicon MPS（ユニファイドメモリ {um_label}）を検出しましたが容量が小さめです。"
+                "PYTORCH_ENABLE_MPS_FALLBACK=1 を有効にし、1〜3分程度の短尺動画でご利用ください。"
+            )
     elif nvidia_detected and not cuda:
         status = "error"
         note = (
             f"NVIDIA GPU（{name}）は検出されましたが、PyTorchのCUDAが無効です。"
-            "setup.bat で CUDA版 PyTorch を導入してください（audio-separatorは導入禁止）。"
+            "setup.bat / setup.sh で CUDA版 PyTorch を導入してください（audio-separatorは導入禁止）。"
+        )
+    elif non_nvidia_gpu:
+        status = "warn"
+        note = (
+            f"非NVIDIA GPU（{name}）を検出しました。PyTorch CUDA / MPS 非対応のため CPU モード"
+            "（軽量DSP分離＋物理HRTF空間Mix）で動作します。無音AI Foley本番生成は非対応です。"
         )
     else:
         status = "error"
         note = (
-            "CUDA対応GPUが検出されませんでした（CPU動作）。"
-            "軽量DSP分離＋空間Mixは動作しますが、高精度AI分離や無音Foley生成にはCUDA GPUが必要です。"
+            "CUDA / MPS 対応GPUが検出されませんでした（CPU動作）。"
+            "軽量DSP分離＋空間Mixは動作しますが、高精度AI分離や無音Foley生成には対応GPUが必要です。"
         )
 
     return {
         "name": name,
         "cuda": cuda,
+        "mps": mps,
+        "backend": backend,
+        "unified_memory": unified_memory,
+        "unified_memory_gb": unified_memory_gb,
+        "non_nvidia_gpu": non_nvidia_gpu,
         "vram_total_gb": total,
         "vram_free_gb": free,
         "driver": driver,
@@ -423,18 +696,19 @@ def _eval_gpu(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _eval_memory(raw: dict[str, Any]) -> dict[str, Any]:
+def _eval_memory(raw: dict[str, Any], *, unified_memory: bool = False) -> dict[str, Any]:
     total = round(float(raw.get("total_gb", 0.0)), 2)
     avail = round(float(raw.get("available_gb", 0.0)), 2)
+    um_suffix = "（ユニファイドメモリとしてGPUとも共有）" if unified_memory else ""
     if total >= 30.0:
         status = "ok"
-        note = f"総容量 {total:.1f} GB（空き {avail:.1f} GB）。長尺映像・複数AIモデル切替・空間多ch出力を余裕で処理できます。"
+        note = f"総容量 {total:.1f} GB（空き {avail:.1f} GB）{um_suffix}。長尺映像・複数AIモデル切替・空間多ch出力を余裕で処理できます。"
     elif total >= 15.0:
         status = "warn"
-        note = f"総容量 {total:.1f} GB（空き {avail:.1f} GB）。標準的な中尺動画まで動作しますが、Foley生成時は他アプリ終了を推奨します。"
+        note = f"総容量 {total:.1f} GB（空き {avail:.1f} GB）{um_suffix}。標準的な中尺動画まで動作しますが、Foley生成時は他アプリ終了を推奨します。"
     else:
         status = "error"
-        note = f"総容量 {total:.1f} GB（空き {avail:.1f} GB）。メモリ不足のリスクが高いため、短尺（1〜3分以内）やプレビュー区間処理を使ってください。"
+        note = f"総容量 {total:.1f} GB（空き {avail:.1f} GB）{um_suffix}。メモリ不足のリスクが高いため、短尺（1〜3分以内）やプレビュー区間処理を使ってください。"
     return {"total_gb": total, "available_gb": avail, "status": status, "note": note}
 
 
@@ -472,6 +746,8 @@ def _build_recommendations(
     soundsep: dict[str, Any],
 ) -> dict[str, Any]:
     cuda = gpu["cuda"]
+    mps = bool(gpu.get("mps", False))
+    non_nvidia_gpu = bool(gpu.get("non_nvidia_gpu", False))
     vram = gpu["vram_total_gb"]
     ram = memory["total_gb"]
     cores = cpu["cores"]
@@ -597,9 +873,121 @@ def _build_recommendations(
             ),
             "estimated_speed_factor": 5.5,
         }
+    elif mps and ram >= 23.0 and cores >= 8:
+        tier = "A"
+        tier_label = "Tier A (Apple Silicon MPS)：ハイスペック（大容量ユニファイドメモリ）"
+        voiced = {
+            "supported": True,
+            "status": "ok",
+            "comfortable_minutes": 15,
+            "max_recommended_minutes": 45,
+            "quality_grade": "A",
+            "quality_label": "Aランク (MPS)：高品質（BandIt Plus分離＋話者分離＋空間Mix）",
+            "models": {
+                "separator": "BandIt Plus (ステレオDME)",
+                "diarization": "Nemotron-3-Diarization",
+                "overlap": "定位・帯域ソフト分離（任意でSepFormer）",
+                "vision": "OpenCV顔・口元・動き追跡 + Depth Anything V2 Small",
+            },
+            "reason": (
+                f"Apple Silicon MPS（ユニファイドメモリ {ram:.0f} GB）により、有音動画の分離と話者別空間配置を高品質に実行できます。"
+                "未対応演算フォールバックのため PYTORCH_ENABLE_MPS_FALLBACK=1（run.sh 既定有効）を維持してください。"
+            ),
+            "estimated_speed_factor": 0.95,
+        }
+        max_foley_sec = 45 if ram >= 30.0 else 30
+        voiced_note_extra = "他アプリを閉じた状態で" if ram < 30.0 else ""
+        silent = {
+            "supported": True,
+            "status": "warn",
+            "comfortable_seconds": 15,
+            "max_recommended_seconds": max_foley_sec,
+            "quality_grade": "A",
+            "quality_label": "Aランク (MPS)：HunyuanVideo-Foley XL（省メモリ・オフロード推奨）",
+            "models": {
+                "foley": "HunyuanVideo-Foley XL (MPS省メモリ・オフロード併用)",
+                "offload": True,
+                "vision": "OpenCV動き重心・カット解析",
+            },
+            "reason": (
+                f"ユニファイドメモリ {ram:.0f} GB の MPS 環境ではメモリを OS と共有するため、"
+                f"Foley 生成は{voiced_note_extra}省メモリ設定（オフロード有効）・PYTORCH_ENABLE_MPS_FALLBACK=1 で 15〜{max_foley_sec} 秒以内の短尺を推奨します。"
+            ),
+            "estimated_speed_factor": 3.8,
+        }
+    elif mps and ram >= 15.0:
+        tier = "B"
+        tier_label = "Tier B (Apple Silicon MPS)：標準スペック（MPS省メモリ運用）"
+        voiced = {
+            "supported": True,
+            "status": "warn",
+            "comfortable_minutes": 5,
+            "max_recommended_minutes": 15,
+            "quality_grade": "B",
+            "quality_label": "Bランク (MPS)：標準品質（省メモリ分離＋音響クラスタ話者分け＋空間Mix）",
+            "models": {
+                "separator": "BandIt Plus (標準) または DBS-TIGER-DnR (省メモリ)",
+                "diarization": "VAD＋MFCC/ピッチ音響クラスタリング",
+                "overlap": "定位・帯域ソフト分離",
+                "vision": "OpenCV顔・口元・動き追跡",
+            },
+            "reason": (
+                f"Apple Silicon MPS（ユニファイドメモリ {ram:.0f} GB）により、5〜15分までの有音動画を安定処理できます。"
+                "一部演算のCPUフォールバック用に PYTORCH_ENABLE_MPS_FALLBACK=1（run.sh で自動設定）が必要です。"
+            ),
+            "estimated_speed_factor": 1.45,
+        }
+        silent = {
+            "supported": True,
+            "status": "warn",
+            "comfortable_seconds": 10,
+            "max_recommended_seconds": 20,
+            "quality_grade": "B",
+            "quality_label": "Bランク (MPS)：HunyuanVideo-Foley XL（省メモリ注意・極短尺限定）",
+            "models": {
+                "foley": "HunyuanVideo-Foley XL (MPS省メモリ・オフロード必須)",
+                "offload": True,
+                "vision": "OpenCV動き重心・カット解析",
+            },
+            "reason": (
+                f"ユニファイドメモリ {ram:.0f} GB では OS とメモリを共有するため、Foley 生成は省メモリ注意です。"
+                "他アプリを終了し、PYTORCH_ENABLE_MPS_FALLBACK=1・オフロード有効の 10〜20 秒クリップでお試しください。"
+            ),
+            "estimated_speed_factor": 6.0,
+        }
     else:
         tier = "C"
-        tier_label = "Tier C：CPU軽量モード（短尺リミックス・プレビュー向け）"
+        if mps:
+            tier_label = "Tier C (MPS 省メモリ)：短尺リミックス向け"
+            voiced_reason = (
+                f"Apple Silicon MPS 環境ですがユニファイドメモリが {ram:.0f} GB のため、安全のため短尺（1〜3分）または軽量分離を推奨します"
+                "（PYTORCH_ENABLE_MPS_FALLBACK=1 有効推奨）。"
+            )
+            silent_reason = (
+                f"無音動画からの AI Foley 生成（HunyuanVideo-Foley）はユニファイドメモリ 16 GB 以上（推奨 24 GB 以上）が必要です。"
+                f"現在の {ram:.0f} GB 環境ではテスト用のプレビュー合成フォールバックのみ利用できます。"
+            )
+        elif non_nvidia_gpu:
+            tier_label = "Tier C (非NVIDIA GPU)：CPU軽量モード（短尺リミックス向け）"
+            voiced_reason = (
+                "非NVIDIA GPU（AMD / Intel 等）は PyTorch CUDA / MPS 非対応のため、CPU 完結のローカル DSP 3分離と物理 HRTF 空間エンジンで動作します。"
+                "1〜3分程度の短尺動画で立体音響化を体験できます。"
+            )
+            silent_reason = (
+                "無音動画からの AI Foley 生成（HunyuanVideo-Foley）は NVIDIA CUDA GPU（または 16 GB 以上の Apple Silicon MPS）が必要です。"
+                "非NVIDIA GPU 環境ではテスト用のプレビュー合成フォールバックのみ動作します。"
+            )
+        else:
+            tier_label = "Tier C：CPU軽量モード（短尺リミックス・プレビュー向け）"
+            voiced_reason = (
+                "CUDA対応GPUが利用できない（またはVRAM/RAMが不足している）ため、CPU完結のDSP分離と物理HRTF空間エンジンで動作します。"
+                "AI分離より分離精度は控えめですが、1〜3分の短尺動画で立体音響化を体験できます。"
+            )
+            silent_reason = (
+                "無音動画からのAI Foley生成（HunyuanVideo-Foley）はCUDA対応NVIDIA GPU（推奨12GB以上・最低目安8GB＋オフロード）が必要です。"
+                "現在のPCではテスト用のプレビュー合成フォールバックのみ動作します。"
+            )
+
         voiced = {
             "supported": True,
             "status": "warn",
@@ -613,10 +1001,7 @@ def _build_recommendations(
                 "overlap": "定位・帯域ソフト分離",
                 "vision": "OpenCV顔・動き追跡（軽量サンプリング）",
             },
-            "reason": (
-                "CUDA対応GPUが利用できない（またはVRAM/RAMが不足している）ため、CPU完結のDSP分離と物理HRTF空間エンジンで動作します。"
-                "AI分離より分離精度は控えめですが、1〜3分の短尺動画で立体音響化を体験できます。"
-            ),
+            "reason": voiced_reason,
             "estimated_speed_factor": 3.5,
         }
         silent = {
@@ -625,16 +1010,13 @@ def _build_recommendations(
             "comfortable_seconds": 0,
             "max_recommended_seconds": 0,
             "quality_grade": "C",
-            "quality_label": "非対応：CUDA GPU必須（HunyuanVideo-FoleyはGPU 8GB以上が目安）",
+            "quality_label": "非対応：CUDA GPU または 16GB+ Apple Silicon MPS 必須",
             "models": {
                 "foley": "本番生成は非対応（テスト用モーション合成フォールバックのみ利用可）",
                 "offload": True,
                 "vision": "OpenCV動き重心解析",
             },
-            "reason": (
-                "無音動画からのAI Foley生成（HunyuanVideo-Foley）はCUDA対応NVIDIA GPU（推奨12GB以上・最低目安8GB＋オフロード）が必要です。"
-                "現在のPCではテスト用のプレビュー合成フォールバックのみ動作します。"
-            ),
+            "reason": silent_reason,
             "estimated_speed_factor": 0.0,
         }
 
@@ -705,8 +1087,14 @@ def _build_recommendations(
 def assess_system(raw_hw: dict[str, Any]) -> dict[str, Any]:
     """計測済みハードウェア生情報から診断結果辞書を構築する（純粋関数）。"""
     cpu = _eval_cpu(raw_hw.get("cpu") or {})
-    gpu = _eval_gpu(raw_hw.get("gpu") or {})
-    memory = _eval_memory(raw_hw.get("memory") or {})
+    mem_raw = dict(raw_hw.get("memory") or {})
+    gpu_raw = dict(raw_hw.get("gpu") or {})
+    if gpu_raw.get("mps") and "unified_memory" not in gpu_raw:
+        gpu_raw["unified_memory"] = True
+    if gpu_raw.get("unified_memory") and not gpu_raw.get("unified_memory_gb"):
+        gpu_raw["unified_memory_gb"] = float(mem_raw.get("total_gb") or 0.0)
+    gpu = _eval_gpu(gpu_raw)
+    memory = _eval_memory(mem_raw, unified_memory=bool(gpu.get("unified_memory")))
     ffmpeg = _eval_ffmpeg(raw_hw.get("ffmpeg") or {})
     disk = _eval_disk(raw_hw.get("disk") or {})
     ss_raw = raw_hw.get("soundseparator") or {}
@@ -896,7 +1284,7 @@ def evaluate_video_plan(
             can_run = False
             recommended_preview_seconds = 10
             warnings.append(
-                "このPCにはCUDA対応GPU（8GB以上目安）がないため、HunyuanVideo-Foley の本番生成は非対応です。"
+                "このPCにはCUDA対応GPU（8GB以上目安）または大容量Apple Silicon MPS（16GB以上目安）がないため、HunyuanVideo-Foley の本番生成は非対応です。"
                 "動作確認のみ行う場合は「テスト用フォールバック許可」を有効にし、10秒以内の短尺でお試しください。"
             )
             estimated_seconds = round(max(5.0, min(dur, 30.0) * 1.2 + 4.0), 1)

@@ -1,23 +1,32 @@
 # CineSS — 映像サラウンド MixMaster ＆ バイノーラル出力スタジオ
 
-**CineSS** は、手元の Windows PC 上で映像の音声を立体音響（**Dolby Atmos 互換 ADM BWF [完全フリー構成]** / **Ambisonics 1〜7次 AmbiX**）へ再構築し、**ヘッドホンで映画館のような3D定位を体感できるバイノーラル映像（MP4）** を出力するローカル Web アプリケーションです。
+**CineSS** は、手元の **Windows / macOS (Apple Silicon MPS・Intel) / Linux** PC 上で映像の音声を立体音響（**Dolby Atmos 互換 ADM BWF [完全フリー構成]** / **Ambisonics 1〜7次 AmbiX**）へ再構築し、**ヘッドホンで映画館のような3D定位を体感できるバイノーラル映像（MP4）** を出力するローカル Web アプリケーションです。
 
-AI エージェント（Claude Code / Antigravity / MCP 対応クライアント）とのネイティブ連携を備えており、「リポジトリを読ませるだけで環境確認→Web アプリ起動→ブラウザ上の『▶ 処理開始』ボタン押下をトリガーにエージェントが処理開始」という体験を実現します。
+AI エージェント（Claude Code / Antigravity / MCP 対応クライアント）とのネイティブ連携を備えており、「リポジトリを読ませるだけで環境確認→Web アプリ起動→ブラウザ上の『▶ 処理開始』ボタン押下をトリガーにエージェントが処理開始→シーン温度コンタクトシートを見て監督演出リミックス」という体験を実現します。
 
 ---
 
 ## 主な機能
 
-1. **PC動作環境チェック ＆ スペック別おすすめガイド**
-   - 実機の **CPU / GPU（CUDA・VRAM空き/総容量）/ RAM / FFmpeg / 空きディスク** を自動計測し、**✅ 快適 / ⚠️ 警告 / ✕ 不足** で分かりやすく表示します。
+1. **PC動作環境チェック ＆ スペック別おすすめガイド（クロスプラットフォーム対応）**
+   - 実機の **CPU / GPU（NVIDIA CUDA・Apple Silicon MPS・AMD/Intel 非NVIDIA検出）/ メモリ（ユニファイドメモリ含む）/ FFmpeg / 空きディスク** を自動計測し、**✅ 快適 / ⚠️ 警告 / ✕ 不足** で分かりやすく表示します。
    - PC スペックに応じて **Tier S / A / B / C** を自動判定し、「有音動画リミックス」「無音動画 Foley 生成」それぞれについて **推奨動画長（快適目安・上限目安）・選定モデル・期待クオリティ** を案内します。
+   - **Apple Silicon (MPS)**: ユニファイドメモリ 16GB〜（Tier B）/ 24GB〜（Tier A）環境で MPS 実行に対応します（`run.sh` で `PYTORCH_ENABLE_MPS_FALLBACK=1` を自動設定、Foley 生成時は省メモリ・短尺推奨）。
+   - **非NVIDIA GPU (AMD / Intel 等)**: PyTorch CUDA / MPS 非対応環境（`non_nvidia_gpu`）を安全に識別し、CPU 軽量モード（ローカル DSP 3分離＋物理 HRTF）へ自動フォールバックします。
    - 隣接フォルダに `SoundSeparator`（または環境変数 `SOUNDSEPARATOR_DIR`）がある場合は、取得済みの分離・話者分離モデルをコピーせず自動共有します。
-2. **有音動画リミックス（3分離 ＋ 人物別声分け ＋ 3D位置再現）**
+2. **有音動画リミックス ＋ 映画方式 SFX 4層厳密分解**
    - 映像音声を **話し声（Dialog）/ 効果音（SFX）/ BGM（Music）** へ3分離（BandIt Plus / DBS-TIGER-DnR、単体環境やCPU環境ではローカルDSPフォールバック）。
    - 複数話者の発話を人物別に声分けし、映像の顔・口元モーション活性度と自動紐付けして「画面左の人は左から、右の人は右から、遠くの人は奥行きをもって」定位させます。
-3. **無音動画 Foley 生成（HunyuanVideo-Foley ＋ 空間配置）**
-   - 無音映像から動き・カット・シーン特徴を解析し、HunyuanVideo-Foley（XXL / XL、VRAMに応じたオフロード対応）による 48kHz 効果音・環境音生成と3D空間配置を行います（オフライン検証用のモーション合成プレビューフォールバックにも対応）。
-4. **プロ仕様サラウンド MixMaster ＆ バイノーラル出力（完全フリー構成）**
+   - **映画方式 SFX 4層厳密相補（ロスレス）分解**:
+     - `sfx_sub`: 140Hz LPF 低域・重低音基盤（Atmos 7.1.4 LFE / Ambisonics ACN 0 連携、ダッキング免除）
+     - `sfx_impact`（Left / Center / Right）: 衝撃帯域成分をステレオパンで配置（無音側チャンネルは自動畳み込み・激しい衝撃時はセリフダッキングを瞬時解除するスマート・インパクト免除に対応）
+     - `ambience`: 空間全体に広がる環境音ベッド
+3. **映像シーン温度 ＆ AIダビング監督演出**
+   - 映像の輝度・暖色度・動きエネルギー・急激なフラッシュ変化から、シーンごとの迫力カーブ（**シーン温度**: `静寂` / `通常` / `高揚` / `クライマックス`）を解析し、激しいアクションの近接距離（1.3〜2.2m）と静寂シーンの遠景距離（3.2〜5.2m）を自然に再現します。
+   - 代表フレームを最大8コマまとめた **監督用コンタクトシート画像（`director_sheet.jpg`）** と時間変化キーフレームを含む **AIダビング監督プラン（`director_plan`）** を生成し、Web UI・CLI・MCP から再分離なしで高速に監督演出を微調整・再適用できます。
+4. **無音動画 Foley 生成（HunyuanVideo-Foley ＋ 空間配置）**
+   - 無音映像から動き・カット・シーン温度を解析し、HunyuanVideo-Foley（XXL / XL、VRAMやユニファイドメモリに応じたオフロード対応）による 48kHz 効果音・環境音生成と3D空間配置を行います（オフライン検証用のモーション合成プレビューフォールバックにも対応）。
+5. **プロ仕様サラウンド MixMaster ＆ バイノーラル出力（完全フリー構成）**
    - **Dolby Atmos 互換（完全フリー・国際標準）**: 商用有償エンコーダ（E-AC-3 JOC）に依存せず、国際標準規格 **ITU-R BS.2076 準拠 ADM BWF `.wav`**（7.1.4 Bed + Dynamic Objects）＋ 7.1.4 確認用 WAV ＋ 内蔵 HRTF 直接バイノーラルを出力します。DaVinci Resolve / EAR / Reaper 等と互換があります（民生 TV 向け `.ec3 (E-AC-3 JOC)` 配信変換のみ外部対応ツールが必要です）。
    - **Ambisonics 1〜7次対応（AmbiX: ACN + SN3D + Max-rE デコード）**:
      - `ambisonics_foa`（**1次 FOA / 4ch**、約 44 MB/分・48kHz 32bit float）
@@ -25,27 +34,29 @@ AI エージェント（Claude Code / Antigravity / MCP 対応クライアント
      - `ambisonics_hoa5`（**5次 HOA / 36ch**、約 396 MB/分）
      - `ambisonics_hoa7`（**7次 HOA / 64ch・IEM Plug-in Suite / SPARTA 準拠上限**、約 703 MB/分）
      - 推定出力サイズが 3.5 GB を超える長尺・高次 WAV は自動で **RF64（64bit拡張WAV）** 形式で書き出します。
-     - PC 診断（RAM 16GB 以下や低スペックでは 3次以下推奨・5次/7次は ⚠️ 警告、RAM 32GB 以上＆8コア以上の高スペックでは 7次 ✅ 快適）と連動して容量目安と警告を表示します。
-   - **HRTF バイノーラル**: 実測 MIT KEMAR SOFA HRTF（任意取得）および内蔵物理ベース HRTF（Woodworth-Schlosberg ITD・球体回折 ILD・ピンナフィルタ・距離空気吸収＆初期反射/リバーブ）。
-   - **ラウドネスマスタリング**: Cinema (-24 LKFS) / Atmos (-18 LKFS) / Web (-14 LKFS) ＆ True Peak ≤ -1.0 dBTP 保護。
-5. **インタラクティブ 3D 空間ステージビューアー ＆ A/B 比較**
+   - **HRTF バイノーラル**: 実測 MIT KEMAR SOFA HRTF（任意取得・拡散音場EQ補正付き）および内蔵物理ベース HRTF。
+   - **ラウドネスマスタリング**: 元音声等音量マッチング（`match_original` 既定）/ Cinema (-24 LKFS) / Atmos (-18 LKFS) / Web (-14 LKFS) ＆ True Peak ≤ -1.0 dBTP 保護。
+6. **インタラクティブ 3D 空間ステージビューアー ＆ A/B 比較**
    - ヘッドホン試聴向けのワンクリック **元音声 ⇔ バイノーラル** 切替プレイヤー。
-   - 3D トップダウン空間レーダー上で音源ノードをドラッグ調整し、分離済みステムを再利用して数秒で再 Mix できます。
+   - 3D トップダウン空間レーダー上で音源ノードをドラッグ調整したり、監督プランを再適用して数秒で再 Mix できます。
 
 ---
 
 ## 動作要件
 
-- **OS**: Windows 10 / 11（64bit）
+- **OS**:
+  - Windows 10 / 11（64bit）
+  - macOS（Apple Silicon M1〜M4 MPS 推奨 / Intel Mac CPU）
+  - Linux（64bit・NVIDIA CUDA または CPU）
 - **必須ツール**: [uv](https://docs.astral.sh/uv/)、FFmpeg（`ffmpeg` / `ffprobe` が PATH に通っていること）
-- **Python**: Python 3.11（`setup.bat` が `uv venv --python 3.11 .venv` で自動構築）
+- **Python**: Python 3.11（`setup.bat` / `setup.sh` が `uv venv --python 3.11 .venv` で自動構築）
 - **ハードウェア目安**:
-  - **Tier S（快適・フル機能）**: 8コア以上 CPU / CUDA GPU VRAM 16GB以上 / RAM 32GB以上（有音 30〜90分・無音Foley 60〜180秒目安）
-  - **Tier A（高品質）**: CUDA GPU VRAM 12GB前後 / RAM 16GB以上（有音 15〜45分・無音Foley XLオフロード併用 30〜90秒目安）
-  - **Tier B（標準）**: CUDA GPU VRAM 8GB前後 / RAM 16GB（有音 5〜15分・無音Foley XLオフロード必須 15〜30秒限定）
-  - **Tier C（CPU軽量）**: GPUなし / RAM 8GB〜（ローカルDSP 3分離＋物理HRTFによる 1〜3分の有音短尺リミックス向け。無音AI Foley本番生成は非対応）
+  - **Tier S（快適・フル機能）**: 8コア以上 CPU / NVIDIA CUDA GPU VRAM 16GB以上 / RAM 32GB以上（有音 30〜90分・無音Foley 60〜180秒目安）
+  - **Tier A（高品質）**: CUDA VRAM 12GB前後（RAM 16GB以上）、または Apple Silicon MPS ユニファイドメモリ 24GB以上・8コア以上（有音 15〜45分、無音Foleyはオフロード併用・MPSでは省メモリ短尺推奨）
+  - **Tier B（標準）**: CUDA VRAM 8GB前後（RAM 16GB）、または Apple Silicon MPS ユニファイドメモリ 16GB（有音 5〜15分、無音Foleyはオフロード必須・短尺限定）
+  - **Tier C（CPU軽量 / 非NVIDIA GPU）**: GPUなし・非NVIDIA GPU（AMD/Intel）・RAM 8GB〜（ローカルDSP 3分離＋物理HRTFによる 1〜3分の有音短尺リミックス向け。無音AI Foley本番生成は非対応）
 
-> **注意**: VRAM目安は提供元推奨と暫定目安に基づく案内であり、他アプリのメモリ使用状況や動画の複雑さによって変動します。
+> **注意**: VRAM・ユニファイドメモリ目安は提供元推奨と暫定目安に基づく案内であり、他アプリのメモリ使用状況や動画の複雑さによって変動します。
 
 ---
 
@@ -53,28 +64,44 @@ AI エージェント（Claude Code / Antigravity / MCP 対応クライアント
 
 ### 1. セットアップ（初回のみ）
 
+**Windows:**
 ```bat
 setup.bat
 ```
 
-- `.venv`（Python 3.11）を作成し、NVIDIA GPU がある場合は **CUDA 12.4 版 PyTorch (`torch==2.6.0+cu124`)** を優先導入します。
+**macOS / Linux:**
+```bash
+chmod +x setup.sh run.sh
+./setup.sh
+```
+
+- `.venv`（Python 3.11）を作成し、Windows/Linux の NVIDIA GPU 環境では **CUDA 12.4 版 PyTorch (`torch==2.6.0+cu124`)**、macOS 環境では **標準 PyPI PyTorch（Apple Silicon MPS / Intel CPU）**、その他の非 NVIDIA 環境では CPU 版 PyTorch を導入します。
 - **重要**: `audio-separator` は PyTorch を CPU 版に上書きするため導入しません。
 - セットアップ時に AI モデルは自動ダウンロードしません。
 
 ### 2. Web アプリ起動
 
+**Windows:**
 ```bat
 run.bat
 ```
 
+**macOS / Linux:**
+```bash
+./run.sh
+```
+> `run.sh` は `PYTORCH_ENABLE_MPS_FALLBACK=1` を自動でエクスポートし、`.venv/bin/python -X utf8 -m uvicorn app.server:app --host 127.0.0.1 --port "${CINESS_PORT:-8780}"` で起動します。
+
 ブラウザで **`http://127.0.0.1:8780`** が自動的に開きます（ポートは環境変数 `CINESS_PORT` で変更可能）。
-起動後、右上の **「AIモデル管理」** から必要なモデルを取得してください（隣接 `SoundSeparator` がある場合は BandIt Plus / DBS-TIGER-DnR / MelBand Dereverb / Nemotron-3-Diarization 等が自動で緑バッジ「SoundSeparator共有」になります）。
+起動後、右上の **「AIモデル管理」** から必要なモデルを取得してください（隣接 `SoundSeparator` や `~/AI/HunyuanVideo-Foley` がある場合は自動で検出・共有されます）。
 
 ---
 
-## AI エージェント連携（「開始ボタン」でエージェント実行）
+## AI エージェント連携（「開始ボタン」＆ AIダビング監督）
 
 ### 方法 A: CLI 常駐ランナー（おすすめ）
+
+Windows では `.venv\Scripts\python.exe`、macOS / Linux では `.venv/bin/python` を使用してください。
 
 ```powershell
 # 1. 環境診断とモデル確認
@@ -85,29 +112,50 @@ run.bat
 
 # 3. Web UI の「▶ 処理開始」ボタンを待ち受けて自動実行
 .venv\Scripts\python.exe -X utf8 tools/ciness_agent.py watch --server http://127.0.0.1:8780
+
+# 4. 完了ジョブのシーン温度・SFX 4層・コンタクトシート情報取得
+.venv\Scripts\python.exe -X utf8 tools/ciness_agent.py director-context --job-id <JOB_ID>
+
+# 5. AIダビング監督プランを適用して再分離なしで高速空間リミックス
+.venv\Scripts\python.exe -X utf8 tools/ciness_agent.py apply-director --job-id <JOB_ID> --plan '{"notes":"クライマックス強化","keyframes":[]}'
 ```
 
 `watch` を起動すると、Web UI ヘッダーが **「🤖 エージェント接続中・待機OK」** に変わり、画面上で **「▶ 処理開始」** を押すだけでエージェントがジョブを受注して実行・ログ出力・完了まで自動で進行します。
 
-### 方法 B: MCP サーバー（`.mcp.json` 同梱）
+### 方法 B: MCP サーバー（`.mcp.json` 同梱・計8ツール）
 
-リポジトリ直下の `.mcp.json`（登録名 `ciness`）を利用すると、MCP 対応クライアントから以下の6ツールを直接呼び出せます。
+リポジトリ直下の `.mcp.json`（登録名 `ciness`）を利用すると、MCP 対応クライアントから以下の **8ツール** を直接呼び出せます。
+
+> **macOS / Linux での `.mcp.json` 読み替え注意**:
+> 同梱の `.mcp.json` は既定で Windows 向けの `"command": ".venv/Scripts/python.exe"` になっています。macOS / Linux の MCP クライアントで使用する場合は、設定上の起動コマンドを **`".venv/bin/python"`** に読み替えてご利用ください。
 
 | ツール名 | 機能 |
 |---|---|
-| `ciness_status` | PC環境診断・サーバー稼働・エージェント接続・モデル一覧の確認 |
+| `ciness_status` | PC環境診断（CUDA / MPS / 非NVIDIA含む）・サーバー稼働・エージェント接続・モデル一覧の確認 |
 | `ciness_start_server` | FastAPI Web サーバーの起動確認＆ブラウザ起動 |
 | `ciness_wait_job` | ハートビートを送りながら Web UI からのジョブ投入を待機 |
 | `ciness_claim_and_run_job` | キューのジョブを受注してバックグラウンド（または同期）で実行 |
 | `ciness_job_status` | ジョブの進捗・ログ・成果物パスの確認 |
 | `ciness_cancel_job` | ジョブの安全キャンセル |
+| `ciness_get_director_context` | シーン温度カーブ・SFX 4層情報・監督プラン・コンタクトシート画像 (`director_sheet.jpg`) の取得 |
+| `ciness_apply_director_plan` | 監督プラン (`director_plan`) を適用して再分離なしの高速空間リミックスを実行 |
+
+### 監督連携 Web API 契約
+
+- `GET /api/jobs/{job_id}/director-context`: シーン温度（`intensity_track`, `scene_segments`）、SFX 4層（`sfx_layers`, `sfx_events`）、`director_plan`, `director_sheet_url` 等を返却
+- `GET /api/jobs/{job_id}/media/director_sheet`: 代表フレーム最大8枚の JPEG コンタクトシート画像を返却
+- `POST /api/jobs/{job_id}/director-plan`: `{"director_plan": {...}}` を受信し、空間リミックス後の状態と `result` を返却
 
 ---
 
 ## テスト
 
 ```powershell
+# Windows
 .venv\Scripts\python.exe -X utf8 -m unittest discover -s tests -v
+
+# macOS / Linux
+.venv/bin/python -X utf8 -m unittest discover -s tests -v
 ```
 
 ---

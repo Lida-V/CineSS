@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 APP_ROOT = Path(__file__).resolve().parent.parent
@@ -41,6 +42,50 @@ def ensure_directories() -> None:
         directory.mkdir(parents=True, exist_ok=True)
 
 
+def find_venv_python(root: Path | str | None = None) -> Path:
+    """指定ディレクトリ配下の .venv Python 実行ファイルを検出する（Windows / macOS / Linux 対応）。
+
+    実ファイルが存在しない場合は OS 標準の想定パスを返す（is_file() == False）。
+    """
+    base = Path(root).expanduser() if root is not None else APP_ROOT
+    venv_dir = base / ".venv"
+    if os.name == "nt":
+        candidates = [
+            venv_dir / "Scripts" / "python.exe",
+            venv_dir / "bin" / "python",
+            venv_dir / "bin" / "python3",
+        ]
+    else:
+        candidates = [
+            venv_dir / "bin" / "python",
+            venv_dir / "bin" / "python3",
+            venv_dir / "Scripts" / "python.exe",
+        ]
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return candidates[0]
+
+
+def get_torch_device() -> tuple[str, str]:
+    """利用可能な PyTorch 演算デバイスと表示ラベルを返す (cuda -> mps -> cpu)。"""
+    try:
+        import torch  # noqa: PLC0415
+
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            return "cuda", "NVIDIA CUDA"
+        backends = getattr(torch, "backends", None)
+        mps_backend = getattr(backends, "mps", None) if backends is not None else None
+        if mps_backend is not None and mps_backend.is_available():
+            return "mps", "Apple Silicon MPS"
+    except Exception:
+        pass
+    return "cpu", "CPU"
+
+
 def find_soundseparator_dir() -> Path | None:
     """隣接または環境変数指定の SoundSeparator フォルダを探索する。
 
@@ -48,6 +93,7 @@ def find_soundseparator_dir() -> Path | None:
     1. 環境変数 `SOUNDSEPARATOR_DIR`
     2. 隣接 `../SoundtSeparator`
     3. 隣接 `../SoundSeparator`
+    4. ホーム配下 `~/AI/SoundSeparator`, `~/SoundSeparator`
     """
     candidates: list[Path] = []
     env_dir = os.environ.get("SOUNDSEPARATOR_DIR")
@@ -55,6 +101,12 @@ def find_soundseparator_dir() -> Path | None:
         candidates.append(Path(env_dir).expanduser())
     candidates.append(APP_ROOT.parent / "SoundtSeparator")
     candidates.append(APP_ROOT.parent / "SoundSeparator")
+    try:
+        home = Path.home()
+        candidates.append(home / "AI" / "SoundSeparator")
+        candidates.append(home / "SoundSeparator")
+    except RuntimeError:
+        pass
 
     for candidate in candidates:
         try:
@@ -78,9 +130,10 @@ def find_hunyuan_foley_dir() -> Path | None:
 
     優先順:
     1. 環境変数 `HUNYUAN_FOLEY_DIR`
-    2. `engine/hunyuan_foley`
-    3. 隣接 `../HunyuanVideo-Foley`
-    4. Windows 標準配置 `C:/AI/HunyuanVideo-Foley`
+    2. `engine/hunyuan_foley` / `engine/HunyuanVideo-Foley`
+    3. 隣接 `../HunyuanVideo-Foley` / `../hunyuan_foley`
+    4. ホーム配下 `~/AI/HunyuanVideo-Foley` / `~/HunyuanVideo-Foley`
+    5. Windows 標準配置 `C:/AI/HunyuanVideo-Foley`
     """
     candidates: list[Path] = []
     env_dir = os.environ.get("HUNYUAN_FOLEY_DIR")
@@ -89,6 +142,13 @@ def find_hunyuan_foley_dir() -> Path | None:
     candidates.append(ENGINE_DIR / "hunyuan_foley")
     candidates.append(ENGINE_DIR / "HunyuanVideo-Foley")
     candidates.append(APP_ROOT.parent / "HunyuanVideo-Foley")
+    candidates.append(APP_ROOT.parent / "hunyuan_foley")
+    try:
+        home = Path.home()
+        candidates.append(home / "AI" / "HunyuanVideo-Foley")
+        candidates.append(home / "HunyuanVideo-Foley")
+    except RuntimeError:
+        pass
     if os.name == "nt":
         candidates.append(Path("C:/AI/HunyuanVideo-Foley"))
 

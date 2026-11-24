@@ -280,6 +280,33 @@ def _nms_detections(detections: list[dict[str, Any]], iou_thresh: float = 0.35) 
     return kept
 
 
+def _resolve_torch_device() -> str:
+    """config.get_torch_device() または torch バックエンドから推論デバイス (cuda/mps/cpu) を解決する。"""
+    try:
+        from app import config as ciness_config
+
+        fn = getattr(ciness_config, "get_torch_device", None)
+        if callable(fn):
+            res = fn()
+            if isinstance(res, tuple) and res:
+                return str(res[0])
+            if isinstance(res, str) and res:
+                return res
+    except Exception:
+        pass
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+        mps_backend = getattr(torch.backends, "mps", None)
+        if mps_backend is not None and mps_backend.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
 class _OptionalDepthEstimator:
     """ローカルに導入済みの場合のみ Depth Anything V2 Small を利用する（暗黙DLしない）。"""
 
@@ -315,12 +342,15 @@ class _OptionalDepthEstimator:
 
             self._processor = AutoImageProcessor.from_pretrained(str(model_dir), local_files_only=True)
             self._model = AutoModelForDepthEstimation.from_pretrained(str(model_dir), local_files_only=True)
-            self._device = "cuda" if torch.cuda.is_available() else "cpu"
+            self._device = _resolve_torch_device()
+            if self._device == "mps":
+                os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
             self._model = self._model.to(self._device).eval()
             self.available = True
         except Exception:
             self._processor = None
             self._model = None
+            self._device = "cpu"
             self.available = False
 
     def estimate_map(self, frame_bgr: np.ndarray) -> np.ndarray | None:
@@ -956,13 +986,210 @@ def _build_scene_summary(
     }
 
 
+def _estimate_sfx_distance_m(
+    energy: float,
+    p98: float,
+    flash_score: float,
+    area_ratio: float = 0.0,
+    depth_val: float | None = None,
+) -> tuple[float, float]:
+    """モーションエネルギー・局所ピーク(p98)・画面フラッシュの合成強度から SFX 距離[m]を算出する。
+
+    - 激しいアクション時: 約 1.3 〜 2.2m（近接で迫力を表現）
+    - 静かな微小動き時: 約 3.2 〜 5.2m（遠景で空間奥行きを表現）
+    """
+    energy_norm = min(1.0, max(0.0, float(energy) / 0.15))
+    p98_norm = min(1.0, max(0.0, float(p98) / 0.50))
+    flash_norm = min(1.0, max(0.0, float(flash_score)))
+    area_norm = min(1.0, max(0.0, float(area_ratio) * 3.0))
+
+    intensity = min(
+        1.0,
+        0.36 * energy_norm + 0.40 * p98_norm + 0.16 * flash_norm + 0.08 * area_norm,
+    )
+    action_dist = max(1.3, min(5.2, 5.0 - 3.7 * (intensity ** 0.72)))
+
+    if depth_val is not None and math.isfinite(depth_val):
+        depth_dist = max(1.0, min(8.0, 1.0 + (1.0 - float(depth_val)) * 7.0))
+        dist = 0.45 * depth_dist + 0.55 * action_dist
+    else:
+        dist = action_dist
+
+    return round(max(1.3, min(5.2, dist)), 2), round(float(intensity), 4)
+
+
+def _classify_temperature(temp: float) -> tuple[str, str]:
+    """正規化シーン温度 (0.0..1.0) を日本語ラベルと英語コードへ分類する。"""
+    t = float(temp)
+    if t < 0.25:
+        return "静寂", "quiet"
+    if t < 0.52:
+        return "通常", "normal"
+    if t < 0.75:
+        return "高揚", "rising"
+    return "クライマックス", "climax"
+
+
+def _build_intensity_and_segments(
+    raw_samples: list[dict[str, Any]],
+    duration_sec: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """フレーム時系列メトリクスから正規化温度カーブとシーン区間ラベルを構築する。"""
+    total_dur = max(0.1, float(duration_sec))
+    if not raw_samples:
+        label_ja, label_code = _classify_temperature(0.30)
+        return (
+            [
+                {
+                    "t_sec": 0.0,
+                    "t": 0.0,
+                    "temperature": 0.3,
+                    "raw_temperature": 0.3,
+                    "motion_energy": 0.0,
+                    "p98": 0.0,
+                    "flash_score": 0.0,
+                    "brightness": 128.0,
+                    "warmth": 0.0,
+                    "is_cut": False,
+                }
+            ],
+            [
+                {
+                    "segment_id": 0,
+                    "start_sec": 0.0,
+                    "end_sec": round(total_dur, 3),
+                    "duration_sec": round(total_dur, 3),
+                    "mean_temperature": 0.3,
+                    "peak_temperature": 0.3,
+                    "label": label_ja,
+                    "label_code": label_code,
+                }
+            ],
+        )
+
+    raw_vals = np.array([float(s["raw_score"]) for s in raw_samples], dtype=np.float64)
+    p95 = float(np.percentile(raw_vals, 95)) if raw_vals.size > 0 else 0.0
+    # 全体が完全静止に近い動画が無意味に高温度化しないようダイナミックレンジを適応調整
+    rel_weight = 0.35 * min(1.0, max(0.0, (p95 - 0.06) / 0.24))
+    denom = max(p95, 0.25)
+    combined = np.clip((1.0 - rel_weight) * raw_vals + rel_weight * np.minimum(1.0, raw_vals / denom), 0.0, 1.0)
+
+    # 3点移動平均（2パス）で急峻なノイズを抑えつつ山を残す
+    smoothed = combined.copy()
+    if smoothed.size >= 3:
+        for _ in range(2):
+            pad = np.pad(smoothed, (1, 1), mode="edge")
+            smoothed = 0.25 * pad[:-2] + 0.50 * pad[1:-1] + 0.25 * pad[2:]
+        # カット／急激フラッシュのピークが埋もれすぎないよう元値も適度に反映
+        smoothed = np.clip(np.maximum(smoothed, 0.78 * combined), 0.0, 1.0)
+
+    intensity_track: list[dict[str, Any]] = []
+    for item, temp_val in zip(raw_samples, smoothed):
+        t_val = round(float(item["t_sec"]), 3)
+        intensity_track.append({
+            "t_sec": t_val,
+            "t": t_val,
+            "temperature": round(float(temp_val), 4),
+            "raw_temperature": round(float(item["raw_score"]), 4),
+            "motion_energy": round(float(item["motion_energy"]), 4),
+            "p98": round(float(item["p98"]), 4),
+            "flash_score": round(float(item["flash_score"]), 4),
+            "brightness": round(float(item["brightness"]), 1),
+            "warmth": round(float(item["warmth"]), 2),
+            "is_cut": bool(item["is_cut"]),
+        })
+
+    # 連続同一ラベルでグループ化
+    n = len(intensity_track)
+    raw_groups: list[dict[str, Any]] = []
+    for idx, pt in enumerate(intensity_track):
+        label_ja, label_code = _classify_temperature(pt["temperature"])
+        t_start = 0.0 if idx == 0 else float(pt["t_sec"])
+        t_end = total_dur if idx == n - 1 else float(intensity_track[idx + 1]["t_sec"])
+        t_end = max(t_start, t_end)
+        if raw_groups and raw_groups[-1]["label_code"] == label_code:
+            raw_groups[-1]["end_sec"] = t_end
+            raw_groups[-1]["temps"].append(float(pt["temperature"]))
+        else:
+            raw_groups.append({
+                "start_sec": t_start,
+                "end_sec": t_end,
+                "label": label_ja,
+                "label_code": label_code,
+                "temps": [float(pt["temperature"])],
+            })
+
+    # 短すぎる微小断片を隣接区間へ統合（クライマックスは短めでも保持優先）
+    min_seg_dur = min(0.75, max(0.25, total_dur * 0.10))
+    while len(raw_groups) > 1:
+        short_idx = next(
+            (
+                i
+                for i, g in enumerate(raw_groups)
+                if (g["end_sec"] - g["start_sec"]) < (0.35 if g["label_code"] == "climax" else min_seg_dur)
+            ),
+            None,
+        )
+        if short_idx is None:
+            break
+        cur = raw_groups[short_idx]
+        cur_mean = float(np.mean(cur["temps"]))
+        if short_idx == 0:
+            neighbor_idx = 1
+        elif short_idx == len(raw_groups) - 1:
+            neighbor_idx = short_idx - 1
+        else:
+            prev_mean = float(np.mean(raw_groups[short_idx - 1]["temps"]))
+            next_mean = float(np.mean(raw_groups[short_idx + 1]["temps"]))
+            neighbor_idx = (short_idx - 1) if abs(prev_mean - cur_mean) <= abs(next_mean - cur_mean) else (short_idx + 1)
+
+        target = raw_groups[neighbor_idx]
+        target["start_sec"] = min(target["start_sec"], cur["start_sec"])
+        target["end_sec"] = max(target["end_sec"], cur["end_sec"])
+        target["temps"].extend(cur["temps"])
+        raw_groups.pop(short_idx)
+
+    scene_segments: list[dict[str, Any]] = []
+    for g in raw_groups:
+        mean_t = float(np.mean(g["temps"]))
+        peak_t = float(np.max(g["temps"]))
+        label_ja, label_code = _classify_temperature(mean_t)
+        s_sec = round(float(g["start_sec"]), 3)
+        e_sec = round(float(g["end_sec"]), 3)
+        if scene_segments and scene_segments[-1]["label_code"] == label_code:
+            prev = scene_segments[-1]
+            prev["end_sec"] = e_sec
+            prev["duration_sec"] = round(max(0.0, e_sec - prev["start_sec"]), 3)
+            prev["_temps"].extend(g["temps"])
+            m_t = float(np.mean(prev["_temps"]))
+            prev["mean_temperature"] = round(m_t, 3)
+            prev["peak_temperature"] = round(float(np.max(prev["_temps"])), 3)
+        else:
+            scene_segments.append({
+                "segment_id": len(scene_segments),
+                "start_sec": s_sec,
+                "end_sec": e_sec,
+                "duration_sec": round(max(0.0, e_sec - s_sec), 3),
+                "mean_temperature": round(mean_t, 3),
+                "peak_temperature": round(peak_t, 3),
+                "label": label_ja,
+                "label_code": label_code,
+                "_temps": list(g["temps"]),
+            })
+
+    for seg in scene_segments:
+        seg.pop("_temps", None)
+
+    return intensity_track, scene_segments
+
+
 def analyze_video_spatial(
     video_path: str | Path,
     sample_fps: float = 4.0,
     use_depth_model: bool = False,
     progress_cb: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
-    """映像から人物の3D軌跡・口元活性度・動き重心・シーン特徴を解析する。"""
+    """映像から人物の3D軌跡・口元活性度・動き重心・シーン温度・シーン特徴を解析する。"""
     path = Path(video_path)
     if not path.is_file():
         raise FileNotFoundError(f"動画ファイルが見つかりません: {path}")
@@ -989,6 +1216,7 @@ def analyze_video_spatial(
         anime_fallback_tracker = _PersonTracker(width, height, max_missed_sec=max(0.9, 2.5 / eff_sample_fps))
 
         motion_track: list[dict[str, Any]] = []
+        raw_intensity_samples: list[dict[str, Any]] = []
         brightness_list: list[float] = []
         warmth_list: list[float] = []
         motion_energies: list[float] = []
@@ -996,7 +1224,8 @@ def analyze_video_spatial(
 
         prev_small_gray: np.ndarray | None = None
         prev_hist: np.ndarray | None = None
-        last_motion_pos = (0.0, 0.0, 3.2)
+        prev_brightness: float | None = None
+        last_motion_pos = (0.0, 0.0, 4.2)
 
         frame_idx = 0
         sampled_count = 0
@@ -1024,9 +1253,11 @@ def analyze_video_spatial(
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
             # 明るさ・色調の客観計測
-            brightness_list.append(float(np.mean(gray)))
+            cur_brightness = float(np.mean(gray))
+            brightness_list.append(cur_brightness)
             b_mean, _, r_mean = [float(np.mean(ch)) for ch in cv2.split(frame)]
-            warmth_list.append(r_mean - b_mean)
+            cur_warmth = r_mean - b_mean
+            warmth_list.append(cur_warmth)
 
             # 任意: Depth Anything V2 深度推定
             depth_map = depth_est.estimate_map(frame) if depth_est.available else None
@@ -1039,7 +1270,7 @@ def analyze_video_spatial(
                 if anime_dets:
                     anime_fallback_tracker.update(t, anime_dets, gray, depth_map=depth_map)
 
-            # 動き重心（フレーム間差分 + Farneback オプティカルフロー）
+            # 動き重心（フレーム間差分 + Farneback オプティカルフロー + 画面フラッシュ）
             work_w = min(320, width)
             work_h = max(16, int(round(height * (work_w / max(width, 1)))))
             small_gray = cv2.resize(gray, (work_w, work_h), interpolation=cv2.INTER_AREA)
@@ -1051,18 +1282,50 @@ def analyze_video_spatial(
             if prev_small_gray is not None:
                 diff = cv2.absdiff(small_gray, prev_small_gray).astype(np.float32) / 255.0
                 mean_diff = float(np.mean(diff))
-                hist_corr = float(cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL)) if prev_hist is not None else 1.0
+                bright_jump = abs(cur_brightness - (prev_brightness if prev_brightness is not None else cur_brightness))
+                flash_p98 = float(np.percentile(diff, 98))
+                flash_score = min(1.0, max(bright_jump / 38.0, max(0.0, (flash_p98 - 0.14) / 0.45)))
 
+                hist_corr = float(cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL)) if prev_hist is not None else 1.0
                 is_cut = (mean_diff > 0.28 and hist_corr < 0.55)
+
                 if is_cut:
                     cut_times.append(round(t, 3))
-                    motion_energies.append(min(1.0, mean_diff))
+                    energy = min(1.0, mean_diff)
+                    p98 = float(np.percentile(diff, 98))
+                    cut_flash = min(1.0, max(flash_score * 0.75, bright_jump / 48.0))
+                    dist_m, action_intensity = _estimate_sfx_distance_m(
+                        energy=energy,
+                        p98=p98,
+                        flash_score=cut_flash,
+                        area_ratio=min(1.0, mean_diff * 2.0),
+                    )
+                    az, el = last_motion_pos[0], last_motion_pos[1]
+                    last_motion_pos = (az, el, dist_m)
+                    motion_energies.append(energy)
                     motion_track.append({
                         "t": round(t, 3),
-                        "azimuth_deg": last_motion_pos[0],
-                        "elevation_deg": last_motion_pos[1],
-                        "distance_m": last_motion_pos[2],
-                        "motion_energy": round(min(1.0, mean_diff), 4),
+                        "azimuth_deg": az,
+                        "elevation_deg": el,
+                        "distance_m": dist_m,
+                        "motion_energy": round(energy, 4),
+                        "p98": round(p98, 4),
+                        "flash_score": round(cut_flash, 4),
+                        "action_intensity": action_intensity,
+                        "is_cut": True,
+                    })
+                    raw_score = min(
+                        1.0,
+                        0.42 * min(1.0, energy / 0.16) + 0.36 * min(1.0, p98 / 0.55) + 0.22 * cut_flash + 0.10,
+                    )
+                    raw_intensity_samples.append({
+                        "t_sec": t,
+                        "raw_score": raw_score,
+                        "motion_energy": energy,
+                        "p98": p98,
+                        "flash_score": cut_flash,
+                        "brightness": cur_brightness,
+                        "warmth": cur_warmth,
                         "is_cut": True,
                     })
                 else:
@@ -1079,6 +1342,8 @@ def analyze_video_spatial(
 
                     thresh = max(0.05, p98 * 0.45)
                     mask = motion_map >= thresh
+                    area_ratio = float(np.mean(mask))
+                    depth_val = None
                     if int(np.count_nonzero(mask)) >= 8:
                         weights = motion_map * mask
                         w_sum = float(np.sum(weights))
@@ -1086,16 +1351,20 @@ def analyze_video_spatial(
                         mx = float(np.sum(xs * weights) / max(w_sum, 1e-8))
                         my = float(np.sum(ys * weights) / max(w_sum, 1e-8))
                         az, el = pixel_to_azimuth_elevation(mx, my, work_w, work_h)
-                        area_ratio = float(np.mean(mask))
                         if depth_map is not None:
                             d_small = cv2.resize(depth_map, (work_w, work_h), interpolation=cv2.INTER_AREA)
-                            d_val = float(np.mean(d_small[mask]))
-                            dist_m = round(max(1.0, min(8.0, 1.0 + (1.0 - d_val) * 7.0)), 2)
-                        else:
-                            dist_m = round(max(1.2, min(7.5, 1.4 + (1.0 - min(area_ratio * 3.5, 1.0)) * 4.5)), 2)
-                        last_motion_pos = (az, el, dist_m)
+                            depth_val = float(np.mean(d_small[mask]))
                     else:
-                        az, el, dist_m = last_motion_pos
+                        az, el = last_motion_pos[0], last_motion_pos[1]
+
+                    dist_m, action_intensity = _estimate_sfx_distance_m(
+                        energy=energy,
+                        p98=p98,
+                        flash_score=flash_score,
+                        area_ratio=area_ratio,
+                        depth_val=depth_val,
+                    )
+                    last_motion_pos = (az, el, dist_m)
 
                     motion_track.append({
                         "t": round(t, 3),
@@ -1103,6 +1372,23 @@ def analyze_video_spatial(
                         "elevation_deg": el,
                         "distance_m": dist_m,
                         "motion_energy": round(energy, 4),
+                        "p98": round(p98, 4),
+                        "flash_score": round(flash_score, 4),
+                        "action_intensity": action_intensity,
+                        "is_cut": False,
+                    })
+                    raw_score = min(
+                        1.0,
+                        0.42 * min(1.0, energy / 0.16) + 0.36 * min(1.0, p98 / 0.55) + 0.22 * flash_score,
+                    )
+                    raw_intensity_samples.append({
+                        "t_sec": t,
+                        "raw_score": raw_score,
+                        "motion_energy": energy,
+                        "p98": p98,
+                        "flash_score": flash_score,
+                        "brightness": cur_brightness,
+                        "warmth": cur_warmth,
                         "is_cut": False,
                     })
             else:
@@ -1110,13 +1396,27 @@ def analyze_video_spatial(
                     "t": round(t, 3),
                     "azimuth_deg": 0.0,
                     "elevation_deg": 0.0,
-                    "distance_m": 3.2,
+                    "distance_m": 4.2,
                     "motion_energy": 0.0,
+                    "p98": 0.0,
+                    "flash_score": 0.0,
+                    "action_intensity": 0.0,
+                    "is_cut": False,
+                })
+                raw_intensity_samples.append({
+                    "t_sec": t,
+                    "raw_score": 0.0,
+                    "motion_energy": 0.0,
+                    "p98": 0.0,
+                    "flash_score": 0.0,
+                    "brightness": cur_brightness,
+                    "warmth": cur_warmth,
                     "is_cut": False,
                 })
 
             prev_small_gray = small_gray
             prev_hist = hist
+            prev_brightness = cur_brightness
 
             if progress_cb and frame_count > 0:
                 pct = min(98, int(100 * frame_idx / frame_count))
@@ -1131,6 +1431,14 @@ def analyze_video_spatial(
 
     if duration_sec <= 0.0:
         duration_sec = max(last_t + (1.0 / max(fps, 1.0)), 0.1)
+
+    # 先頭フレームが動き途中の場合でも不自然な 0 谷を作らないよう 2フレーム目から軽く馴染ませる
+    if len(raw_intensity_samples) >= 2 and raw_intensity_samples[0]["raw_score"] == 0.0:
+        raw_intensity_samples[0]["raw_score"] = round(float(raw_intensity_samples[1]["raw_score"]) * 0.75, 4)
+    if len(motion_track) >= 2 and motion_track[0]["action_intensity"] == 0.0:
+        motion_track[0]["distance_m"] = motion_track[1]["distance_m"]
+
+    intensity_track, scene_segments = _build_intensity_and_segments(raw_intensity_samples, duration_sec)
 
     person_tracks = tracker.finalize(sampled_count)
     if not person_tracks and sampled_count >= 3:
@@ -1149,6 +1457,11 @@ def analyze_video_spatial(
         cut_times=cut_times,
         duration_sec=duration_sec,
     )
+    if intensity_track:
+        temps = [float(p["temperature"]) for p in intensity_track]
+        scene_summary["mean_temperature"] = round(float(np.mean(temps)), 3)
+        scene_summary["peak_temperature"] = round(float(np.max(temps)), 3)
+        scene_summary["climax_segments"] = sum(1 for seg in scene_segments if seg["label_code"] == "climax")
 
     if progress_cb:
         try:
@@ -1167,5 +1480,264 @@ def analyze_video_spatial(
         "depth_model_used": bool(depth_est.available),
         "person_tracks": person_tracks,
         "motion_track": motion_track,
+        "intensity_track": intensity_track,
+        "scene_segments": scene_segments,
         "scene_summary": scene_summary,
+    }
+
+
+_LABEL_ASCII_MAP: dict[str, str] = {
+    "静寂": "QUIET",
+    "通常": "NORMAL",
+    "高揚": "RISING",
+    "クライマックス": "CLIMAX",
+    "quiet": "QUIET",
+    "normal": "NORMAL",
+    "rising": "RISING",
+    "climax": "CLIMAX",
+}
+
+_LABEL_COLOR_BGR: dict[str, tuple[int, int, int]] = {
+    "quiet": (235, 165, 90),     # 青系
+    "normal": (130, 210, 120),   # 緑系
+    "rising": (60, 185, 250),    # 橙系
+    "climax": (80, 90, 245),     # 赤系
+}
+
+
+def _find_japanese_ttf() -> str | None:
+    """Pillow 利用可能な環境で OS 標準の日本語フォントを探す（個人固有パス不使用）。"""
+    win_dir = os.environ.get("WINDIR")
+    candidates: list[Path] = []
+    if win_dir:
+        fonts_dir = Path(win_dir) / "Fonts"
+        candidates.extend([
+            fonts_dir / "meiryo.ttc",
+            fonts_dir / "YuGothM.ttc",
+            fonts_dir / "msgothic.ttc",
+        ])
+    candidates.extend([
+        Path("/System/Library/Fonts/ヒラギノ角ゴシック W4.ttc"),
+        Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
+        Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    ])
+    for cand in candidates:
+        try:
+            if cand.is_file():
+                return str(cand)
+        except OSError:
+            continue
+    return None
+
+
+def _select_contact_sheet_times(
+    duration_sec: float,
+    intensity_track: list[dict[str, Any]],
+    max_frames: int,
+) -> list[dict[str, Any]]:
+    """動画全体から均等バケット内の最大温度フレームを最大 max_frames 点選定する。"""
+    n_slots = max(1, min(8, int(max_frames)))
+    dur = max(0.1, float(duration_sec))
+    selected: list[dict[str, Any]] = []
+
+    if intensity_track:
+        for slot in range(n_slots):
+            s_t = dur * slot / n_slots
+            e_t = dur * (slot + 1) / n_slots
+            bucket = [
+                pt for pt in intensity_track
+                if s_t <= float(pt.get("t_sec", pt.get("t", 0.0))) < (e_t + (0.01 if slot == n_slots - 1 else 0.0))
+            ]
+            if bucket:
+                best = max(bucket, key=lambda p: float(p.get("temperature", 0.0)))
+                t_val = float(best.get("t_sec", best.get("t", s_t)))
+                temp = float(best.get("temperature", 0.3))
+            else:
+                t_val = min(dur - 0.01, (s_t + e_t) * 0.5)
+                closest = min(intensity_track, key=lambda p: abs(float(p.get("t_sec", p.get("t", 0.0))) - t_val))
+                temp = float(closest.get("temperature", 0.3))
+            label_ja, label_code = _classify_temperature(temp)
+            selected.append({
+                "t_sec": round(max(0.0, min(dur, t_val)), 3),
+                "temperature": round(temp, 2),
+                "label": label_ja,
+                "label_code": label_code,
+            })
+    else:
+        for slot in range(n_slots):
+            t_val = dur * (slot + 0.5) / n_slots
+            label_ja, label_code = _classify_temperature(0.3)
+            selected.append({
+                "t_sec": round(t_val, 3),
+                "temperature": 0.3,
+                "label": label_ja,
+                "label_code": label_code,
+            })
+
+    # 近接重複時刻を除去しつつ昇順維持
+    deduped: list[dict[str, Any]] = []
+    for item in sorted(selected, key=lambda x: x["t_sec"]):
+        if not deduped or abs(item["t_sec"] - deduped[-1]["t_sec"]) >= 0.02 or dur < 0.3:
+            deduped.append(item)
+    return deduped[:n_slots]
+
+
+def export_director_contact_sheet(
+    video_path: str | Path,
+    vision_result: dict[str, Any] | None,
+    out_path: str | Path,
+    max_frames: int = 8,
+) -> dict[str, Any]:
+    """代表フレーム（最大8枚、2x4グリッド、総横幅 <= 1280px）の監督コンタクトシート JPEG を生成する。"""
+    src_video = Path(video_path)
+    if not src_video.is_file():
+        raise FileNotFoundError(f"動画ファイルが見つかりません: {src_video}")
+    dst_path = Path(out_path)
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+    vr = vision_result or {}
+    intensity_track = vr.get("intensity_track") or []
+
+    cap = cv2.VideoCapture(str(src_video))
+    if not cap.isOpened():
+        raise RuntimeError(f"OpenCV で動画を開けませんでした: {src_video}")
+
+    try:
+        vw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
+        vh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 360)
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        if not math.isfinite(fps) or fps <= 0:
+            fps = 30.0
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        duration_sec = float(vr.get("duration_sec") or 0.0)
+        if duration_sec <= 0.0 and frame_count > 0:
+            duration_sec = frame_count / fps
+        if duration_sec <= 0.0:
+            duration_sec = 1.0
+
+        slots = _select_contact_sheet_times(duration_sec, intensity_track, max_frames=max_frames)
+        captured: list[tuple[dict[str, Any], np.ndarray]] = []
+        last_valid: np.ndarray | None = None
+
+        for slot in slots:
+            t_sec = float(slot["t_sec"])
+            cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, t_sec * 1000.0))
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                if frame_count > 0:
+                    target_idx = max(0, min(frame_count - 1, int(round(t_sec * fps))))
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
+                    ret, frame = cap.read()
+            if (not ret or frame is None) and last_valid is not None:
+                frame = last_valid.copy()
+            if frame is not None:
+                if vw <= 0 or vh <= 0:
+                    vh, vw = frame.shape[:2]
+                last_valid = frame
+                captured.append((slot, frame))
+    finally:
+        cap.release()
+
+    if not captured:
+        blank = np.zeros((max(180, vh), max(320, vw), 3), dtype=np.uint8)
+        captured = [({"t_sec": 0.0, "temperature": 0.0, "label": "通常", "label_code": "normal"}, blank)]
+
+    n_tiles = len(captured)
+    cols = 4 if n_tiles > 4 else max(1, n_tiles)
+    rows = int(math.ceil(n_tiles / cols))
+    pad = 8
+    tile_w = min(310, (1280 - pad * (cols + 1)) // cols)
+    tile_w = max(120, tile_w)
+    tile_h = max(90, int(round(tile_w * max(vh, 1) / max(vw, 1))))
+
+    canvas_w = cols * tile_w + (cols + 1) * pad
+    canvas_h = rows * tile_h + (rows + 1) * pad
+    canvas = np.full((canvas_h, canvas_w, 3), (18, 22, 30), dtype=np.uint8)
+
+    pil_font = None
+    font_mode = "opencv_ascii"
+    try:
+        from PIL import Image, ImageDraw, ImageFont  # type: ignore
+
+        font_path = _find_japanese_ttf()
+        if font_path:
+            pil_font = ImageFont.truetype(font_path, 14)
+            font_mode = "pil_ttf"
+    except Exception:
+        pil_font = None
+        font_mode = "opencv_ascii"
+
+    frame_meta: list[dict[str, Any]] = []
+    for idx, (slot, frame) in enumerate(captured):
+        r_idx = idx // cols
+        c_idx = idx % cols
+        x0 = pad + c_idx * (tile_w + pad)
+        y0 = pad + r_idx * (tile_h + pad)
+
+        tile = cv2.resize(frame, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
+
+        # 下部半透明オーバーレイ帯
+        bar_h = min(30, max(22, tile_h // 5))
+        overlay = tile.copy()
+        cv2.rectangle(overlay, (0, tile_h - bar_h), (tile_w, tile_h), (10, 12, 18), -1)
+        tile = cv2.addWeighted(overlay, 0.72, tile, 0.28, 0.0)
+
+        accent = _LABEL_COLOR_BGR.get(slot["label_code"], (130, 210, 120))
+        cv2.rectangle(tile, (0, 0), (tile_w - 1, tile_h - 1), (55, 65, 80), 1)
+        cv2.rectangle(tile, (0, tile_h - bar_h), (tile_w - 1, tile_h - bar_h + 2), accent, -1)
+
+        if font_mode == "pil_ttf" and pil_font is not None:
+            try:
+                from PIL import Image, ImageDraw  # type: ignore
+
+                pil_img = Image.fromarray(cv2.cvtColor(tile, cv2.COLOR_BGR2RGB))
+                draw = ImageDraw.Draw(pil_img)
+                txt = f"{slot['t_sec']:.1f}s  T:{slot['temperature']:.2f} {slot['label']}"
+                draw.text((8, tile_h - bar_h + 6), txt, font=pil_font, fill=(242, 246, 252))
+                tile = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            except Exception:
+                font_mode = "opencv_ascii"
+
+        if font_mode != "pil_ttf":
+            ascii_label = _LABEL_ASCII_MAP.get(
+                slot["label"],
+                _LABEL_ASCII_MAP.get(slot["label_code"], "NORMAL"),
+            )
+            txt = f"{slot['t_sec']:.1f}s T:{slot['temperature']:.2f} {ascii_label}"
+            cv2.putText(
+                tile,
+                txt,
+                (7, tile_h - max(7, bar_h // 3)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.44,
+                (242, 246, 252),
+                1,
+                cv2.LINE_AA,
+            )
+
+        canvas[y0 : y0 + tile_h, x0 : x0 + tile_w] = tile
+        frame_meta.append({
+            "index": idx,
+            "t_sec": float(slot["t_sec"]),
+            "temperature": float(slot["temperature"]),
+            "label": slot["label"],
+            "label_code": slot["label_code"],
+        })
+
+    ok, encoded = cv2.imencode(".jpg", canvas, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+    if not ok:
+        raise RuntimeError("コンタクトシート JPEG のエンコードに失敗しました。")
+    dst_path.write_bytes(encoded.tobytes())
+
+    return {
+        "path": str(dst_path.resolve()),
+        "width": int(canvas.shape[1]),
+        "height": int(canvas.shape[0]),
+        "cols": cols,
+        "rows": rows,
+        "frame_count": n_tiles,
+        "font_mode": font_mode,
+        "frames": frame_meta,
     }

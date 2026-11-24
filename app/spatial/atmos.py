@@ -38,6 +38,7 @@ from .hrtf import (
     HRTFEngine,
     RoomReverbEngine,
     SAMPLE_RATE,
+    _deduplicate_sorted_keyframes,
     air_absorption_response,
     clamp_distance_m,
     clamp_elevation_deg,
@@ -46,6 +47,8 @@ from .hrtf import (
     fit_length,
     interpolate_keyframes,
     load_audio_48k,
+    resolve_gain_linear_for_render,
+    resolve_object_gain_db,
     wrap_azimuth_deg,
 )
 
@@ -197,10 +200,11 @@ def compute_714_panning_gains(
 
 
 def _lfe_lowpass(mono: np.ndarray, sample_rate: int = SAMPLE_RATE, cutoff_hz: float = 80.0) -> np.ndarray:
-    """LFE チャンネル用の 80Hz 4次 Butterworth ローパスフィルタ。"""
+    """LFE チャンネル用の 4次 Butterworth ローパスフィルタ（既定 80Hz）。"""
     if mono.size == 0 or float(np.max(np.abs(mono))) < 1e-10:
         return np.zeros_like(mono, dtype=np.float32)
-    sos = signal.butter(4, cutoff_hz, btype="lowpass", fs=sample_rate, output="sos")
+    eff_cut = max(20.0, min(float(cutoff_hz), 0.45 * float(sample_rate)))
+    sos = signal.butter(4, eff_cut, btype="lowpass", fs=sample_rate, output="sos")
     return signal.sosfilt(sos, mono.astype(np.float64)).astype(np.float32)
 
 
@@ -216,22 +220,28 @@ def _delay_samples(x: np.ndarray, n_delay: int) -> np.ndarray:
 def _apply_distance_to_object_mono(
     mono_audio: np.ndarray,
     keyframes: list[dict[str, Any]] | None,
-    gain_db: float,
+    gain_db: float | np.ndarray,
     rt60_sec: float,
     sample_rate: int = SAMPLE_RATE,
     block_size: int = 2048,
     role: str = "sfx",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """オブジェクト音声へ距離減衰・空気吸収LPFを滑らかに適用し、直接音とリバーブセンドを返す。"""
+    """オブジェクト音声へ時間変化ゲイン・距離減衰・空気吸収LPFを滑らかに適用し、直接音とリバーブセンドを返す。"""
     x = np.asarray(mono_audio, dtype=np.float32).reshape(-1)
     n_samples = x.shape[0]
-    gain_lin = float(10.0 ** (float(gain_db) / 20.0))
-    if n_samples == 0 or gain_lin == 0.0 or float(np.max(np.abs(x))) < 1e-9:
+    if n_samples == 0:
+        return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+
+    gain_lin = resolve_gain_linear_for_render(
+        n_samples, gain_db=gain_db, keyframes=keyframes, sample_rate=sample_rate
+    )
+    x_scaled = x.astype(np.float64) * gain_lin
+    if float(np.max(np.abs(x_scaled))) < 1e-9:
         return np.zeros((n_samples,), dtype=np.float32), np.zeros((n_samples,), dtype=np.float32)
 
     hop = block_size // 2
     window = np.hanning(block_size).astype(np.float64)
-    x_pad = np.pad(x.astype(np.float64) * gain_lin, (hop, hop + block_size), mode="constant")
+    x_pad = np.pad(x_scaled, (hop, hop + block_size), mode="constant")
 
     n_fft = block_size * 2
     freqs = np.fft.rfftfreq(n_fft, d=1.0 / sample_rate)
@@ -279,7 +289,10 @@ def _build_adm_keyframes(
         x, y, z = spherical_to_atmos_xyz(0.0, 0.0, 2.0)
         return [{"t": 0.0, "x": x, "y": y, "z": z}]
 
-    sorted_kf = sorted(keyframes, key=lambda k: float(k.get("t", 0.0)))
+    sorted_kf = _deduplicate_sorted_keyframes(keyframes)
+    if not sorted_kf:
+        x, y, z = spherical_to_atmos_xyz(0.0, 0.0, 2.0)
+        return [{"t": 0.0, "x": x, "y": y, "z": z}]
     # 静的オブジェクト（1点のみ）なら 1 ブロックで十分
     if len(sorted_kf) == 1:
         k = sorted_kf[0]
@@ -355,34 +368,61 @@ class AtmosRenderer:
 
         return np.stack([out_l, out_r], axis=1).astype(np.float32)
 
-    def _route_bed_track_714(self, audio_2d: np.ndarray, gain_db: float, role: str) -> np.ndarray:
-        """BGM・環境音トラックを 7.1.4 Bed (N, 12) へシネマティックに配置する。"""
-        n = audio_2d.shape[0]
-        gain_lin = float(10.0 ** (float(gain_db) / 20.0))
+    def _route_bed_track_714(
+        self,
+        audio_2d: np.ndarray,
+        gain_db: float | np.ndarray = 0.0,
+        role: str = "music",
+        keyframes: list[dict[str, Any]] | None = None,
+    ) -> np.ndarray:
+        """BGM・環境音・重低音ベッドトラックを 7.1.4 Bed (N, 12) へシネマティックに配置する。"""
+        arr = np.asarray(audio_2d, dtype=np.float32)
+        if arr.ndim == 1:
+            arr = arr[:, np.newaxis]
+        n = arr.shape[0]
         bed = np.zeros((n, 12), dtype=np.float32)
-        if n == 0 or gain_lin == 0.0 or float(np.max(np.abs(audio_2d))) < 1e-10:
+        if n == 0 or float(np.max(np.abs(arr))) < 1e-10:
             return bed
 
-        is_ambience = str(role).lower() == "ambience"
         sr = self.sample_rate
+        gain_lin = resolve_gain_linear_for_render(
+            n, gain_db=gain_db, keyframes=keyframes, sample_rate=sr
+        )
+        role_norm = str(role or "music").strip().lower()
 
-        if audio_2d.shape[1] >= 2:
-            left = audio_2d[:, 0] * gain_lin
-            right = audio_2d[:, 1] * gain_lin
+        if role_norm == "sfx_sub":
+            left = (arr[:, 0] * gain_lin).astype(np.float32)
+            right = (arr[:, 1] * gain_lin).astype(np.float32) if arr.shape[1] >= 2 else left
+            mid = 0.5 * (left + right)
+            if float(np.max(np.abs(left))) < 1e-10 and float(np.max(np.abs(right))) < 1e-10:
+                return bed
+            # 重低音ベッド: Front L/R (0.48) + LFE 140Hz LPF (0.88)
+            bed[:, 0] += 0.48 * left
+            bed[:, 1] += 0.48 * right
+            bed[:, 3] += 0.88 * _lfe_lowpass(mid, sample_rate=sr, cutoff_hz=140.0)
+            return bed
+
+        is_ambience = role_norm == "ambience"
+
+        if arr.shape[1] >= 2:
+            left = (arr[:, 0] * gain_lin).astype(np.float32)
+            right = (arr[:, 1] * gain_lin).astype(np.float32)
+            if float(np.max(np.abs(left))) < 1e-10 and float(np.max(np.abs(right))) < 1e-10:
+                return bed
             mid = 0.5 * (left + right)
             if is_ambience:
-                # 環境音はサラウンド・トップへより豊かに包囲配置
-                bed[:, 0] += 0.55 * left
-                bed[:, 1] += 0.55 * right
-                bed[:, 4] += 0.52 * _delay_samples(left, int(0.009 * sr))
-                bed[:, 5] += 0.52 * _delay_samples(right, int(0.011 * sr))
-                bed[:, 6] += 0.42 * _delay_samples(left, int(0.017 * sr))
-                bed[:, 7] += 0.42 * _delay_samples(right, int(0.021 * sr))
-                bed[:, 8] += 0.36 * _delay_samples(left, int(0.013 * sr))
-                bed[:, 9] += 0.36 * _delay_samples(right, int(0.016 * sr))
-                bed[:, 10] += 0.30 * _delay_samples(left, int(0.023 * sr))
-                bed[:, 11] += 0.30 * _delay_samples(right, int(0.027 * sr))
-                bed[:, 3] += 0.25 * _lfe_lowpass(mid, sample_rate=sr)
+                # 環境音はリア・サイド・ハイトへ広がりよく包囲配置
+                bed[:, 0] += 0.48 * left
+                bed[:, 1] += 0.48 * right
+                bed[:, 4] += 0.56 * _delay_samples(left, int(0.009 * sr))
+                bed[:, 5] += 0.56 * _delay_samples(right, int(0.011 * sr))
+                bed[:, 6] += 0.48 * _delay_samples(left, int(0.017 * sr))
+                bed[:, 7] += 0.48 * _delay_samples(right, int(0.021 * sr))
+                bed[:, 8] += 0.40 * _delay_samples(left, int(0.013 * sr))
+                bed[:, 9] += 0.40 * _delay_samples(right, int(0.016 * sr))
+                bed[:, 10] += 0.34 * _delay_samples(left, int(0.023 * sr))
+                bed[:, 11] += 0.34 * _delay_samples(right, int(0.027 * sr))
+                bed[:, 3] += 0.20 * _lfe_lowpass(mid, sample_rate=sr)
             else:
                 # BGM はフロントL/Rを芯に、サラウンド＆ハイトへ自然な広がり
                 bed[:, 0] += 0.78 * left
@@ -396,16 +436,31 @@ class AtmosRenderer:
                 bed[:, 9] += 0.18 * _delay_samples(right, int(0.018 * sr))
                 bed[:, 3] += 0.35 * _lfe_lowpass(mid, sample_rate=sr)
         else:
-            mono = audio_2d[:, 0] * gain_lin
-            bed[:, 0] += 0.52 * mono
-            bed[:, 1] += 0.52 * _delay_samples(mono, int(0.007 * sr))
-            bed[:, 4] += 0.38 * _delay_samples(mono, int(0.014 * sr))
-            bed[:, 5] += 0.38 * _delay_samples(mono, int(0.019 * sr))
-            bed[:, 6] += 0.28 * _delay_samples(mono, int(0.024 * sr))
-            bed[:, 7] += 0.28 * _delay_samples(mono, int(0.029 * sr))
-            bed[:, 8] += 0.22 * _delay_samples(mono, int(0.017 * sr))
-            bed[:, 9] += 0.22 * _delay_samples(mono, int(0.021 * sr))
-            bed[:, 3] += 0.28 * _lfe_lowpass(mono, sample_rate=sr)
+            mono = (arr[:, 0] * gain_lin).astype(np.float32)
+            if float(np.max(np.abs(mono))) < 1e-10:
+                return bed
+            if is_ambience:
+                bed[:, 0] += 0.42 * mono
+                bed[:, 1] += 0.42 * _delay_samples(mono, int(0.007 * sr))
+                bed[:, 4] += 0.50 * _delay_samples(mono, int(0.012 * sr))
+                bed[:, 5] += 0.50 * _delay_samples(mono, int(0.016 * sr))
+                bed[:, 6] += 0.44 * _delay_samples(mono, int(0.022 * sr))
+                bed[:, 7] += 0.44 * _delay_samples(mono, int(0.027 * sr))
+                bed[:, 8] += 0.36 * _delay_samples(mono, int(0.015 * sr))
+                bed[:, 9] += 0.36 * _delay_samples(mono, int(0.019 * sr))
+                bed[:, 10] += 0.30 * _delay_samples(mono, int(0.025 * sr))
+                bed[:, 11] += 0.30 * _delay_samples(mono, int(0.030 * sr))
+                bed[:, 3] += 0.18 * _lfe_lowpass(mono, sample_rate=sr)
+            else:
+                bed[:, 0] += 0.52 * mono
+                bed[:, 1] += 0.52 * _delay_samples(mono, int(0.007 * sr))
+                bed[:, 4] += 0.38 * _delay_samples(mono, int(0.014 * sr))
+                bed[:, 5] += 0.38 * _delay_samples(mono, int(0.019 * sr))
+                bed[:, 6] += 0.28 * _delay_samples(mono, int(0.024 * sr))
+                bed[:, 7] += 0.28 * _delay_samples(mono, int(0.029 * sr))
+                bed[:, 8] += 0.22 * _delay_samples(mono, int(0.017 * sr))
+                bed[:, 9] += 0.22 * _delay_samples(mono, int(0.021 * sr))
+                bed[:, 3] += 0.28 * _lfe_lowpass(mono, sample_rate=sr)
 
         return bed
 
@@ -442,8 +497,11 @@ class AtmosRenderer:
             g_ch = np.interp(sample_idx, ctrl_idx_f, gains_ctrl[:, ch])
             out[:, ch] = (x * g_ch).astype(np.float32)
 
-        # SFX / Foley のみ控えめに LFE 補助（セリフは LFE に送らない）
-        if str(role).lower() in ("sfx", "foley"):
+        # SFX / Foley のみ LFE 補助（sfx_impact は 0.28、セリフは LFE に送らない）
+        role_norm = str(role or "sfx").strip().lower()
+        if role_norm == "sfx_impact":
+            out[:, 3] = 0.28 * _lfe_lowpass(x, sample_rate=self.sample_rate)
+        elif role_norm in ("sfx", "foley"):
             out[:, 3] = 0.20 * _lfe_lowpass(x, sample_rate=self.sample_rate)
 
         return out
@@ -493,7 +551,7 @@ class AtmosRenderer:
         for idx, (obj, audio) in enumerate(loaded_tracks):
             audio_fit = fit_length(audio, n_samples)
             is_bed = bool(obj.get("is_bed", False))
-            gain_db = float(obj.get("gain_db", 0.0))
+            gain_db = resolve_object_gain_db(obj, n_samples, sample_rate=self.sample_rate)
             role = str(obj.get("role", "sfx"))
             spread = float(obj.get("spread", 0.1))
 

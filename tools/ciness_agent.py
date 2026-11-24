@@ -2,10 +2,13 @@
 """CineSS エージェント連携 CLI / 常駐ランナー。
 
 主な用途:
-  .venv/Scripts/python.exe -X utf8 tools/ciness_agent.py status
+  .venv/Scripts/python.exe -X utf8 tools/ciness_agent.py status          (Windows)
+  .venv/bin/python -X utf8 tools/ciness_agent.py status                  (macOS/Linux)
   .venv/Scripts/python.exe -X utf8 tools/ciness_agent.py start-server
   .venv/Scripts/python.exe -X utf8 tools/ciness_agent.py watch --server http://127.0.0.1:8780
   .venv/Scripts/python.exe -X utf8 tools/ciness_agent.py run-job --job-id <id>
+  .venv/Scripts/python.exe -X utf8 tools/ciness_agent.py director-context --job-id <id>
+  .venv/Scripts/python.exe -X utf8 tools/ciness_agent.py apply-director --job-id <id> --plan <json_or_path>
 
 設計方針:
 - リポジトリ位置はこのファイルから相対解決し、絶対パスを持たない。
@@ -42,6 +45,7 @@ from app.config import (  # noqa: E402
     OUTPUT_DIR,
     SHUTDOWN_FLAG_PATH,
     ensure_directories,
+    find_venv_python,
 )
 from app.hardware_advisor import check_system  # noqa: E402
 from app.model_manager import list_models  # noqa: E402
@@ -49,6 +53,31 @@ from app.model_manager import list_models  # noqa: E402
 
 class AgentError(Exception):
     """エージェントCLI実行時の明示的エラー。"""
+
+
+def _validate_job_id(job_id: str) -> str:
+    if (
+        not isinstance(job_id, str)
+        or not job_id
+        or len(job_id) > 80
+        or ".." in job_id
+        or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for c in job_id)
+    ):
+        raise AgentError("job_id の形式が正しくありません。")
+    return job_id
+
+
+def _extract_http_error_detail(exc: urllib.error.HTTPError) -> str:
+    try:
+        raw = exc.read().decode("utf-8", errors="replace").strip()
+        if raw:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict) and parsed.get("detail"):
+                return str(parsed["detail"])
+            return raw
+    except Exception:
+        pass
+    return str(exc)
 
 
 def _default_server_url(port: int | None = None) -> str:
@@ -174,8 +203,8 @@ def cmd_status(server_url: str | None = None) -> dict[str, Any]:
     return {
         "app_root": str(APP_ROOT),
         "python": sys.executable,
-        "venv_ready": (APP_ROOT / ".venv" / "Scripts" / "python.exe").is_file()
-        or (APP_ROOT / ".venv" / "bin" / "python").is_file(),
+        "venv_python": str(find_venv_python()),
+        "venv_ready": find_venv_python().is_file(),
         "server_url": url,
         "server_running": server_running,
         "agent": agent_info,
@@ -227,13 +256,14 @@ def cmd_start_server(
     ensure_directories()
     log_path = OUTPUT_DIR / "_server.log"
 
-    venv_py = APP_ROOT / ".venv" / "Scripts" / "python.exe"
+    venv_py = find_venv_python()
     python_exe = str(venv_py) if venv_py.is_file() else sys.executable
 
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     env["CINESS_PORT"] = str(target_port)
+    env.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
     command = [
         python_exe,
@@ -648,6 +678,125 @@ def cmd_watch(
     return last_result
 
 
+def _load_director_plan_arg(plan: str | dict[str, Any]) -> dict[str, Any]:
+    """CLI文字列（JSONまたはファイルパス）またはdictから監督プラン辞書を読み込む。"""
+    if isinstance(plan, dict):
+        obj: Any = dict(plan)
+    elif isinstance(plan, str):
+        raw = plan.strip()
+        if not raw:
+            raise AgentError("監督プランが空です。JSON 文字列または JSON ファイルパスを指定してください。")
+        file_candidate: Path | None = None
+        if len(raw) < 512 and not raw.startswith("{"):
+            try:
+                p = Path(raw).expanduser()
+                if p.is_file():
+                    file_candidate = p
+            except OSError:
+                file_candidate = None
+        if file_candidate is not None:
+            try:
+                obj = json.loads(file_candidate.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise AgentError(f"監督プランファイルの読み込みに失敗しました ({file_candidate}): {exc}") from exc
+        else:
+            try:
+                obj = json.loads(raw)
+            except ValueError as exc:
+                raise AgentError(f"監督プランの JSON 解析に失敗しました: {exc}") from exc
+    else:
+        raise AgentError("監督プランは JSON オブジェクトまたはファイルパスで指定してください。")
+
+    if not isinstance(obj, dict):
+        raise AgentError("監督プランは JSON オブジェクト（辞書）である必要があります。")
+    if isinstance(obj.get("director_plan"), dict) and len(obj) == 1:
+        return dict(obj["director_plan"])
+    return obj
+
+
+def cmd_director_context(
+    job_id: str,
+    *,
+    server_url: str | None = None,
+) -> dict[str, Any]:
+    """指定ジョブの映像シーン温度・SFX層分解・AI監督コンテキストを取得する。"""
+    safe_id = _validate_job_id(job_id)
+    url = (server_url or _default_server_url()).rstrip("/")
+    data: dict[str, Any] | None = None
+
+    try:
+        data = _http_json("GET", f"{url}/api/jobs/{safe_id}/director-context", timeout=10.0)
+    except urllib.error.HTTPError as exc:
+        detail = _extract_http_error_detail(exc)
+        raise AgentError(f"監督コンテキストの取得に失敗しました (HTTP {exc.code}): {detail}") from exc
+    except (urllib.error.URLError, OSError) as exc:
+        ctx_path = JOBS_DIR / safe_id / "work" / "director_context.json"
+        if ctx_path.is_file():
+            try:
+                data = json.loads(ctx_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as read_exc:
+                raise AgentError(f"ローカル監督コンテキストの読み込みに失敗しました: {read_exc}") from read_exc
+        else:
+            raise AgentError(
+                f"サーバー {url} に接続できず、ローカル監督コンテキストも見つかりません ({ctx_path}): {exc}"
+            ) from exc
+
+    if not isinstance(data, dict):
+        raise AgentError(f"ジョブ {safe_id} の監督コンテキスト形式が不正です。")
+
+    out = dict(data)
+    out.setdefault("job_id", safe_id)
+    out.setdefault("director_sheet_url", f"/api/jobs/{safe_id}/media/director_sheet")
+    sheet_path = JOBS_DIR / safe_id / "work" / "director_sheet.jpg"
+    if sheet_path.is_file():
+        out.setdefault("director_sheet_local_path", str(sheet_path.resolve()))
+    return out
+
+
+def cmd_apply_director(
+    job_id: str,
+    plan: str | dict[str, Any],
+    *,
+    server_url: str | None = None,
+) -> dict[str, Any]:
+    """AIダビング監督プランをジョブへ適用し、空間リミックス後の状態と結果を返す。"""
+    safe_id = _validate_job_id(job_id)
+    director_plan = _load_director_plan_arg(plan)
+    url = (server_url or _default_server_url()).rstrip("/")
+    payload = {"director_plan": director_plan}
+
+    try:
+        return _http_json(
+            "POST",
+            f"{url}/api/jobs/{safe_id}/director-plan",
+            payload,
+            timeout=180.0,
+        )
+    except urllib.error.HTTPError as exc:
+        detail = _extract_http_error_detail(exc)
+        raise AgentError(f"監督プランの適用に失敗しました (HTTP {exc.code}): {detail}") from exc
+    except (urllib.error.URLError, OSError) as exc:
+        job_dir = JOBS_DIR / safe_id
+        if not job_dir.is_dir():
+            raise AgentError(f"サーバー {url} に接続できず、ジョブディレクトリも見つかりません ({job_dir}): {exc}") from exc
+        try:
+            from app import pipeline  # noqa: PLC0415
+
+            remix_fn = getattr(pipeline, "apply_director_plan_and_remix", None)
+        except Exception as imp_exc:
+            raise AgentError(f"サーバー未接続かつローカルリミックス機能の読み込みに失敗しました: {imp_exc}") from imp_exc
+        if not callable(remix_fn):
+            raise AgentError(f"サーバー {url} に接続できず、ローカル apply_director_plan_and_remix も利用できません: {exc}") from exc
+        result = remix_fn(job_dir, director_plan)
+        return {
+            "job_id": safe_id,
+            "status": "done",
+            "director_plan": director_plan,
+            "result": result,
+            "offline_local": True,
+        }
+
+
 # ---------------------------------------------------------------------------
 # エントリポイント
 # ---------------------------------------------------------------------------
@@ -655,7 +804,7 @@ def cmd_watch(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="CineSS エージェント連携 CLI（環境診断・サーバー起動・ジョブ待機/実行）"
+        description="CineSS エージェント連携 CLI（環境診断・サーバー起動・ジョブ待機/実行・監督連携）"
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -679,6 +828,15 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--server", default=_default_server_url(), help="CineSS サーバーURL")
     p_run.add_argument("--agent-name", default="ciness-agent", help="進捗ログに記録するエージェント名")
     p_run.add_argument("--no-server-sync", action="store_true", help="サーバーAPIへの進捗送信を行わない")
+
+    p_dctx = sub.add_parser("director-context", help="ジョブの映像シーン温度・SFX層・AI監督コンテキストを取得")
+    p_dctx.add_argument("--job-id", required=True, help="対象の job_id")
+    p_dctx.add_argument("--server", default=_default_server_url(), help="CineSS サーバーURL")
+
+    p_dapply = sub.add_parser("apply-director", help="AIダビング監督プランを適用して空間リミックスを再実行")
+    p_dapply.add_argument("--job-id", required=True, help="対象の job_id")
+    p_dapply.add_argument("--plan", required=True, help="監督プラン JSON 文字列または JSON ファイルパス")
+    p_dapply.add_argument("--server", default=_default_server_url(), help="CineSS サーバーURL")
 
     args = parser.parse_args(argv)
     if hasattr(sys.stdout, "reconfigure"):
@@ -707,13 +865,19 @@ def main(argv: list[str] | None = None) -> int:
                 poll_interval=args.poll_interval,
                 once=args.once,
             )
-        else:
+        elif args.command == "director-context":
+            result = cmd_director_context(args.job_id, server_url=args.server)
+        elif args.command == "apply-director":
+            result = cmd_apply_director(args.job_id, args.plan, server_url=args.server)
+        elif args.command == "run-job":
             result = cmd_run_job(
                 args.job_id,
                 server_url=args.server,
                 agent_name=args.agent_name,
                 sync_server=not args.no_server_sync,
             )
+        else:
+            raise AgentError(f"未対応のサブコマンドです: {args.command}")
     except AgentError as exc:
         print(f"エラー: {exc}", file=sys.stderr)
         print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=real_stdout)

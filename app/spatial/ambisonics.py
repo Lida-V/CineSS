@@ -34,6 +34,8 @@ from .hrtf import (
     fit_length,
     interpolate_keyframes,
     load_audio_48k,
+    resolve_gain_linear_for_render,
+    resolve_object_gain_db,
 )
 
 MIN_AMBISONICS_ORDER: int = 1
@@ -267,22 +269,28 @@ def build_max_re_decoder_matrix(order: int) -> tuple[np.ndarray, np.ndarray, np.
 def _apply_dynamic_distance_mono(
     mono_audio: np.ndarray,
     keyframes: list[dict[str, Any]] | None,
-    gain_db: float,
+    gain_db: float | np.ndarray,
     rt60_sec: float,
     sample_rate: int = SAMPLE_RATE,
     block_size: int = 2048,
     role: str = "sfx",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """距離減衰＋距離依存空気吸収 LPF を Hann 窓 50% オーバーラップでモノラル信号へ滑らかに適用する。"""
+    """時間変化ゲイン＋距離減衰＋距離依存空気吸収 LPF を Hann 窓 50% オーバーラップでモノラル信号へ滑らかに適用する。"""
     x = np.asarray(mono_audio, dtype=np.float32).reshape(-1)
     n_samples = x.shape[0]
-    gain_lin = float(10.0 ** (float(gain_db) / 20.0))
-    if n_samples == 0 or gain_lin == 0.0 or float(np.max(np.abs(x))) < 1e-9:
+    if n_samples == 0:
+        return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+
+    gain_lin = resolve_gain_linear_for_render(
+        n_samples, gain_db=gain_db, keyframes=keyframes, sample_rate=sample_rate
+    )
+    x_scaled = x.astype(np.float64) * gain_lin
+    if float(np.max(np.abs(x_scaled))) < 1e-9:
         return np.zeros((n_samples,), dtype=np.float32), np.zeros((n_samples,), dtype=np.float32)
 
     hop = block_size // 2
     window = np.hanning(block_size).astype(np.float64)
-    x_pad = np.pad(x.astype(np.float64) * gain_lin, (hop, hop + block_size), mode="constant")
+    x_pad = np.pad(x_scaled, (hop, hop + block_size), mode="constant")
 
     n_fft = block_size * 2
     freqs = np.fft.rfftfreq(n_fft, d=1.0 / sample_rate)
@@ -376,36 +384,74 @@ class AmbisonicsRenderer:
     def encode_bed_source(
         self,
         audio_2d: np.ndarray,
-        gain_db: float = 0.0,
+        gain_db: float | np.ndarray = 0.0,
+        role: str = "music",
+        keyframes: list[dict[str, Any]] | None = None,
     ) -> np.ndarray:
-        """BGM・環境音などのベッド音源を自然な空間幅（±45°〜±110°仮想音源展開）で AmbiX エンコードする。"""
+        """BGM・環境音・重低音ベッド音源を役割に応じた空間展開で AmbiX エンコードする。"""
         arr = np.asarray(audio_2d, dtype=np.float32)
         if arr.ndim == 1:
             arr = arr[:, np.newaxis]
         n = arr.shape[0]
-        gain_lin = float(10.0 ** (float(gain_db) / 20.0))
-        if n == 0 or gain_lin == 0.0 or float(np.max(np.abs(arr))) < 1e-10:
+        if n == 0 or float(np.max(np.abs(arr))) < 1e-10:
             return np.zeros((n, self.num_channels), dtype=np.float32)
 
+        gain_lin = resolve_gain_linear_for_render(
+            n, gain_db=gain_db, keyframes=keyframes, sample_rate=self.sample_rate
+        )
+        role_norm = str(role or "music").strip().lower()
         b_field = np.zeros((n, self.num_channels), dtype=np.float32)
 
+        if role_norm == "sfx_sub":
+            # 重低音ベッドは ACN 0 (W: 無指向圧力成分) 主体で位相干渉なく安定配置
+            if arr.shape[1] >= 2:
+                mono_sub = (0.5 * (arr[:, 0] + arr[:, 1]) * gain_lin).astype(np.float32)
+            else:
+                mono_sub = (arr[:, 0] * gain_lin).astype(np.float32)
+            b_field[:, 0] = mono_sub
+            return b_field
+
         if arr.shape[1] >= 2:
-            left = arr[:, 0] * gain_lin
-            right = arr[:, 1] * gain_lin
-            virtual_feeds = [
-                (left * 0.72, -45.0, 0.0),
-                (right * 0.72, 45.0, 0.0),
-                (_decorrelate_delay(left, int(0.011 * self.sample_rate)) * 0.42, -110.0, 15.0),
-                (_decorrelate_delay(right, int(0.014 * self.sample_rate)) * 0.42, 110.0, 15.0),
-            ]
+            left = (arr[:, 0] * gain_lin).astype(np.float32)
+            right = (arr[:, 1] * gain_lin).astype(np.float32)
+            if float(np.max(np.abs(left))) < 1e-10 and float(np.max(np.abs(right))) < 1e-10:
+                return b_field
+            if role_norm == "ambience":
+                virtual_feeds = [
+                    (left * 0.50, -55.0, 0.0),
+                    (right * 0.50, 55.0, 0.0),
+                    (_decorrelate_delay(left, int(0.011 * self.sample_rate)) * 0.55, -115.0, 20.0),
+                    (_decorrelate_delay(right, int(0.015 * self.sample_rate)) * 0.55, 115.0, 20.0),
+                    (_decorrelate_delay(left, int(0.021 * self.sample_rate)) * 0.34, -145.0, -10.0),
+                    (_decorrelate_delay(right, int(0.025 * self.sample_rate)) * 0.34, 145.0, -10.0),
+                ]
+            else:
+                virtual_feeds = [
+                    (left * 0.72, -45.0, 0.0),
+                    (right * 0.72, 45.0, 0.0),
+                    (_decorrelate_delay(left, int(0.011 * self.sample_rate)) * 0.42, -110.0, 15.0),
+                    (_decorrelate_delay(right, int(0.014 * self.sample_rate)) * 0.42, 110.0, 15.0),
+                ]
         else:
-            mono = arr[:, 0] * gain_lin
-            virtual_feeds = [
-                (mono * 0.45, -45.0, 0.0),
-                (_decorrelate_delay(mono, int(0.008 * self.sample_rate)) * 0.45, 45.0, 0.0),
-                (_decorrelate_delay(mono, int(0.016 * self.sample_rate)) * 0.32, -110.0, 15.0),
-                (_decorrelate_delay(mono, int(0.023 * self.sample_rate)) * 0.32, 110.0, 15.0),
-            ]
+            mono = (arr[:, 0] * gain_lin).astype(np.float32)
+            if float(np.max(np.abs(mono))) < 1e-10:
+                return b_field
+            if role_norm == "ambience":
+                virtual_feeds = [
+                    (mono * 0.38, -55.0, 0.0),
+                    (_decorrelate_delay(mono, int(0.008 * self.sample_rate)) * 0.38, 55.0, 0.0),
+                    (_decorrelate_delay(mono, int(0.015 * self.sample_rate)) * 0.42, -115.0, 20.0),
+                    (_decorrelate_delay(mono, int(0.022 * self.sample_rate)) * 0.42, 115.0, 20.0),
+                    (_decorrelate_delay(mono, int(0.029 * self.sample_rate)) * 0.28, -145.0, -10.0),
+                    (_decorrelate_delay(mono, int(0.035 * self.sample_rate)) * 0.28, 145.0, -10.0),
+                ]
+            else:
+                virtual_feeds = [
+                    (mono * 0.45, -45.0, 0.0),
+                    (_decorrelate_delay(mono, int(0.008 * self.sample_rate)) * 0.45, 45.0, 0.0),
+                    (_decorrelate_delay(mono, int(0.016 * self.sample_rate)) * 0.32, -110.0, 15.0),
+                    (_decorrelate_delay(mono, int(0.023 * self.sample_rate)) * 0.32, 110.0, 15.0),
+                ]
 
         # 高次 (4〜7次) のベッド音源が点状に尖りすぎないよう緩やかに高次テーパーを掛ける
         order_taper = np.ones(self.num_channels, dtype=np.float32)
@@ -520,10 +566,11 @@ class AmbisonicsRenderer:
         for obj, audio in loaded_tracks:
             audio_fit = fit_length(audio, n_samples)
             is_bed = bool(obj.get("is_bed", False))
-            gain_db = float(obj.get("gain_db", 0.0))
+            gain_db = resolve_object_gain_db(obj, n_samples, sample_rate=self.sample_rate)
+            role = str(obj.get("role", "sfx"))
 
             if is_bed:
-                ambix_mix += self.encode_bed_source(audio_fit, gain_db=gain_db)
+                ambix_mix += self.encode_bed_source(audio_fit, gain_db=gain_db, role=role)
             else:
                 mono = (
                     audio_fit[:, 0]
@@ -531,7 +578,6 @@ class AmbisonicsRenderer:
                     else np.mean(audio_fit, axis=1, dtype=np.float64).astype(np.float32)
                 )
                 keyframes = obj.get("keyframes")
-                role = str(obj.get("role", "sfx"))
                 direct_mono, rev_send = _apply_dynamic_distance_mono(
                     mono,
                     keyframes=keyframes,
