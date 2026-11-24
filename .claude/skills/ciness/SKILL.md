@@ -45,15 +45,17 @@ CineSS は映像を解析し、有音動画の「3分離＋映画方式 SFX 4層
      ```
    - ユーザーへ **`http://127.0.0.1:8780`** とPC環境診断サマリー（CPU / CUDA GPU / Apple Silicon MPS ユニファイドメモリ / 非NVIDIA GPU 判定と推奨動画長）を案内し、「Web画面で動画をアップロードして **▶ 処理開始** ボタンを押せば処理を開始します」と伝える。
 
-3. **AIダビング監督連携（完了ジョブの演出調整）**:
+3. **AIダビング監督・360°ワールド連携（事前解析 ＆ 完了後演出調整）**:
+   - 処理前に `inspect-world`（CLI）または `ciness_inspect_video_world`（MCP）でコンタクトシート（`director_sheet.jpg`）と 360° 環境（`world_profile` / `flyby_events`）を確認でき、必要に応じて物体ヒント（`scene_objects_hint`）を Foley へ活用できる。
    - ジョブ完了後、`director-context`（CLI）または `ciness_get_director_context`（MCP）で以下を確認できる：
      - `intensity_track` / `scene_segments`（シーン温度カーブ：`静寂`/`通常`/`高揚`/`クライマックス`）
+     - `world_profile` / `flyby_events` / `world_360`（360°環境・後方包囲・頭上ハイト・画面外通過）
      - `sfx_layers` / `sfx_events`（`sfx_sub`, `sfx_impact` L/C/R, `ambience` の状態と衝撃時刻）
      - `director_sheet_url` / `director_sheet_local_path`（最大8コマのコンタクトシート JPEG）
      - `director_plan`（現在適用されている時間変化キーフレームと演出メモ）
-   - コンタクトシート画像とシーン温度を踏まえて演出を微調整したい場合は、`apply-director`（CLI）または `ciness_apply_director_plan`（MCP）でカスタム `director_plan` を送信する。再分離・再映像解析なしで空間レンダリング＋マスタリングのみ数秒で再実行される（何度適用しても冪等）。
+   - コンタクトシート画像と 360° 空間文脈を踏まえて演出を微調整したい場合は、`apply-director`（CLI）または `ciness_apply_director_plan`（MCP）でカスタム `director_plan`（`azimuth_deg` `±180°`・`elevation_deg` `±90°`・`world_360` 含む）を送信する。再分離・再映像解析なしで空間レンダリング＋マスタリングのみ数秒で再実行される（何度適用しても冪等）。
 
-4. **MCP サーバー (`ciness`) が使える場合（計8ツール）**:
+4. **MCP サーバー (`ciness`) が使える場合（計9ツール）**:
    - **注意（macOS / Linux）**: 同梱 `.mcp.json` は既定で Windows 用 `".venv/Scripts/python.exe"` になっているため、macOS / Linux で MCP クライアントを使う場合は `".venv/bin/python"` に読み替えて設定する。
    - 利用可能なツール一覧:
      1. `ciness_status` — PC診断（CUDA / MPS / 非NVIDIA含む）・サーバー稼働・モデル確認
@@ -62,8 +64,9 @@ CineSS は映像を解析し、有音動画の「3分離＋映画方式 SFX 4層
      4. `ciness_claim_and_run_job` — ジョブを受注してバックグラウンド実行
      5. `ciness_job_status` — 完了まで進捗・ログを確認し、成果物とメトリクスをユーザーに報告
      6. `ciness_cancel_job` — 中断依頼時に安全キャンセル
-     7. `ciness_get_director_context` — シーン温度・SFX 4層・コンタクトシート情報を取得
-     8. `ciness_apply_director_plan` — AIダビング監督プランを適用し高速空間リミックスを実行
+     7. `ciness_get_director_context` — シーン温度・360°世界環境・SFX 4層・コンタクトシート情報を取得
+     8. `ciness_apply_director_plan` — AIダビング監督プラン（`±180°/±90°`・`world_360`）を適用し高速空間リミックスを実行
+     9. `ciness_inspect_video_world` — 処理前に動画の 360° 世界環境・通過候補・コンタクトシート・Foley推奨プロンプトを事前解析
 
 ## CLI コマンド一覧
 
@@ -81,6 +84,9 @@ Windows では `.venv\Scripts\python.exe`、macOS / Linux では `.venv/bin/pyth
 
 # 特定のジョブIDを1本だけ実行
 .venv\Scripts\python.exe -X utf8 tools/ciness_agent.py run-job --job-id <JOB_ID> --server http://127.0.0.1:8780
+
+# 処理前の動画 360° ワールド環境・通過イベント・コンタクトシート解析
+.venv\Scripts\python.exe -X utf8 tools/ciness_agent.py inspect-world --video <VIDEO_PATH>
 
 # 映像シーン温度・SFX 4層・監督プラン・コンタクトシート情報を取得
 .venv\Scripts\python.exe -X utf8 tools/ciness_agent.py director-context --job-id <JOB_ID> --server http://127.0.0.1:8780

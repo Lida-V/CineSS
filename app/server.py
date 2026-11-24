@@ -106,8 +106,17 @@ class CreateJobRequest(BaseModel):
     enable_dereverb: bool = True
     enable_sfx_multilayer: bool = True
     enable_director: bool = True
+    enable_world_360: bool = True
+    scene_objects_hint: str = ""
     director_plan: Optional[dict[str, Any]] = None
     execution_mode: str = "auto"  # "auto" | "agent" | "local"
+
+
+class InspectWorldRequest(BaseModel):
+    upload_id: Optional[str] = None
+    video_path: Optional[str] = None
+    sample_fps: float = Field(default=4.0, ge=1.0, le=12.0)
+    max_frames: int = Field(default=8, ge=1, le=8)
 
 
 class RemixRequest(BaseModel):
@@ -1225,6 +1234,34 @@ def api_video_preview(upload_id: str) -> FileResponse:
     )
 
 
+@app.post("/api/videos/inspect-world")
+def api_inspect_video_world(req: InspectWorldRequest) -> dict[str, Any]:
+    """処理前に動画の 360° ワールド環境・画面外通過候補・コンタクトシート・Foley推奨プロンプトを解析する。"""
+    src_video, filename = _resolve_upload_video(req.upload_id, req.video_path)
+    if req.upload_id:
+        safe_uid = _validate_id(req.upload_id, "アップロードID")
+        out_dir = UPLOADS_DIR / safe_uid
+    else:
+        out_dir = OUTPUT_DIR / "_world_previews" / f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+
+    try:
+        from app.pipeline import inspect_video_world
+
+        info = inspect_video_world(
+            src_video,
+            out_dir=out_dir,
+            sample_fps=float(req.sample_fps),
+            max_frames=int(req.max_frames),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"360°ワールド事前解析に失敗しました: {exc}") from exc
+
+    info["filename"] = filename
+    if req.upload_id:
+        info["upload_id"] = req.upload_id
+    return info
+
+
 # ---------------------------------------------------------------------------
 # 3. ジョブ管理＆エージェント連携ブリッジ
 # ---------------------------------------------------------------------------
@@ -1302,6 +1339,8 @@ def api_create_job(req: CreateJobRequest) -> dict[str, Any]:
         "enable_dereverb": bool(req.enable_dereverb),
         "enable_sfx_multilayer": bool(req.enable_sfx_multilayer),
         "enable_director": bool(req.enable_director),
+        "enable_world_360": bool(req.enable_world_360),
+        "scene_objects_hint": (req.scene_objects_hint or "").strip(),
         "execution_mode": exec_mode,
     }
     if req.director_plan is not None:

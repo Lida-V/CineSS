@@ -29,11 +29,14 @@ from .hrtf import (
     RoomReverbEngine,
     SAMPLE_RATE,
     air_absorption_response,
+    decorrelate_allpass,
     distance_direct_gain,
     distance_reverb_send,
     fit_length,
+    highpass_air,
     interpolate_keyframes,
     load_audio_48k,
+    lowpass_rear_air,
     resolve_gain_linear_for_render,
     resolve_object_gain_db,
 )
@@ -387,8 +390,9 @@ class AmbisonicsRenderer:
         gain_db: float | np.ndarray = 0.0,
         role: str = "music",
         keyframes: list[dict[str, Any]] | None = None,
+        world_360: dict[str, Any] | None = None,
     ) -> np.ndarray:
-        """BGM・環境音・重低音ベッド音源を役割に応じた空間展開で AmbiX エンコードする。"""
+        """BGM・環境音・重低音ベッド音源を役割に応じた 360° 無相関空間展開で AmbiX エンコードする。"""
         arr = np.asarray(audio_2d, dtype=np.float32)
         if arr.ndim == 1:
             arr = arr[:, np.newaxis]
@@ -411,46 +415,75 @@ class AmbisonicsRenderer:
             b_field[:, 0] = mono_sub
             return b_field
 
+        w360 = world_360 if isinstance(world_360, dict) else {}
+        w360_enabled = w360.get("enabled", True) is not False
+        if w360_enabled:
+            rear_scale = max(0.4, min(1.6, float(w360.get("rear_level", 1.0))))
+            height_scale = max(0.3, min(1.6, float(w360.get("height_level", 1.0))))
+        else:
+            rear_scale = 0.65
+            height_scale = 0.55
+
+        sr = self.sample_rate
         if arr.shape[1] >= 2:
             left = (arr[:, 0] * gain_lin).astype(np.float32)
             right = (arr[:, 1] * gain_lin).astype(np.float32)
             if float(np.max(np.abs(left))) < 1e-10 and float(np.max(np.abs(right))) < 1e-10:
                 return b_field
+            rear_l = lowpass_rear_air(left, sample_rate=sr, cutoff_hz=7500.0)
+            rear_r = lowpass_rear_air(right, sample_rate=sr, cutoff_hz=7500.0)
+            hi_l = highpass_air(left, sample_rate=sr, cutoff_hz=320.0)
+            hi_r = highpass_air(right, sample_rate=sr, cutoff_hz=320.0)
             if role_norm == "ambience":
+                # 10方向球面 360° 2段オールパス無相関フィード（前方・側面・後方・頭上前・頭上後）
                 virtual_feeds = [
-                    (left * 0.50, -55.0, 0.0),
-                    (right * 0.50, 55.0, 0.0),
-                    (_decorrelate_delay(left, int(0.011 * self.sample_rate)) * 0.55, -115.0, 20.0),
-                    (_decorrelate_delay(right, int(0.015 * self.sample_rate)) * 0.55, 115.0, 20.0),
-                    (_decorrelate_delay(left, int(0.021 * self.sample_rate)) * 0.34, -145.0, -10.0),
-                    (_decorrelate_delay(right, int(0.025 * self.sample_rate)) * 0.34, 145.0, -10.0),
+                    (left * 0.42, -50.0, 0.0),
+                    (right * 0.42, 50.0, 0.0),
+                    (decorrelate_allpass(decorrelate_allpass(left, 211, coeff=0.50), 313, coeff=0.48) * 0.48, -95.0, 5.0),
+                    (decorrelate_allpass(decorrelate_allpass(right, 223, coeff=0.50), 331, coeff=-0.48) * 0.48, 95.0, 5.0),
+                    (decorrelate_allpass(decorrelate_allpass(rear_l, 389, coeff=0.52), 503, coeff=-0.50) * (0.46 * rear_scale), -140.0, -5.0),
+                    (decorrelate_allpass(decorrelate_allpass(rear_r, 401, coeff=0.52), 521, coeff=0.50) * (0.46 * rear_scale), 140.0, -5.0),
+                    (decorrelate_allpass(decorrelate_allpass(hi_l, 293, coeff=0.48), 431, coeff=0.48) * (0.36 * height_scale), -45.0, 45.0),
+                    (decorrelate_allpass(decorrelate_allpass(hi_r, 307, coeff=0.48), 443, coeff=-0.48) * (0.36 * height_scale), 45.0, 45.0),
+                    (decorrelate_allpass(decorrelate_allpass(hi_l, 467, coeff=0.50), 601, coeff=-0.50) * (0.32 * height_scale * rear_scale), -135.0, 45.0),
+                    (decorrelate_allpass(decorrelate_allpass(hi_r, 479, coeff=0.50), 613, coeff=0.50) * (0.32 * height_scale * rear_scale), 135.0, 45.0),
                 ]
             else:
                 virtual_feeds = [
-                    (left * 0.72, -45.0, 0.0),
-                    (right * 0.72, 45.0, 0.0),
-                    (_decorrelate_delay(left, int(0.011 * self.sample_rate)) * 0.42, -110.0, 15.0),
-                    (_decorrelate_delay(right, int(0.014 * self.sample_rate)) * 0.42, 110.0, 15.0),
+                    (left * 0.70, -45.0, 0.0),
+                    (right * 0.70, 45.0, 0.0),
+                    (decorrelate_allpass(rear_l, 241, coeff=0.45) * (0.40 * rear_scale), -115.0, 15.0),
+                    (decorrelate_allpass(rear_r, 251, coeff=0.45) * (0.40 * rear_scale), 115.0, 15.0),
+                    (decorrelate_allpass(hi_l, 311, coeff=0.45) * (0.20 * height_scale), -55.0, 40.0),
+                    (decorrelate_allpass(hi_r, 317, coeff=0.45) * (0.20 * height_scale), 55.0, 40.0),
                 ]
         else:
             mono = (arr[:, 0] * gain_lin).astype(np.float32)
             if float(np.max(np.abs(mono))) < 1e-10:
                 return b_field
+            rear_m = lowpass_rear_air(mono, sample_rate=sr, cutoff_hz=7500.0)
+            hi_m = highpass_air(mono, sample_rate=sr, cutoff_hz=320.0)
             if role_norm == "ambience":
                 virtual_feeds = [
-                    (mono * 0.38, -55.0, 0.0),
-                    (_decorrelate_delay(mono, int(0.008 * self.sample_rate)) * 0.38, 55.0, 0.0),
-                    (_decorrelate_delay(mono, int(0.015 * self.sample_rate)) * 0.42, -115.0, 20.0),
-                    (_decorrelate_delay(mono, int(0.022 * self.sample_rate)) * 0.42, 115.0, 20.0),
-                    (_decorrelate_delay(mono, int(0.029 * self.sample_rate)) * 0.28, -145.0, -10.0),
-                    (_decorrelate_delay(mono, int(0.035 * self.sample_rate)) * 0.28, 145.0, -10.0),
+                    (mono * 0.36, -50.0, 0.0),
+                    (mono * 0.36, 50.0, 0.0),
+                    (decorrelate_allpass(decorrelate_allpass(mono, 211, coeff=0.50), 313, coeff=0.48) * 0.42, -95.0, 5.0),
+                    (decorrelate_allpass(decorrelate_allpass(mono, 223, coeff=0.50), 331, coeff=-0.48) * 0.42, 95.0, 5.0),
+                    (decorrelate_allpass(decorrelate_allpass(rear_m, 389, coeff=0.52), 503, coeff=-0.50) * (0.40 * rear_scale), -140.0, -5.0),
+                    (decorrelate_allpass(decorrelate_allpass(rear_m, 401, coeff=0.52), 521, coeff=0.50) * (0.40 * rear_scale), 140.0, -5.0),
+                    (decorrelate_allpass(decorrelate_allpass(hi_m, 293, coeff=0.48), 431, coeff=0.48) * (0.32 * height_scale), -45.0, 45.0),
+                    (decorrelate_allpass(decorrelate_allpass(hi_m, 307, coeff=0.48), 443, coeff=-0.48) * (0.32 * height_scale), 45.0, 45.0),
+                    (decorrelate_allpass(decorrelate_allpass(hi_m, 467, coeff=0.50), 601, coeff=-0.50) * (0.28 * height_scale * rear_scale), -135.0, 45.0),
+                    (decorrelate_allpass(decorrelate_allpass(hi_m, 479, coeff=0.50), 613, coeff=0.50) * (0.28 * height_scale * rear_scale), 135.0, 45.0),
                 ]
             else:
                 virtual_feeds = [
                     (mono * 0.45, -45.0, 0.0),
-                    (_decorrelate_delay(mono, int(0.008 * self.sample_rate)) * 0.45, 45.0, 0.0),
-                    (_decorrelate_delay(mono, int(0.016 * self.sample_rate)) * 0.32, -110.0, 15.0),
-                    (_decorrelate_delay(mono, int(0.023 * self.sample_rate)) * 0.32, 110.0, 15.0),
+                    (mono * 0.45, 45.0, 0.0),
+                    (decorrelate_allpass(rear_m, 241, coeff=0.45) * (0.34 * rear_scale), -115.0, 15.0),
+                    (decorrelate_allpass(rear_m, 251, coeff=0.45) * (0.34 * rear_scale), 115.0, 15.0),
+                    (decorrelate_allpass(hi_m, 311, coeff=0.45) * (0.18 * height_scale), -55.0, 40.0),
+                    (decorrelate_allpass(hi_m, 317, coeff=0.45) * (0.18 * height_scale), 55.0, 40.0),
                 ]
 
         # 高次 (4〜7次) のベッド音源が点状に尖りすぎないよう緩やかに高次テーパーを掛ける
@@ -562,6 +595,7 @@ class AmbisonicsRenderer:
 
         ambix_mix = np.zeros((n_samples, self.num_channels), dtype=np.float32)
         reverb_bus_mono = np.zeros((n_samples,), dtype=np.float32)
+        world_360 = scene_dict.get("world_360") or {}
 
         for obj, audio in loaded_tracks:
             audio_fit = fit_length(audio, n_samples)
@@ -570,7 +604,13 @@ class AmbisonicsRenderer:
             role = str(obj.get("role", "sfx"))
 
             if is_bed:
-                ambix_mix += self.encode_bed_source(audio_fit, gain_db=gain_db, role=role)
+                ambix_mix += self.encode_bed_source(
+                    audio_fit,
+                    gain_db=gain_db,
+                    role=role,
+                    keyframes=obj.get("keyframes"),
+                    world_360=world_360,
+                )
             else:
                 mono = (
                     audio_fit[:, 0]

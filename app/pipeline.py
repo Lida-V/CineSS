@@ -19,6 +19,7 @@ import math
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 import uuid
 import zipfile
@@ -28,7 +29,7 @@ from typing import Any, Callable
 import numpy as np
 import soundfile as sf
 
-from app.audio.foley_engine import generate_foley
+from app.audio.foley_engine import build_foley_prompt, generate_foley
 from app.audio.separator_bridge import extract_audio_from_video, separate_dme
 from app.audio.sfx_splitter import split_sfx_layers
 from app.audio.speaker_splitter import (
@@ -464,7 +465,14 @@ def _motion_track_to_keyframes(
     return kfs
 
 
-def _estimate_room_params(scene_summary: dict[str, Any] | None) -> dict[str, Any]:
+def _estimate_room_params(
+    scene_summary: dict[str, Any] | None,
+    world_profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if isinstance(world_profile, dict) and world_profile.get("recommended_rt60_sec"):
+        rt60 = max(0.20, min(1.2, float(world_profile["recommended_rt60_sec"])))
+        size = str(world_profile.get("recommended_room_size") or "medium")
+        return {"rt60_sec": round(rt60, 2), "size": size}
     summary = scene_summary or {}
     bright = summary.get("brightness_label", "medium")
     persons = int(summary.get("person_count", 0))
@@ -473,6 +481,37 @@ def _estimate_room_params(scene_summary: dict[str, Any] | None) -> dict[str, Any
     if bright == "bright" and persons == 0:
         return {"rt60_sec": 0.55, "size": "large"}
     return {"rt60_sec": 0.45, "size": "medium"}
+
+
+def _build_initial_world_360(
+    vision_result: dict[str, Any] | None,
+    enable_world_360: bool = True,
+) -> dict[str, Any]:
+    wp = (vision_result or {}).get("world_profile") or {}
+    env_type = str(wp.get("environment_type") or "indoor_intimate")
+    env_ja = str(wp.get("environment_label_ja") or "室内・標準空間")
+    rear_s = max(0.50, min(1.0, float(wp.get("rear_immersion_strength", 0.65))))
+    sky_p = max(0.25, min(1.0, float(wp.get("sky_overhead_presence", 0.40))))
+    rt60 = wp.get("recommended_rt60_sec")
+    if enable_world_360:
+        return {
+            "enabled": True,
+            "environment_type": env_type,
+            "environment_label_ja": env_ja,
+            "rear_level": round(0.85 + 0.55 * rear_s, 2),
+            "height_level": round(0.75 + 0.60 * sky_p, 2),
+            "surround_wrap": round(0.45 + 0.45 * rear_s, 2),
+            "rt60_sec": round(float(rt60), 2) if rt60 is not None else None,
+        }
+    return {
+        "enabled": False,
+        "environment_type": env_type,
+        "environment_label_ja": env_ja,
+        "rear_level": 0.65,
+        "height_level": 0.55,
+        "surround_wrap": 0.0,
+        "rt60_sec": None,
+    }
 
 
 def _mono_pan_compensation_db(wav_path: str | Path) -> float:
@@ -735,7 +774,7 @@ def _build_voiced_scene(
         "mode": "voiced",
         "duration_sec": round(float(duration_sec), 3),
         "sample_rate": SAMPLE_RATE,
-        "room": _estimate_room_params(vision_result.get("scene_summary")),
+        "room": _estimate_room_params(vision_result.get("scene_summary"), vision_result.get("world_profile")),
         "objects": objects,
     }
     return scene, sfx_info
@@ -824,7 +863,7 @@ def _build_silent_foley_scene(
         "mode": "silent_foley",
         "duration_sec": round(float(duration_sec), 3),
         "sample_rate": SAMPLE_RATE,
-        "room": _estimate_room_params(vision_result.get("scene_summary")),
+        "room": _estimate_room_params(vision_result.get("scene_summary"), vision_result.get("world_profile")),
         "objects": objects,
     }
     return scene, sfx_info
@@ -869,11 +908,14 @@ def _write_director_context(
     duration_sec: float,
     enable_sfx_multilayer: bool,
     enable_director: bool,
+    enable_world_360: bool,
     vision_result: dict[str, Any] | None,
     sfx_info: dict[str, Any] | None,
     director_plan: dict[str, Any] | None,
+    world_360: dict[str, Any] | None,
     sheet_info: dict[str, Any] | None,
     sheet_path: Path,
+    foley_prompt_used: str | None = None,
 ) -> dict[str, Any]:
     """work/director_context.json を構築・保存し、その内容を返す。"""
     vr = vision_result or {}
@@ -883,15 +925,20 @@ def _write_director_context(
         "duration_sec": round(float(duration_sec), 3),
         "enable_sfx_multilayer": bool(enable_sfx_multilayer),
         "enable_director": bool(enable_director),
+        "enable_world_360": bool(enable_world_360),
         "intensity_track": vr.get("intensity_track") or [],
         "scene_segments": vr.get("scene_segments") or [],
         "scene_summary": vr.get("scene_summary") or {},
+        "world_profile": vr.get("world_profile") or {},
+        "flyby_events": vr.get("flyby_events") or [],
+        "world_360": world_360 or {},
         "sfx_layers": _public_sfx_layers(sfx_info),
         "sfx_events": list((sfx_info or {}).get("impact_events") or []),
         "director_plan": director_plan,
         "director_sheet": sheet_info,
         "director_sheet_path": str(sheet_path.resolve()) if has_sheet else None,
         "director_sheet_url": f"/api/jobs/{job_id}/media/director_sheet" if has_sheet else None,
+        "foley_prompt_used": foley_prompt_used,
     }
     _atomic_write_json(work_dir / "director_context.json", context)
     return context
@@ -905,6 +952,7 @@ def run_job(
     enable_sfx_multilayer: bool | None = None,
     enable_director: bool | None = None,
     director_plan: dict[str, Any] | None = None,
+    enable_world_360: bool | None = None,
 ) -> dict[str, Any]:
     """CineSS 統合パイプラインのメイン実行関数。"""
     t0 = time.time()
@@ -928,6 +976,7 @@ def run_job(
     raw_target_lufs = request.get("target_lufs") if "target_lufs" in request else None
     loudness_mode, fixed_target_lufs = _resolve_loudness_settings(request.get("loudness_mode"), raw_target_lufs)
     foley_prompt = str(request.get("foley_prompt") or "")
+    scene_objects_hint = str(request.get("scene_objects_hint") or "")
     allow_foley_fallback = bool(request.get("allow_foley_fallback", False))
     preview_start = max(0.0, float(request.get("preview_start") or 0.0))
     preview_duration_raw = request.get("preview_duration")
@@ -946,6 +995,11 @@ def run_job(
         if enable_director is not None
         else bool(request.get("enable_director", True))
     )
+    eff_world_360 = (
+        bool(enable_world_360)
+        if enable_world_360 is not None
+        else bool(request.get("enable_world_360", True))
+    )
     eff_director_plan = director_plan if director_plan is not None else request.get("director_plan")
 
     # --- 1) 映像検査 & 有音/無音自動判定 ---
@@ -962,7 +1016,8 @@ def run_job(
         f"映像検査完了: {video_info['width']}x{video_info['height']} / {video_info['duration_sec']:.1f}秒 / "
         f"音声RMS={video_info['audio_rms_db']} dBFS → モード={effective_mode}, 品質={quality}, "
         f"規格={spatial_format}, セリフ定位={dialog_pan_mode}, ラウドネス={loudness_mode}, "
-        f"SFX4層={'ON' if eff_sfx_multilayer else 'OFF'}, AI監督={'ON' if eff_director else 'OFF'}",
+        f"SFX4層={'ON' if eff_sfx_multilayer else 'OFF'}, AI監督={'ON' if eff_director else 'OFF'}, "
+        f"360°拡張={'ON' if eff_world_360 else 'OFF'}",
     )
 
     # --- 2) 任意のプレビュー区間切り出し ---
@@ -1026,6 +1081,7 @@ def run_job(
     original_lufs: float | None = None
     effective_target_lufs: float
     sfx_info: dict[str, Any] | None = None
+    foley_prompt_used: str | None = None
 
     # --- 4) 有音モード or 無音Foleyモード ---
     if effective_mode == "voiced":
@@ -1117,7 +1173,9 @@ def run_job(
             allow_preview_fallback=allow_foley_fallback,
             progress_cb=_make_sub_progress(progress_cb, "separate", 28.0, 58.0),
             log_cb=log_cb,
+            scene_objects_hint=scene_objects_hint,
         )
+        foley_prompt_used = foley_result.get("prompt")
         models_used["foley"] = foley_result["method"]
 
         sfx_wav: Path | None = Path(foley_result["sfx_mono_wav"]) if foley_result.get("sfx_mono_wav") else None
@@ -1168,15 +1226,21 @@ def run_job(
         "target_lufs": effective_target_lufs,
         "enable_sfx_multilayer": eff_sfx_multilayer,
         "enable_director": eff_director,
+        "enable_world_360": eff_world_360,
     }
+    scene["world_360"] = _build_initial_world_360(vision_result, enable_world_360=eff_world_360)
 
     # 監督プラン適用前のクリーンなベースシーンを保存（再適用時の冪等ベース復元用）
     _atomic_write_json(work_dir / "scene_base.json", scene)
 
     active_director_plan: dict[str, Any] | None = None
     if eff_director:
-        _emit_progress(progress_cb, 73, "mapping", "AIダビング監督がシーン温度に基づく時間変化演出を設計中...")
-        raw_plan = eff_director_plan if eff_director_plan is not None else build_auto_director_plan(vision_result, sfx_info=sfx_info)
+        _emit_progress(progress_cb, 73, "mapping", "AIダビング監督がシーン温度と360°世界に基づく演出を設計中...")
+        raw_plan = (
+            eff_director_plan
+            if eff_director_plan is not None
+            else build_auto_director_plan(vision_result, sfx_info=sfx_info, enable_world_360=eff_world_360)
+        )
         active_director_plan = validate_director_plan(raw_plan, duration_sec)
         scene = apply_director_plan_to_scene(scene, active_director_plan)
         models_used["director"] = active_director_plan.get("source", "auto_director")
@@ -1191,11 +1255,14 @@ def run_job(
         duration_sec=duration_sec,
         enable_sfx_multilayer=eff_sfx_multilayer,
         enable_director=eff_director,
+        enable_world_360=eff_world_360,
         vision_result=vision_result,
         sfx_info=sfx_info,
         director_plan=active_director_plan,
+        world_360=scene.get("world_360"),
         sheet_info=sheet_info,
         sheet_path=sheet_path,
+        foley_prompt_used=foley_prompt_used,
     )
     _emit_log(log_cb, f"3D空間シーンを構築しました（音源オブジェクト数={len(scene['objects'])}）。")
 
@@ -1251,6 +1318,7 @@ def run_job(
         "enable_dialog_ducking": enable_dialog_ducking,
         "enable_sfx_multilayer": eff_sfx_multilayer,
         "enable_director": eff_director,
+        "enable_world_360": eff_world_360,
         "duration_sec": duration_sec,
         "is_preview_sliced": is_preview_sliced,
         "elapsed_sec": elapsed,
@@ -1258,6 +1326,10 @@ def run_job(
         "scene_path": str(scene_path.resolve()),
         "video_info": video_info,
         "vision_summary": vision_result.get("scene_summary"),
+        "world_profile": vision_result.get("world_profile"),
+        "flyby_events": vision_result.get("flyby_events") or [],
+        "world_360": scene.get("world_360"),
+        "foley_prompt_used": foley_prompt_used,
         "scene_segments": vision_result.get("scene_segments") or [],
         "sfx_layers": _public_sfx_layers(sfx_info),
         "sfx_events": list((sfx_info or {}).get("impact_events") or []),
@@ -1539,7 +1611,7 @@ def apply_director_plan_and_remix(
         log_cb=log_cb,
     )
 
-    # director_context.json と result.json に最新の監督プランを同期
+    # director_context.json と result.json に最新の監督プラン・world_360 を同期
     ctx_path = work_dir / "director_context.json"
     ctx = _read_json(ctx_path, default={}) or {}
     if not ctx:
@@ -1551,15 +1623,23 @@ def apply_director_plan_and_remix(
             "duration_sec": round(duration_sec, 3),
             "enable_sfx_multilayer": bool(prev_result.get("enable_sfx_multilayer", True)),
             "enable_director": True,
+            "enable_world_360": bool(updated_scene.get("world_360", {}).get("enabled", prev_result.get("enable_world_360", True))),
             "intensity_track": vr.get("intensity_track") or [],
             "scene_segments": vr.get("scene_segments") or prev_result.get("scene_segments") or [],
             "scene_summary": vr.get("scene_summary") or prev_result.get("vision_summary") or {},
+            "world_profile": vr.get("world_profile") or prev_result.get("world_profile") or {},
+            "flyby_events": vr.get("flyby_events") or prev_result.get("flyby_events") or [],
             "sfx_layers": prev_result.get("sfx_layers") or [],
             "sfx_events": prev_result.get("sfx_events") or [],
             "director_sheet_path": str(sheet_path.resolve()) if sheet_path.is_file() else None,
             "director_sheet_url": f"/api/jobs/{job_id}/media/director_sheet" if sheet_path.is_file() else None,
         }
+    active_w360 = updated_scene.get("world_360") or prev_result.get("world_360") or {}
     ctx["enable_director"] = True
+    ctx["enable_world_360"] = bool(active_w360.get("enabled", ctx.get("enable_world_360", True)))
+    ctx["world_360"] = active_w360
+    if validated_plan.get("flyby_events"):
+        ctx["flyby_events"] = validated_plan["flyby_events"]
     ctx["director_plan"] = validated_plan
     _atomic_write_json(ctx_path, ctx)
 
@@ -1567,8 +1647,64 @@ def apply_director_plan_and_remix(
     models_used["director"] = validated_plan.get("source", "custom_director")
     remix_res["models_used"] = models_used
     remix_res["enable_director"] = True
+    remix_res["enable_world_360"] = ctx["enable_world_360"]
+    remix_res["world_360"] = active_w360
+    remix_res["flyby_events"] = ctx.get("flyby_events") or []
+    remix_res["world_profile"] = ctx.get("world_profile") or prev_result.get("world_profile")
     remix_res["director_plan"] = validated_plan
     remix_res["director_context_path"] = str(ctx_path.resolve())
     _atomic_write_json(jdir / "result.json", remix_res)
 
     return remix_res
+
+
+def inspect_video_world(
+    video_path: str | Path,
+    out_dir: str | Path | None = None,
+    sample_fps: float = 4.0,
+    max_frames: int = 8,
+) -> dict[str, Any]:
+    """処理前に映像の 360° 世界環境・画面外通過候補・コンタクトシート・Foley 推奨プロンプトを高速解析する。"""
+    src = Path(video_path).resolve()
+    if not src.is_file():
+        raise FileNotFoundError(f"入力動画が見つかりません: {src}")
+
+    video_info = inspect_video(src)
+    vision_result = analyze_video_spatial(src, sample_fps=sample_fps, use_depth_model=False)
+
+    if out_dir is not None:
+        sheet_dir = Path(out_dir).resolve()
+        sheet_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        sheet_dir = Path(tempfile.mkdtemp(prefix="ciness_world_")).resolve()
+
+    sheet_path = sheet_dir / "director_sheet.jpg"
+    sheet_info = export_director_contact_sheet(src, vision_result, sheet_path, max_frames=max_frames)
+
+    wp = vision_result.get("world_profile") or {}
+    flybys = vision_result.get("flyby_events") or []
+    summary = vision_result.get("scene_summary") or {}
+    suggested_prompt = build_foley_prompt(summary, world_profile=wp)
+
+    flyby_notes = [str(ev.get("note_ja")) for ev in flybys[:4] if ev.get("note_ja")]
+    flyby_desc = " / ".join(flyby_notes) if flyby_notes else "顕著な画面外通過イベントは少なめ（全周環境包囲を中心に設計）"
+    guide_ja = (
+        f"{wp.get('description_ja', '360°標準空間')} | "
+        f"検出人物 {len(vision_result.get('person_tracks') or [])}名 / "
+        f"通過演出: {flyby_desc}"
+    )
+
+    return {
+        "ok": True,
+        "video_path": str(src),
+        "video_info": video_info,
+        "world_profile": wp,
+        "flyby_events": flybys,
+        "scene_segments": vision_result.get("scene_segments") or [],
+        "scene_summary": summary,
+        "person_count": len(vision_result.get("person_tracks") or []),
+        "suggested_foley_prompt": suggested_prompt,
+        "director_sheet_path": str(sheet_path),
+        "director_sheet": sheet_info,
+        "spatial_360_guide_ja": guide_ja,
+    }

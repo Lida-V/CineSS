@@ -797,6 +797,33 @@ def cmd_apply_director(
         }
 
 
+def cmd_inspect_world(
+    video_path: str,
+    *,
+    out_dir: str | None = None,
+    sample_fps: float = 4.0,
+    max_frames: int = 8,
+) -> dict[str, Any]:
+    """処理前に映像の 360° 世界環境・画面外通過・コンタクトシート・Foley 推奨プロンプトを解析する。"""
+    src = Path(video_path).expanduser()
+    if not src.is_file():
+        raise AgentError(f"入力動画が見つかりません: {src}")
+    try:
+        from app import pipeline  # noqa: PLC0415
+
+        fn = getattr(pipeline, "inspect_video_world", None)
+    except Exception as exc:
+        raise AgentError(f"映像360°事前解析モジュールの読み込みに失敗しました: {exc}") from exc
+    if not callable(fn):
+        raise AgentError("pipeline.inspect_video_world が利用できません。")
+    return fn(
+        src,
+        out_dir=out_dir,
+        sample_fps=float(sample_fps),
+        max_frames=int(max_frames),
+    )
+
+
 # ---------------------------------------------------------------------------
 # エントリポイント
 # ---------------------------------------------------------------------------
@@ -838,6 +865,12 @@ def main(argv: list[str] | None = None) -> int:
     p_dapply.add_argument("--plan", required=True, help="監督プラン JSON 文字列または JSON ファイルパス")
     p_dapply.add_argument("--server", default=_default_server_url(), help="CineSS サーバーURL")
 
+    p_iworld = sub.add_parser("inspect-world", help="動画の 360° ワールド環境・通過イベント・コンタクトシート・Foley推奨プロンプトを事前解析")
+    p_iworld.add_argument("--video", required=True, help="解析対象のローカル動画ファイルパス")
+    p_iworld.add_argument("--out-dir", default=None, help="コンタクトシート保存先ディレクトリ（省略時は一時ディレクトリ）")
+    p_iworld.add_argument("--sample-fps", type=float, default=4.0, help="映像サンプリングFPS（既定 4.0）")
+    p_iworld.add_argument("--max-frames", type=int, default=8, help="コンタクトシート最大コマ数（既定 8）")
+
     args = parser.parse_args(argv)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -869,6 +902,13 @@ def main(argv: list[str] | None = None) -> int:
             result = cmd_director_context(args.job_id, server_url=args.server)
         elif args.command == "apply-director":
             result = cmd_apply_director(args.job_id, args.plan, server_url=args.server)
+        elif args.command == "inspect-world":
+            result = cmd_inspect_world(
+                args.video,
+                out_dir=args.out_dir,
+                sample_fps=args.sample_fps,
+                max_frames=args.max_frames,
+            )
         elif args.command == "run-job":
             result = cmd_run_job(
                 args.job_id,

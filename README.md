@@ -21,11 +21,13 @@ AI エージェント（Claude Code / Antigravity / MCP 対応クライアント
      - `sfx_sub`: 140Hz LPF 低域・重低音基盤（Atmos 7.1.4 LFE / Ambisonics ACN 0 連携、ダッキング免除）
      - `sfx_impact`（Left / Center / Right）: 衝撃帯域成分をステレオパンで配置（無音側チャンネルは自動畳み込み・激しい衝撃時はセリフダッキングを瞬時解除するスマート・インパクト免除に対応）
      - `ambience`: 空間全体に広がる環境音ベッド
-3. **映像シーン温度 ＆ AIダビング監督演出**
-   - 映像の輝度・暖色度・動きエネルギー・急激なフラッシュ変化から、シーンごとの迫力カーブ（**シーン温度**: `静寂` / `通常` / `高揚` / `クライマックス`）を解析し、激しいアクションの近接距離（1.3〜2.2m）と静寂シーンの遠景距離（3.2〜5.2m）を自然に再現します。
-   - 代表フレームを最大8コマまとめた **監督用コンタクトシート画像（`director_sheet.jpg`）** と時間変化キーフレームを含む **AIダビング監督プラン（`director_plan`）** を生成し、Web UI・CLI・MCP から再分離なしで高速に監督演出を微調整・再適用できます。
-4. **無音動画 Foley 生成（HunyuanVideo-Foley ＋ 空間配置）**
-   - 無音映像から動き・カット・シーン温度を解析し、HunyuanVideo-Foley（XXL / XL、VRAMやユニファイドメモリに応じたオフロード対応）による 48kHz 効果音・環境音生成と3D空間配置を行います（オフライン検証用のモーション合成プレビューフォールバックにも対応）。
+3. **映像シーン温度 ＆ 360° ワールド空間モデリング ＆ AIダビング監督演出**
+   - 見えている映像を「360° 全方位空間の前方窓」として捉え、画面上部/下部・エッジ密度・カメラ平行移動を差し引いた残差オプティカルフローから **カメラ外 360° 環境（`world_profile`: 屋外オープン／夜間アクション／室内／広間・残響設定）** と **画面外通過（`flyby_events`: 左右側面→後方・頭上・全方位衝撃波）** を自動推定します。
+   - **2段オールパス無相関 360° 空間展開**: 7.1.4 の側面・後方 (`Lrs/Rrs`)・頭上ハイト (`Ltf/Rtf/Ltr/Rtr`) および Ambisonics 10方向球面展開でコムフィルタ濁りのない包囲音場を生成し、イマーシブ設定では画面外話者も側面〜後方へ配置できます。
+   - 映像の輝度・暖色度・動きエネルギー・急激なフラッシュ変化から **シーン温度**（`静寂` / `通常` / `高揚` / `クライマックス`）を解析し、激しいアクションの近接距離（1.3〜2.2m）と静寂シーンの遠景距離（3.2〜5.2m）を自然に再現します。
+   - 代表フレームを最大8コマまとめた **監督用コンタクトシート画像（`director_sheet.jpg`）** と時間変化キーフレーム（`azimuth_deg` `±180°`・`elevation_deg` `±90°`・`distance_m`・`gain_db`・`world_360` 制御）を含む **AIダビング監督プラン（`director_plan`）** を生成し、Web UI・CLI・MCP から再分離なしで高速に監督演出を微調整・再適用できます。
+4. **無音動画 Foley 生成（360°環境＋物体ヒント対応 HunyuanVideo-Foley）**
+   - 無音映像から動き・カット・シーン温度・360°世界プロファイル（`foley_world_hints`）および物体ヒント（`scene_objects_hint`）を自動反映し、HunyuanVideo-Foley（XXL / XL、VRAMやユニファイドメモリに応じたオフロード対応）による 48kHz 効果音・環境音生成と3D空間配置を行います（オフライン検証用のモーション合成プレビューフォールバックにも対応）。
 5. **プロ仕様サラウンド MixMaster ＆ バイノーラル出力（完全フリー構成）**
    - **Dolby Atmos 互換（完全フリー・国際標準）**: 商用有償エンコーダ（E-AC-3 JOC）に依存せず、国際標準規格 **ITU-R BS.2076 準拠 ADM BWF `.wav`**（7.1.4 Bed + Dynamic Objects）＋ 7.1.4 確認用 WAV ＋ 内蔵 HRTF 直接バイノーラルを出力します。DaVinci Resolve / EAR / Reaper 等と互換があります（民生 TV 向け `.ec3 (E-AC-3 JOC)` 配信変換のみ外部対応ツールが必要です）。
    - **Ambisonics 1〜7次対応（AmbiX: ACN + SN3D + Max-rE デコード）**:
@@ -113,18 +115,21 @@ Windows では `.venv\Scripts\python.exe`、macOS / Linux では `.venv/bin/pyth
 # 3. Web UI の「▶ 処理開始」ボタンを待ち受けて自動実行
 .venv\Scripts\python.exe -X utf8 tools/ciness_agent.py watch --server http://127.0.0.1:8780
 
-# 4. 完了ジョブのシーン温度・SFX 4層・コンタクトシート情報取得
+# 4. 処理前の動画 360° 環境・画面外通過・コンタクトシート事前解析
+.venv\Scripts\python.exe -X utf8 tools/ciness_agent.py inspect-world --video <VIDEO_PATH>
+
+# 5. 完了ジョブのシーン温度・360°環境・SFX 4層・コンタクトシート情報取得
 .venv\Scripts\python.exe -X utf8 tools/ciness_agent.py director-context --job-id <JOB_ID>
 
-# 5. AIダビング監督プランを適用して再分離なしで高速空間リミックス
-.venv\Scripts\python.exe -X utf8 tools/ciness_agent.py apply-director --job-id <JOB_ID> --plan '{"notes":"クライマックス強化","keyframes":[]}'
+# 6. AIダビング監督プラン（±180°/±90°・world_360対応）を適用して高速空間リミックス
+.venv\Scripts\python.exe -X utf8 tools/ciness_agent.py apply-director --job-id <JOB_ID> --plan '{"notes":"後方通過＆クライマックス強化","world_360":{"rear_level":1.35,"height_level":1.25}}'
 ```
 
 `watch` を起動すると、Web UI ヘッダーが **「🤖 エージェント接続中・待機OK」** に変わり、画面上で **「▶ 処理開始」** を押すだけでエージェントがジョブを受注して実行・ログ出力・完了まで自動で進行します。
 
-### 方法 B: MCP サーバー（`.mcp.json` 同梱・計8ツール）
+### 方法 B: MCP サーバー（`.mcp.json` 同梱・計9ツール）
 
-リポジトリ直下の `.mcp.json`（登録名 `ciness`）を利用すると、MCP 対応クライアントから以下の **8ツール** を直接呼び出せます。
+リポジトリ直下の `.mcp.json`（登録名 `ciness`）を利用すると、MCP 対応クライアントから以下の **9ツール** を直接呼び出せます。
 
 > **macOS / Linux での `.mcp.json` 読み替え注意**:
 > 同梱の `.mcp.json` は既定で Windows 向けの `"command": ".venv/Scripts/python.exe"` になっています。macOS / Linux の MCP クライアントで使用する場合は、設定上の起動コマンドを **`".venv/bin/python"`** に読み替えてご利用ください。
@@ -137,12 +142,14 @@ Windows では `.venv\Scripts\python.exe`、macOS / Linux では `.venv/bin/pyth
 | `ciness_claim_and_run_job` | キューのジョブを受注してバックグラウンド（または同期）で実行 |
 | `ciness_job_status` | ジョブの進捗・ログ・成果物パスの確認 |
 | `ciness_cancel_job` | ジョブの安全キャンセル |
-| `ciness_get_director_context` | シーン温度カーブ・SFX 4層情報・監督プラン・コンタクトシート画像 (`director_sheet.jpg`) の取得 |
-| `ciness_apply_director_plan` | 監督プラン (`director_plan`) を適用して再分離なしの高速空間リミックスを実行 |
+| `ciness_get_director_context` | シーン温度カーブ・360°世界環境・SFX 4層情報・監督プラン・コンタクトシート画像の取得 |
+| `ciness_apply_director_plan` | 監督プラン (`±180°/±90°`・`world_360`対応) を適用して再分離なしの高速空間リミックスを実行 |
+| `ciness_inspect_video_world` | 処理前に動画の 360° 環境・通過候補・コンタクトシート・Foley推奨プロンプトを事前解析 |
 
-### 監督連携 Web API 契約
+### 監督・事前解析 Web API 契約
 
-- `GET /api/jobs/{job_id}/director-context`: シーン温度（`intensity_track`, `scene_segments`）、SFX 4層（`sfx_layers`, `sfx_events`）、`director_plan`, `director_sheet_url` 等を返却
+- `POST /api/videos/inspect-world`: `upload_id` または `video_path` から処理前の 360° 環境・通過イベント・コンタクトシート・推奨 Foley プロンプトを返却
+- `GET /api/jobs/{job_id}/director-context`: シーン温度（`intensity_track`, `scene_segments`）、`world_profile`、`flyby_events`、`world_360`、SFX 4層、`director_plan`、`director_sheet_url` 等を返却
 - `GET /api/jobs/{job_id}/media/director_sheet`: 代表フレーム最大8枚の JPEG コンタクトシート画像を返却
 - `POST /api/jobs/{job_id}/director-plan`: `{"director_plan": {...}}` を受信し、空間リミックス後の状態と `result` を返却
 

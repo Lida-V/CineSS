@@ -444,6 +444,62 @@ def air_absorption_response(
     return 1.0 / (1.0 + 1j * ratio)
 
 
+def decorrelate_allpass(
+    x: np.ndarray,
+    delay_samples: int,
+    coeff: float = 0.52,
+) -> np.ndarray:
+    """1次オールパス IIR フィルタ H(z) = (-g + z^-D) / (1 - g z^-D) により位相のみを無相関化する。"""
+    arr = np.asarray(x, dtype=np.float32)
+    d = int(delay_samples)
+    if arr.size == 0 or d <= 0 or float(np.max(np.abs(arr))) < 1e-10:
+        return arr.copy()
+    g = max(-0.85, min(0.85, float(coeff)))
+    if abs(g) < 1e-6:
+        b = np.zeros(d + 1, dtype=np.float64)
+        b[d] = 1.0
+        a = np.zeros(1, dtype=np.float64)
+        a[0] = 1.0
+    else:
+        b = np.zeros(d + 1, dtype=np.float64)
+        b[0] = -g
+        b[d] = 1.0
+        a = np.zeros(d + 1, dtype=np.float64)
+        a[0] = 1.0
+        a[d] = -g
+    return signal.lfilter(b, a, arr.astype(np.float64), axis=0).astype(np.float32)
+
+
+def highpass_air(
+    x: np.ndarray,
+    sample_rate: int = SAMPLE_RATE,
+    cutoff_hz: float = 320.0,
+) -> np.ndarray:
+    """頭上ハイトチャンネルの低域濁りを抑える 2次 Butterworth ハイパスフィルタ。"""
+    arr = np.asarray(x, dtype=np.float32)
+    if arr.size == 0 or float(np.max(np.abs(arr))) < 1e-10:
+        return arr.copy()
+    sr = max(8000, int(sample_rate))
+    eff_cut = max(20.0, min(float(cutoff_hz), 0.45 * float(sr)))
+    sos = signal.butter(2, eff_cut, btype="highpass", fs=sr, output="sos")
+    return signal.sosfilt(sos, arr.astype(np.float64), axis=0).astype(np.float32)
+
+
+def lowpass_rear_air(
+    x: np.ndarray,
+    sample_rate: int = SAMPLE_RATE,
+    cutoff_hz: float = 7500.0,
+) -> np.ndarray:
+    """後方音場の自然な頭外定位を作る 2次 Butterworth ローパスフィルタ。"""
+    arr = np.asarray(x, dtype=np.float32)
+    if arr.size == 0 or float(np.max(np.abs(arr))) < 1e-10:
+        return arr.copy()
+    sr = max(8000, int(sample_rate))
+    eff_cut = max(500.0, min(float(cutoff_hz), 0.48 * float(sr)))
+    sos = signal.butter(2, eff_cut, btype="lowpass", fs=sr, output="sos")
+    return signal.sosfilt(sos, arr.astype(np.float64), axis=0).astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # 物理ベース合成 HRTF（Woodworth-Schlosberg ITD + 球体頭部回折 ILD + ピンナ）
 # ---------------------------------------------------------------------------

@@ -42,11 +42,14 @@ from .hrtf import (
     air_absorption_response,
     clamp_distance_m,
     clamp_elevation_deg,
+    decorrelate_allpass,
     distance_direct_gain,
     distance_reverb_send,
     fit_length,
+    highpass_air,
     interpolate_keyframes,
     load_audio_48k,
+    lowpass_rear_air,
     resolve_gain_linear_for_render,
     resolve_object_gain_db,
     wrap_azimuth_deg,
@@ -374,8 +377,9 @@ class AtmosRenderer:
         gain_db: float | np.ndarray = 0.0,
         role: str = "music",
         keyframes: list[dict[str, Any]] | None = None,
+        world_360: dict[str, Any] | None = None,
     ) -> np.ndarray:
-        """BGM・環境音・重低音ベッドトラックを 7.1.4 Bed (N, 12) へシネマティックに配置する。"""
+        """BGM・環境音・重低音ベッドトラックを 7.1.4 Bed (N, 12) へ 360° 無相関包囲配置する。"""
         arr = np.asarray(audio_2d, dtype=np.float32)
         if arr.ndim == 1:
             arr = arr[:, np.newaxis]
@@ -389,6 +393,15 @@ class AtmosRenderer:
             n, gain_db=gain_db, keyframes=keyframes, sample_rate=sr
         )
         role_norm = str(role or "music").strip().lower()
+
+        w360 = world_360 if isinstance(world_360, dict) else {}
+        w360_enabled = w360.get("enabled", True) is not False
+        if w360_enabled:
+            rear_scale = max(0.4, min(1.6, float(w360.get("rear_level", 1.0))))
+            height_scale = max(0.3, min(1.6, float(w360.get("height_level", 1.0))))
+        else:
+            rear_scale = 0.65
+            height_scale = 0.55
 
         if role_norm == "sfx_sub":
             left = (arr[:, 0] * gain_lin).astype(np.float32)
@@ -411,55 +424,65 @@ class AtmosRenderer:
                 return bed
             mid = 0.5 * (left + right)
             if is_ambience:
-                # 環境音はリア・サイド・ハイトへ広がりよく包囲配置
-                bed[:, 0] += 0.48 * left
-                bed[:, 1] += 0.48 * right
-                bed[:, 4] += 0.56 * _delay_samples(left, int(0.009 * sr))
-                bed[:, 5] += 0.56 * _delay_samples(right, int(0.011 * sr))
-                bed[:, 6] += 0.48 * _delay_samples(left, int(0.017 * sr))
-                bed[:, 7] += 0.48 * _delay_samples(right, int(0.021 * sr))
-                bed[:, 8] += 0.40 * _delay_samples(left, int(0.013 * sr))
-                bed[:, 9] += 0.40 * _delay_samples(right, int(0.016 * sr))
-                bed[:, 10] += 0.34 * _delay_samples(left, int(0.023 * sr))
-                bed[:, 11] += 0.34 * _delay_samples(right, int(0.027 * sr))
-                bed[:, 3] += 0.20 * _lfe_lowpass(mid, sample_rate=sr)
+                # 環境音: 素数サンプルオールパス無相関化＋後方空気吸収LPF＋頭上HPFで真の360°包囲を生成
+                rear_l = lowpass_rear_air(left, sample_rate=sr, cutoff_hz=7500.0)
+                rear_r = lowpass_rear_air(right, sample_rate=sr, cutoff_hz=7500.0)
+                hi_l = highpass_air(left, sample_rate=sr, cutoff_hz=320.0)
+                hi_r = highpass_air(right, sample_rate=sr, cutoff_hz=320.0)
+                bed[:, 0] += 0.38 * left
+                bed[:, 1] += 0.38 * right
+                bed[:, 4] += 0.56 * decorrelate_allpass(decorrelate_allpass(left, 211, coeff=0.50), 313, coeff=0.48)
+                bed[:, 5] += 0.56 * decorrelate_allpass(decorrelate_allpass(right, 223, coeff=0.50), 331, coeff=-0.48)
+                bed[:, 6] += (0.54 * rear_scale) * decorrelate_allpass(decorrelate_allpass(rear_l, 389, coeff=0.52), 503, coeff=-0.50)
+                bed[:, 7] += (0.54 * rear_scale) * decorrelate_allpass(decorrelate_allpass(rear_r, 401, coeff=0.52), 521, coeff=0.50)
+                bed[:, 8] += (0.42 * height_scale) * decorrelate_allpass(decorrelate_allpass(hi_l, 293, coeff=0.48), 431, coeff=0.48)
+                bed[:, 9] += (0.42 * height_scale) * decorrelate_allpass(decorrelate_allpass(hi_r, 307, coeff=0.48), 443, coeff=-0.48)
+                bed[:, 10] += (0.38 * height_scale * rear_scale) * decorrelate_allpass(decorrelate_allpass(hi_l, 467, coeff=0.50), 601, coeff=-0.50)
+                bed[:, 11] += (0.38 * height_scale * rear_scale) * decorrelate_allpass(decorrelate_allpass(hi_r, 479, coeff=0.50), 613, coeff=0.50)
+                bed[:, 3] += 0.18 * _lfe_lowpass(mid, sample_rate=sr)
             else:
-                # BGM はフロントL/Rを芯に、サラウンド＆ハイトへ自然な広がり
-                bed[:, 0] += 0.78 * left
-                bed[:, 1] += 0.78 * right
+                # BGM はフロントL/Rを芯に、オールパス無相関化で側後方・頭上へ自然な広がり
+                rear_l = lowpass_rear_air(left, sample_rate=sr, cutoff_hz=7500.0)
+                rear_r = lowpass_rear_air(right, sample_rate=sr, cutoff_hz=7500.0)
+                hi_l = highpass_air(left, sample_rate=sr, cutoff_hz=320.0)
+                hi_r = highpass_air(right, sample_rate=sr, cutoff_hz=320.0)
+                bed[:, 0] += 0.76 * left
+                bed[:, 1] += 0.76 * right
                 bed[:, 2] += 0.14 * mid
-                bed[:, 4] += 0.36 * _delay_samples(left, int(0.011 * sr))
-                bed[:, 5] += 0.36 * _delay_samples(right, int(0.013 * sr))
-                bed[:, 6] += 0.22 * _delay_samples(left, int(0.019 * sr))
-                bed[:, 7] += 0.22 * _delay_samples(right, int(0.022 * sr))
-                bed[:, 8] += 0.18 * _delay_samples(left, int(0.015 * sr))
-                bed[:, 9] += 0.18 * _delay_samples(right, int(0.018 * sr))
-                bed[:, 3] += 0.35 * _lfe_lowpass(mid, sample_rate=sr)
+                bed[:, 4] += 0.36 * decorrelate_allpass(left, 241, coeff=0.45)
+                bed[:, 5] += 0.36 * decorrelate_allpass(right, 251, coeff=0.45)
+                bed[:, 6] += (0.24 * rear_scale) * decorrelate_allpass(rear_l, 409, coeff=0.48)
+                bed[:, 7] += (0.24 * rear_scale) * decorrelate_allpass(rear_r, 419, coeff=0.48)
+                bed[:, 8] += (0.20 * height_scale) * decorrelate_allpass(hi_l, 311, coeff=0.45)
+                bed[:, 9] += (0.20 * height_scale) * decorrelate_allpass(hi_r, 317, coeff=0.45)
+                bed[:, 3] += 0.34 * _lfe_lowpass(mid, sample_rate=sr)
         else:
             mono = (arr[:, 0] * gain_lin).astype(np.float32)
             if float(np.max(np.abs(mono))) < 1e-10:
                 return bed
+            rear_mono = lowpass_rear_air(mono, sample_rate=sr, cutoff_hz=7500.0)
+            hi_mono = highpass_air(mono, sample_rate=sr, cutoff_hz=320.0)
             if is_ambience:
-                bed[:, 0] += 0.42 * mono
-                bed[:, 1] += 0.42 * _delay_samples(mono, int(0.007 * sr))
-                bed[:, 4] += 0.50 * _delay_samples(mono, int(0.012 * sr))
-                bed[:, 5] += 0.50 * _delay_samples(mono, int(0.016 * sr))
-                bed[:, 6] += 0.44 * _delay_samples(mono, int(0.022 * sr))
-                bed[:, 7] += 0.44 * _delay_samples(mono, int(0.027 * sr))
-                bed[:, 8] += 0.36 * _delay_samples(mono, int(0.015 * sr))
-                bed[:, 9] += 0.36 * _delay_samples(mono, int(0.019 * sr))
-                bed[:, 10] += 0.30 * _delay_samples(mono, int(0.025 * sr))
-                bed[:, 11] += 0.30 * _delay_samples(mono, int(0.030 * sr))
+                bed[:, 0] += 0.38 * mono
+                bed[:, 1] += 0.38 * mono
+                bed[:, 4] += 0.56 * decorrelate_allpass(decorrelate_allpass(mono, 211, coeff=0.50), 313, coeff=0.48)
+                bed[:, 5] += 0.56 * decorrelate_allpass(decorrelate_allpass(mono, 223, coeff=0.50), 331, coeff=-0.48)
+                bed[:, 6] += (0.54 * rear_scale) * decorrelate_allpass(decorrelate_allpass(rear_mono, 389, coeff=0.52), 503, coeff=-0.50)
+                bed[:, 7] += (0.54 * rear_scale) * decorrelate_allpass(decorrelate_allpass(rear_mono, 401, coeff=0.52), 521, coeff=0.50)
+                bed[:, 8] += (0.42 * height_scale) * decorrelate_allpass(decorrelate_allpass(hi_mono, 293, coeff=0.48), 431, coeff=0.48)
+                bed[:, 9] += (0.42 * height_scale) * decorrelate_allpass(decorrelate_allpass(hi_mono, 307, coeff=0.48), 443, coeff=-0.48)
+                bed[:, 10] += (0.38 * height_scale * rear_scale) * decorrelate_allpass(decorrelate_allpass(hi_mono, 467, coeff=0.50), 601, coeff=-0.50)
+                bed[:, 11] += (0.38 * height_scale * rear_scale) * decorrelate_allpass(decorrelate_allpass(hi_mono, 479, coeff=0.50), 613, coeff=0.50)
                 bed[:, 3] += 0.18 * _lfe_lowpass(mono, sample_rate=sr)
             else:
                 bed[:, 0] += 0.52 * mono
-                bed[:, 1] += 0.52 * _delay_samples(mono, int(0.007 * sr))
-                bed[:, 4] += 0.38 * _delay_samples(mono, int(0.014 * sr))
-                bed[:, 5] += 0.38 * _delay_samples(mono, int(0.019 * sr))
-                bed[:, 6] += 0.28 * _delay_samples(mono, int(0.024 * sr))
-                bed[:, 7] += 0.28 * _delay_samples(mono, int(0.029 * sr))
-                bed[:, 8] += 0.22 * _delay_samples(mono, int(0.017 * sr))
-                bed[:, 9] += 0.22 * _delay_samples(mono, int(0.021 * sr))
+                bed[:, 1] += 0.52 * mono
+                bed[:, 4] += 0.38 * decorrelate_allpass(mono, 241, coeff=0.45)
+                bed[:, 5] += 0.38 * decorrelate_allpass(mono, 251, coeff=0.45)
+                bed[:, 6] += (0.28 * rear_scale) * decorrelate_allpass(rear_mono, 409, coeff=0.48)
+                bed[:, 7] += (0.28 * rear_scale) * decorrelate_allpass(rear_mono, 419, coeff=0.48)
+                bed[:, 8] += (0.22 * height_scale) * decorrelate_allpass(hi_mono, 311, coeff=0.45)
+                bed[:, 9] += (0.22 * height_scale) * decorrelate_allpass(hi_mono, 317, coeff=0.45)
                 bed[:, 3] += 0.28 * _lfe_lowpass(mono, sample_rate=sr)
 
         return bed
@@ -547,6 +570,7 @@ class AtmosRenderer:
         binaural_direct = np.zeros((n_samples, 2), dtype=np.float32)
         reverb_bus_mono = np.zeros((n_samples,), dtype=np.float32)
         dynamic_objects: list[dict[str, Any]] = []
+        world_360 = scene_dict.get("world_360") or {}
 
         for idx, (obj, audio) in enumerate(loaded_tracks):
             audio_fit = fit_length(audio, n_samples)
@@ -556,7 +580,13 @@ class AtmosRenderer:
             spread = float(obj.get("spread", 0.1))
 
             if is_bed:
-                bed_714 += self._route_bed_track_714(audio_fit, gain_db=gain_db, role=role)
+                bed_714 += self._route_bed_track_714(
+                    audio_fit,
+                    gain_db=gain_db,
+                    role=role,
+                    keyframes=obj.get("keyframes"),
+                    world_360=world_360,
+                )
                 continue
 
             mono = (
@@ -602,7 +632,7 @@ class AtmosRenderer:
                 }
             )
 
-        # 7.1.4 拡散室内リバーブを 11ch（LFE除く）ベッドへ加算（映画ダビングステージ方式）
+        # 7.1.4 拡散室内リバーブを 11ch（LFE除く）ベッドへ加算（映画ダビングステージ方式＋360°重み）
         if float(np.max(np.abs(reverb_bus_mono))) > 1e-8:
             reverb_engine = RoomReverbEngine(
                 rt60_sec=rt60_sec,
@@ -610,10 +640,24 @@ class AtmosRenderer:
                 sample_rate=self.sample_rate,
             )
             rev_11ch = reverb_engine.process_multichannel(reverb_bus_mono, num_channels=11)
-            # 11ch 合計パワーがバイノーラル変換後に自然になるよう 1/sqrt(11) スケーリング
-            rev_scale = 1.0 / math.sqrt(11.0)
+            w360 = world_360 if isinstance(world_360, dict) else {}
+            w360_enabled = w360.get("enabled", True) is not False
+            rear_rev_w = max(0.75, min(1.35, float(w360.get("rear_level", 1.0)))) if w360_enabled else 0.75
+            height_rev_w = max(0.75, min(1.35, float(w360.get("height_level", 1.0)))) if w360_enabled else 0.75
+            rev_weights = []
+            for spk_idx in ATMOS_714_NON_LFE_INDICES:
+                if spk_idx in (6, 7):
+                    rev_weights.append(rear_rev_w)
+                elif spk_idx in (8, 9):
+                    rev_weights.append(height_rev_w)
+                elif spk_idx in (10, 11):
+                    rev_weights.append(0.5 * (rear_rev_w + height_rev_w))
+                else:
+                    rev_weights.append(1.0)
+            w_arr = np.asarray(rev_weights, dtype=np.float64)
+            rev_norm = math.sqrt(float(np.sum(w_arr * w_arr))) or math.sqrt(11.0)
             for k, spk_idx in enumerate(ATMOS_714_NON_LFE_INDICES):
-                bed_714[:, spk_idx] += rev_11ch[:, k] * rev_scale
+                bed_714[:, spk_idx] += rev_11ch[:, k] * float(w_arr[k] / rev_norm)
 
         # バイノーラル統合: 7.1.4 Bed (仮想スピーカーHRTF) + Dynamic Objects (直接連続HRTF)
         binaural_bed = self.render_bed_to_binaural(bed_714)

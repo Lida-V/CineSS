@@ -92,29 +92,52 @@ def _resample(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
     return resample_poly(audio.astype(np.float32), int(dst_sr) // g, int(src_sr) // g, axis=0).astype(np.float32)
 
 
-def build_foley_prompt(scene_summary: dict[str, Any] | None = None, user_prompt: str = "") -> str:
-    """ユーザー入力テキストと映像特徴サマリーから HunyuanVideo-Foley 用英語プロンプトを構築する。"""
-    parts: list[str] = []
-    raw_user = (user_prompt or "").strip()
-    if raw_user:
-        # 日本語キーワードが含まれる場合は英語ヒントも併記
-        mapped = [en for ja, en in _JA_TO_EN_HINTS.items() if ja in raw_user]
-        if raw_user.isascii():
-            parts.append(raw_user)
-        elif mapped:
-            parts.append(", ".join(dict.fromkeys(mapped)))
-        else:
-            parts.append(raw_user)
+def _append_prompt_text(parts: list[str], raw_text: str) -> None:
+    raw = (raw_text or "").strip()
+    if not raw:
+        return
+    mapped = [en for ja, en in _JA_TO_EN_HINTS.items() if ja in raw]
+    if raw.isascii():
+        if raw not in parts:
+            parts.append(raw)
+    elif mapped:
+        joined = ", ".join(dict.fromkeys(mapped))
+        if joined not in parts:
+            parts.append(joined)
+    elif raw not in parts:
+        parts.append(raw)
 
+
+def build_foley_prompt(
+    scene_summary: dict[str, Any] | None = None,
+    user_prompt: str = "",
+    world_profile: dict[str, Any] | None = None,
+    scene_objects_hint: str | None = None,
+) -> str:
+    """ユーザー指定・物体ヒント・360°ワールド環境・映像特徴から Foley 用英語プロンプトを構築する。"""
+    parts: list[str] = []
+    # 1) ユーザー指定プロンプト（日本語ヒント変換対応）
+    _append_prompt_text(parts, user_prompt)
+    # 2) エージェント／UI指定の物体種別・個数・材質ヒント
+    if scene_objects_hint:
+        _append_prompt_text(parts, scene_objects_hint)
+    # 3) 360°ワールドプロファイルの環境・空/天井・地面・通過ヒント
+    if isinstance(world_profile, dict):
+        for hint in world_profile.get("foley_world_hints") or []:
+            h_str = str(hint or "").strip()
+            if h_str and h_str not in parts:
+                parts.append(h_str)
+    # 4) 映像特徴サマリーのタグ
     if isinstance(scene_summary, dict):
         tags = scene_summary.get("suggested_foley_tags") or []
         for tag in tags:
-            if tag and tag not in parts:
-                parts.append(str(tag))
+            t_str = str(tag or "").strip()
+            if t_str and t_str not in parts:
+                parts.append(t_str)
 
     if not parts:
         parts.append("natural realistic cinematic foley sound effects and subtle room ambience")
-    return ", ".join(parts)
+    return ", ".join(dict.fromkeys(parts))
 
 
 def _has_weights(folder: Path) -> bool:
@@ -647,6 +670,7 @@ def generate_foley(
     chunk_duration_sec: float = 15.0,
     progress_cb: Callable[..., Any] | None = None,
     log_cb: Callable[..., Any] | None = None,
+    scene_objects_hint: str = "",
 ) -> dict[str, Any]:
     """無音動画から 48kHz Foley 音声を生成する（未取得時は本番規定どおり明示エラー）。"""
     src = Path(video_path)
@@ -655,13 +679,19 @@ def generate_foley(
         raise FileNotFoundError(f"動画ファイルが見つかりません: {src}")
 
     summary = (scene_analysis or {}).get("scene_summary") if isinstance(scene_analysis, dict) else None
+    world_profile = (scene_analysis or {}).get("world_profile") if isinstance(scene_analysis, dict) else None
     duration_sec = float((scene_analysis or {}).get("duration_sec", 0.0) or 0.0)
     if duration_sec <= 0.0:
         from app.vision.analyzer import inspect_video
 
         duration_sec = float(inspect_video(src).get("duration_sec", 5.0) or 5.0)
 
-    prompt = build_foley_prompt(summary, user_prompt=user_prompt)
+    prompt = build_foley_prompt(
+        summary,
+        user_prompt=user_prompt,
+        world_profile=world_profile,
+        scene_objects_hint=scene_objects_hint,
+    )
     info = find_hunyuan_foley()
 
     if info["available"]:

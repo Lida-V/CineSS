@@ -1183,6 +1183,239 @@ def _build_intensity_and_segments(
     return intensity_track, scene_segments
 
 
+def _detect_flyby_events(
+    motion_track: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """動き重心・残差オプティカルフロー・急拡大スコアから画面外通過（フライバイ）イベントを検出する。"""
+    if not motion_track:
+        return []
+
+    raw_events: list[dict[str, Any]] = []
+    for pt in motion_track:
+        t_sec = float(pt.get("t", 0.0))
+        az = float(pt.get("azimuth_deg", 0.0))
+        el = float(pt.get("elevation_deg", 0.0))
+        vx = float(pt.get("vx", 0.0))
+        vy = float(pt.get("vy", 0.0))
+        exp = float(pt.get("expansion_score", 0.0))
+        energy = float(pt.get("motion_energy", 0.0))
+        p98 = float(pt.get("p98", 0.0))
+        flash = float(pt.get("flash_score", 0.0))
+        up_e = float(pt.get("upper_energy", 0.0))
+        active_enough = (energy >= 0.06) or (p98 >= 0.28)
+        base_int = min(1.0, max(float(pt.get("action_intensity", 0.0)), exp * 0.7 + p98 * 0.5))
+
+        if exp >= 0.35 and flash >= 0.45 and p98 >= 0.40:
+            burst_int = min(1.0, 0.45 * exp + 0.35 * flash + 0.20 * min(1.0, p98 / 0.6))
+            raw_events.append({
+                "t_sec": round(t_sec, 3),
+                "kind": "surround_burst",
+                "direction": "surround",
+                "intensity": round(burst_int, 3),
+                "entry_azimuth_deg": 0.0,
+                "exit_azimuth_deg": 115.0,
+                "peak_elevation_deg": 22.0,
+                "note_ja": f"[{t_sec:.1f}s] 全方位衝撃波: 急拡大+閃光により前後360°へ爆風展開",
+            })
+            continue
+
+        if az <= -24.0 and (vx <= -0.45 or exp >= 0.25) and active_enough:
+            raw_events.append({
+                "t_sec": round(t_sec, 3),
+                "kind": "side_rear_left",
+                "direction": "left",
+                "intensity": round(base_int, 3),
+                "entry_azimuth_deg": round(az, 2),
+                "exit_azimuth_deg": -138.0,
+                "peak_elevation_deg": round(max(-15.0, min(35.0, el)), 1),
+                "note_ja": f"[{t_sec:.1f}s] 左画面外通過: {az:.0f}° → -95° → -138° (左後方へ抜ける)",
+            })
+        elif az >= 24.0 and (vx >= 0.45 or exp >= 0.25) and active_enough:
+            raw_events.append({
+                "t_sec": round(t_sec, 3),
+                "kind": "side_rear_right",
+                "direction": "right",
+                "intensity": round(base_int, 3),
+                "entry_azimuth_deg": round(az, 2),
+                "exit_azimuth_deg": 138.0,
+                "peak_elevation_deg": round(max(-15.0, min(35.0, el)), 1),
+                "note_ja": f"[{t_sec:.1f}s] 右画面外通過: +{az:.0f}° → +95° → +138° (右後方へ抜ける)",
+            })
+
+        if el >= 14.0 and vy <= -0.45 and up_e >= 0.08:
+            peak_el = round(min(78.0, max(58.0, el + 40.0)), 1)
+            raw_events.append({
+                "t_sec": round(t_sec, 3),
+                "kind": "overhead_pass",
+                "direction": "overhead",
+                "intensity": round(min(1.0, max(base_int, up_e * 2.5)), 3),
+                "entry_azimuth_deg": round(az, 2),
+                "exit_azimuth_deg": round(az, 2),
+                "peak_elevation_deg": peak_el,
+                "note_ja": f"[{t_sec:.1f}s] 頭上通過: 上向き高速移動により仰角 +{peak_el:.0f}° 付近を通過",
+            })
+
+    if not raw_events:
+        return []
+
+    # 0.8秒以内の同一種別イベントはピーク強度のもので集約（種類が異なれば独立に保持）
+    grouped: list[dict[str, Any]] = []
+    for ev in sorted(raw_events, key=lambda e: (e["t_sec"], -e["intensity"])):
+        merged = False
+        for existing in reversed(grouped):
+            if existing["kind"] == ev["kind"] and abs(ev["t_sec"] - existing["t_sec"]) <= 0.8:
+                if ev["intensity"] > existing["intensity"]:
+                    existing.update(ev)
+                merged = True
+                break
+        if not merged:
+            grouped.append(dict(ev))
+
+    if len(grouped) > 12:
+        grouped = sorted(
+            sorted(grouped, key=lambda e: e["intensity"], reverse=True)[:12],
+            key=lambda e: e["t_sec"],
+        )
+    return grouped
+
+
+def _build_world_profile(
+    *,
+    brightness_list: list[float],
+    warmth_list: list[float],
+    motion_energies: list[float],
+    top_bright_list: list[float],
+    top_blue_list: list[float],
+    edge_density_list: list[float],
+    upper_motions: list[float],
+    lower_motions: list[float],
+    expansion_scores: list[float],
+    flash_scores: list[float],
+    person_count: int,
+    flyby_events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """画面上部/下部/エッジ/動きからカメラ外の 360° 空間環境プロファイルを構築する。"""
+    mean_bright = float(np.mean(brightness_list)) if brightness_list else 128.0
+    mean_warmth = float(np.mean(warmth_list)) if warmth_list else 0.0
+    mean_motion = float(np.mean(motion_energies)) if motion_energies else 0.0
+    peak_motion = float(np.max(motion_energies)) if motion_energies else 0.0
+    top_bright = float(np.mean(top_bright_list)) if top_bright_list else mean_bright
+    top_blue = float(np.mean(top_blue_list)) if top_blue_list else 0.0
+    edge_mean = float(np.mean(edge_density_list)) if edge_density_list else 0.12
+    up_mean = float(np.mean(upper_motions)) if upper_motions else mean_motion
+    low_mean = float(np.mean(lower_motions)) if lower_motions else mean_motion
+    exp_peak = float(np.max(expansion_scores)) if expansion_scores else 0.0
+    flash_peak = float(np.max(flash_scores)) if flash_scores else 0.0
+    flyby_count = len(flyby_events)
+
+    if mean_bright < 95.0 and (peak_motion >= 0.16 or flash_peak >= 0.35 or exp_peak >= 0.25):
+        env_type = "outdoor_night_action"
+        env_ja = "夜間・暗所アクション空間"
+    elif top_blue >= 0.22 or (top_bright >= 145.0 and edge_mean < 0.18) or (mean_bright >= 135.0 and edge_mean < 0.13):
+        env_type = "outdoor_open"
+        env_ja = "屋外オープン空間"
+    elif (mean_bright < 92.0 and person_count == 0) or (edge_mean < 0.095 and peak_motion < 0.22):
+        env_type = "hall_cavern"
+        env_ja = "広間・反響空間"
+    else:
+        env_type = "indoor_intimate"
+        env_ja = "室内・近接対話空間"
+
+    has_overhead_flyby = any(e.get("kind") == "overhead_pass" for e in flyby_events)
+    has_burst = any(e.get("kind") == "surround_burst" for e in flyby_events)
+
+    env_rear_base = {
+        "outdoor_night_action": 0.72,
+        "outdoor_open": 0.66,
+        "hall_cavern": 0.64,
+        "indoor_intimate": 0.52,
+    }[env_type]
+    rear_strength = min(
+        1.0,
+        max(
+            0.50,
+            env_rear_base
+            + min(0.18, mean_motion * 1.1)
+            + min(0.12, flyby_count * 0.04)
+            + (0.06 if has_burst else 0.0),
+        ),
+    )
+
+    env_sky_base = {
+        "outdoor_open": 0.52,
+        "outdoor_night_action": 0.44,
+        "hall_cavern": 0.48,
+        "indoor_intimate": 0.28,
+    }[env_type]
+    sky_presence = min(
+        1.0,
+        max(
+            0.25,
+            env_sky_base
+            + min(0.24, up_mean * 2.2)
+            + min(0.14, max(0.0, top_blue) * 0.45)
+            + (0.16 if has_overhead_flyby else 0.0),
+        ),
+    )
+
+    ground_act = min(1.0, max(0.0, low_mean * 3.5 + min(0.25, peak_motion * 0.45)))
+
+    if env_type == "indoor_intimate":
+        rt60 = 0.36 if person_count >= 1 else 0.42
+        room_size = "small" if person_count >= 1 else "medium"
+    elif env_type == "outdoor_open":
+        rt60 = 0.50 + min(0.08, peak_motion * 0.2)
+        room_size = "large"
+    elif env_type == "outdoor_night_action":
+        rt60 = 0.54 + min(0.08, flash_peak * 0.1)
+        room_size = "large"
+    else:
+        rt60 = 0.68
+        room_size = "large"
+
+    hints: list[str] = []
+    if env_type == "outdoor_open":
+        hints.append("wide open outdoor 360 degree space, natural breeze, distant depth ambience")
+    elif env_type == "outdoor_night_action":
+        hints.append("dark atmospheric outdoor night arena, deep low rumble and tense air around listener")
+    elif env_type == "hall_cavern":
+        hints.append("spacious echoing hall or cavern ambience, diffuse surround reflections")
+    else:
+        hints.append("intimate enclosed interior room tone, subtle close air and room surfaces")
+
+    if sky_presence >= 0.58:
+        hints.append("open sky or high ceiling overhead air movement")
+    if ground_act >= 0.45:
+        hints.append("clear ground surface contact, footsteps, debris and lower impact weight")
+    if flyby_count > 0:
+        hints.append("fast directional whoosh and pass-by motion sweeping past sides and behind")
+    if exp_peak >= 0.30 or flash_peak >= 0.40:
+        hints.append("dramatic energy bursts and shockwave tail expanding into surround space")
+    if mean_warmth > 15.0:
+        hints.append("warm energetic heat, fire or glowing spark texture")
+
+    desc_ja = (
+        f"360°想定空間: {env_ja} / 後方包囲 {int(round(rear_strength * 100))}% / "
+        f"頭上ハイト {int(round(sky_presence * 100))}% / 画面外通過 {flyby_count}件"
+    )
+    return {
+        "environment_type": env_type,
+        "environment_label_ja": env_ja,
+        "rear_immersion_strength": round(rear_strength, 3),
+        "sky_overhead_presence": round(sky_presence, 3),
+        "ground_activity": round(ground_act, 3),
+        "recommended_rt60_sec": round(max(0.34, min(0.78, rt60)), 2),
+        "recommended_room_size": room_size,
+        "flyby_count": flyby_count,
+        "expansion_peak": round(exp_peak, 3),
+        "upper_motion_mean": round(up_mean, 4),
+        "lower_motion_mean": round(low_mean, 4),
+        "edge_density_mean": round(edge_mean, 4),
+        "foley_world_hints": list(dict.fromkeys(hints)),
+        "description_ja": desc_ja,
+    }
+
+
 def analyze_video_spatial(
     video_path: str | Path,
     sample_fps: float = 4.0,
@@ -1220,12 +1453,20 @@ def analyze_video_spatial(
         brightness_list: list[float] = []
         warmth_list: list[float] = []
         motion_energies: list[float] = []
+        top_bright_list: list[float] = []
+        top_blue_list: list[float] = []
+        edge_density_list: list[float] = []
+        upper_motions: list[float] = []
+        lower_motions: list[float] = []
+        expansion_scores: list[float] = []
+        flash_scores: list[float] = []
         cut_times: list[float] = []
 
         prev_small_gray: np.ndarray | None = None
         prev_hist: np.ndarray | None = None
         prev_brightness: float | None = None
         last_motion_pos = (0.0, 0.0, 4.2)
+        radial_uv_cache: tuple[int, int, np.ndarray, np.ndarray] | None = None
 
         frame_idx = 0
         sampled_count = 0
@@ -1270,12 +1511,34 @@ def analyze_video_spatial(
                 if anime_dets:
                     anime_fallback_tracker.update(t, anime_dets, gray, depth_map=depth_map)
 
-            # 動き重心（フレーム間差分 + Farneback オプティカルフロー + 画面フラッシュ）
+            # 動き重心（フレーム間差分 + Farneback オプティカルフロー + 画面フラッシュ + 360°通過）
             work_w = min(320, width)
             work_h = max(16, int(round(height * (work_w / max(width, 1)))))
             small_gray = cv2.resize(gray, (work_w, work_h), interpolation=cv2.INTER_AREA)
+            small_bgr = cv2.resize(frame, (work_w, work_h), interpolation=cv2.INTER_AREA)
 
-            hsv = cv2.cvtColor(cv2.resize(frame, (work_w, work_h)), cv2.COLOR_BGR2HSV)
+            top_h = max(1, int(round(work_h * 0.34)))
+            bot_y = max(1, work_h - top_h)
+            top_bright_list.append(float(np.mean(small_gray[:top_h])))
+            top_bgr = small_bgr[:top_h].astype(np.float32)
+            top_b = float(np.mean(top_bgr[..., 0]))
+            top_g = float(np.mean(top_bgr[..., 1]))
+            top_r = float(np.mean(top_bgr[..., 2]))
+            top_blue = max(0.0, min(1.0, (top_b - 0.5 * (top_g + top_r) + 12.0) / 56.0)) if top_b > top_r + 6.0 else 0.0
+            top_blue_list.append(float(top_blue))
+
+            edges = cv2.Canny(small_gray, 70, 160)
+            edge_density_list.append(float(np.mean(edges > 0)))
+
+            if radial_uv_cache is None or radial_uv_cache[0] != work_w or radial_uv_cache[1] != work_h:
+                yy, xx = np.indices((work_h, work_w), dtype=np.float32)
+                dx_c = xx - (work_w - 1) * 0.5
+                dy_c = yy - (work_h - 1) * 0.5
+                rad_c = np.sqrt(dx_c * dx_c + dy_c * dy_c) + 1e-6
+                radial_uv_cache = (work_w, work_h, dx_c / rad_c, dy_c / rad_c)
+            ux, uy = radial_uv_cache[2], radial_uv_cache[3]
+
+            hsv = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2HSV)
             hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
             cv2.normalize(hist, hist)
 
@@ -1294,6 +1557,9 @@ def analyze_video_spatial(
                     energy = min(1.0, mean_diff)
                     p98 = float(np.percentile(diff, 98))
                     cut_flash = min(1.0, max(flash_score * 0.75, bright_jump / 48.0))
+                    cut_exp = min(1.0, max(0.0, cut_flash * 0.45))
+                    cut_up = float(np.mean(diff[:top_h]))
+                    cut_low = float(np.mean(diff[bot_y:]))
                     dist_m, action_intensity = _estimate_sfx_distance_m(
                         energy=energy,
                         p98=p98,
@@ -1303,6 +1569,10 @@ def analyze_video_spatial(
                     az, el = last_motion_pos[0], last_motion_pos[1]
                     last_motion_pos = (az, el, dist_m)
                     motion_energies.append(energy)
+                    upper_motions.append(cut_up)
+                    lower_motions.append(cut_low)
+                    expansion_scores.append(cut_exp)
+                    flash_scores.append(cut_flash)
                     motion_track.append({
                         "t": round(t, 3),
                         "azimuth_deg": az,
@@ -1312,6 +1582,11 @@ def analyze_video_spatial(
                         "p98": round(p98, 4),
                         "flash_score": round(cut_flash, 4),
                         "action_intensity": action_intensity,
+                        "vx": 0.0,
+                        "vy": 0.0,
+                        "expansion_score": round(cut_exp, 4),
+                        "upper_energy": round(cut_up, 4),
+                        "lower_energy": round(cut_low, 4),
                         "is_cut": True,
                     })
                     raw_score = min(
@@ -1340,16 +1615,35 @@ def analyze_video_spatial(
                     p98 = float(np.percentile(motion_map, 98))
                     motion_energies.append(energy)
 
+                    # カメラパン等の大域平行移動を差し引いた残差フローと放射状拡大スコア
+                    global_vx = float(np.median(flow[..., 0]))
+                    global_vy = float(np.median(flow[..., 1]))
+                    res_vx = flow[..., 0] - global_vx
+                    res_vy = flow[..., 1] - global_vy
+                    radial = res_vx * ux + res_vy * uy
+                    exp_raw = float(np.sum(np.maximum(0.0, radial) * motion_map) / max(float(np.sum(motion_map)), 1e-6))
+                    exp_score = min(1.0, max(0.0, exp_raw / 2.2))
+                    up_e = float(np.mean(motion_map[:top_h]))
+                    low_e = float(np.mean(motion_map[bot_y:]))
+                    upper_motions.append(up_e)
+                    lower_motions.append(low_e)
+                    expansion_scores.append(exp_score)
+                    flash_scores.append(flash_score)
+
                     thresh = max(0.05, p98 * 0.45)
                     mask = motion_map >= thresh
                     area_ratio = float(np.mean(mask))
                     depth_val = None
+                    obj_vx = 0.0
+                    obj_vy = 0.0
                     if int(np.count_nonzero(mask)) >= 8:
                         weights = motion_map * mask
                         w_sum = float(np.sum(weights))
                         ys, xs = np.indices(motion_map.shape, dtype=np.float32)
                         mx = float(np.sum(xs * weights) / max(w_sum, 1e-8))
                         my = float(np.sum(ys * weights) / max(w_sum, 1e-8))
+                        obj_vx = float(np.sum(res_vx * weights) / max(w_sum, 1e-8))
+                        obj_vy = float(np.sum(res_vy * weights) / max(w_sum, 1e-8))
                         az, el = pixel_to_azimuth_elevation(mx, my, work_w, work_h)
                         if depth_map is not None:
                             d_small = cv2.resize(depth_map, (work_w, work_h), interpolation=cv2.INTER_AREA)
@@ -1375,6 +1669,11 @@ def analyze_video_spatial(
                         "p98": round(p98, 4),
                         "flash_score": round(flash_score, 4),
                         "action_intensity": action_intensity,
+                        "vx": round(obj_vx, 3),
+                        "vy": round(obj_vy, 3),
+                        "expansion_score": round(exp_score, 4),
+                        "upper_energy": round(up_e, 4),
+                        "lower_energy": round(low_e, 4),
                         "is_cut": False,
                     })
                     raw_score = min(
@@ -1392,6 +1691,10 @@ def analyze_video_spatial(
                         "is_cut": False,
                     })
             else:
+                upper_motions.append(0.0)
+                lower_motions.append(0.0)
+                expansion_scores.append(0.0)
+                flash_scores.append(0.0)
                 motion_track.append({
                     "t": round(t, 3),
                     "azimuth_deg": 0.0,
@@ -1401,6 +1704,11 @@ def analyze_video_spatial(
                     "p98": 0.0,
                     "flash_score": 0.0,
                     "action_intensity": 0.0,
+                    "vx": 0.0,
+                    "vy": 0.0,
+                    "expansion_score": 0.0,
+                    "upper_energy": 0.0,
+                    "lower_energy": 0.0,
                     "is_cut": False,
                 })
                 raw_intensity_samples.append({
@@ -1439,6 +1747,7 @@ def analyze_video_spatial(
         motion_track[0]["distance_m"] = motion_track[1]["distance_m"]
 
     intensity_track, scene_segments = _build_intensity_and_segments(raw_intensity_samples, duration_sec)
+    flyby_events = _detect_flyby_events(motion_track)
 
     person_tracks = tracker.finalize(sampled_count)
     if not person_tracks and sampled_count >= 3:
@@ -1457,11 +1766,35 @@ def analyze_video_spatial(
         cut_times=cut_times,
         duration_sec=duration_sec,
     )
+    world_profile = _build_world_profile(
+        brightness_list=brightness_list,
+        warmth_list=warmth_list,
+        motion_energies=motion_energies,
+        top_bright_list=top_bright_list,
+        top_blue_list=top_blue_list,
+        edge_density_list=edge_density_list,
+        upper_motions=upper_motions,
+        lower_motions=lower_motions,
+        expansion_scores=expansion_scores,
+        flash_scores=flash_scores,
+        person_count=len(person_tracks),
+        flyby_events=flyby_events,
+    )
     if intensity_track:
         temps = [float(p["temperature"]) for p in intensity_track]
         scene_summary["mean_temperature"] = round(float(np.mean(temps)), 3)
         scene_summary["peak_temperature"] = round(float(np.max(temps)), 3)
         scene_summary["climax_segments"] = sum(1 for seg in scene_segments if seg["label_code"] == "climax")
+    scene_summary["world_environment"] = world_profile["environment_type"]
+    scene_summary["world_description_ja"] = world_profile["description_ja"]
+
+    motion_zones_summary = {
+        "upper_motion_mean": world_profile["upper_motion_mean"],
+        "lower_motion_mean": world_profile["lower_motion_mean"],
+        "expansion_peak": world_profile["expansion_peak"],
+        "edge_density_mean": world_profile["edge_density_mean"],
+        "flyby_count": len(flyby_events),
+    }
 
     if progress_cb:
         try:
@@ -1483,6 +1816,9 @@ def analyze_video_spatial(
         "intensity_track": intensity_track,
         "scene_segments": scene_segments,
         "scene_summary": scene_summary,
+        "world_profile": world_profile,
+        "flyby_events": flyby_events,
+        "motion_zones_summary": motion_zones_summary,
     }
 
 

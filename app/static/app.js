@@ -64,6 +64,10 @@
     voice: "話者/セリフ",
     sfx_sub: "SFX重低音 (Sub)",
     sfx_impact: "SFX衝撃 (Impact)",
+    sfx_impact_left: "SFX衝撃 (左)",
+    sfx_impact_center: "SFX衝撃 (中央)",
+    sfx_impact_right: "SFX衝撃 (右)",
+    sfx_ambience: "環境音 (Ambience)",
     sfx: "効果音 (SFX)",
     foley: "Foley効果音",
     music: "BGM",
@@ -742,6 +746,7 @@
       enable_dereverb: $("chk-dereverb").checked,
       enable_sfx_multilayer: $("chk-sfx-multilayer") ? $("chk-sfx-multilayer").checked : true,
       enable_director: $("chk-enable-director") ? $("chk-enable-director").checked : true,
+      enable_world_360: $("chk-world-360") ? $("chk-world-360").checked : true,
       execution_mode: getRadioValue("execution_mode", "auto"),
     };
 
@@ -1217,17 +1222,24 @@
 
   function collectDirectorKeyframeSummaries(plan, scene) {
     const rows = [];
+    const pushKfRow = (target, kf, defaultExempt = false) => {
+      rows.push({
+        target,
+        t_sec: kf.t_sec ?? kf.t,
+        end_sec: kf.end_sec,
+        gain_db: kf.gain_db,
+        distance_m: kf.distance_m,
+        azimuth_deg: kf.azimuth_deg,
+        azimuth_offset_deg: kf.azimuth_offset_deg,
+        elevation_deg: kf.elevation_deg,
+        elevation_offset_deg: kf.elevation_offset_deg,
+        duck_exempt: Boolean(kf.duck_exempt || defaultExempt),
+        note: kf.note || kf.reason || "",
+      });
+    };
     if (plan && Array.isArray(plan.keyframes)) {
       plan.keyframes.forEach((kf) => {
-        rows.push({
-          target: kf.target || kf.object_id || kf.role || "演出対象",
-          t_sec: kf.t_sec ?? kf.t,
-          end_sec: kf.end_sec,
-          gain_db: kf.gain_db,
-          distance_m: kf.distance_m,
-          duck_exempt: Boolean(kf.duck_exempt),
-          note: kf.note || kf.reason || "",
-        });
+        pushKfRow(kf.target || kf.object_id || kf.role || "演出対象", kf);
       });
     }
     const trackMaps = [
@@ -1240,52 +1252,34 @@
       if (!m || typeof m !== "object" || Array.isArray(m)) return;
       Object.entries(m).forEach(([key, val]) => {
         if (Array.isArray(val)) {
-          // 各トラックから特徴的なキーフレーム（理由付き/強調/免除）を優先して最大4件ずつ抽出
+          // 各トラックから特徴的なキーフレーム（理由付き/強調/免除/360°移動）を優先して最大4件ずつ抽出
           const prioritized = val.filter(
             (kf) =>
               kf &&
-              (kf.reason || kf.duck_exempt || Math.abs(Number(kf.gain_db || 0)) >= 0.5 || kf.distance_m != null)
+              (kf.reason ||
+                kf.duck_exempt ||
+                Math.abs(Number(kf.gain_db || 0)) >= 0.5 ||
+                kf.distance_m != null ||
+                kf.azimuth_deg != null ||
+                Math.abs(Number(kf.azimuth_offset_deg || 0)) >= 1 ||
+                kf.elevation_deg != null ||
+                Math.abs(Number(kf.elevation_offset_deg || 0)) >= 1)
           );
           const picked = (prioritized.length ? prioritized : val).slice(0, 4);
-          picked.forEach((kf) => {
-            rows.push({
-              target: formatRoleLabelJa(key),
-              t_sec: kf.t_sec ?? kf.t,
-              end_sec: kf.end_sec,
-              gain_db: kf.gain_db,
-              distance_m: kf.distance_m,
-              duck_exempt: Boolean(kf.duck_exempt),
-              note: kf.note || kf.reason || "",
-            });
-          });
+          picked.forEach((kf) => pushKfRow(formatRoleLabelJa(key), kf));
         } else if (val && typeof val === "object") {
           const kfs = (Array.isArray(val.keyframes) ? val.keyframes : [val]).slice(0, 4);
-          kfs.forEach((kf) => {
-            rows.push({
-              target: formatRoleLabelJa(val.role || key),
-              t_sec: kf.t_sec ?? kf.t,
-              end_sec: kf.end_sec,
-              gain_db: kf.gain_db,
-              distance_m: kf.distance_m,
-              duck_exempt: Boolean(kf.duck_exempt || val.duck_exempt),
-              note: kf.note || kf.reason || val.note || "",
-            });
-          });
+          kfs.forEach((kf) =>
+            pushKfRow(formatRoleLabelJa(val.role || key), kf, Boolean(val.duck_exempt))
+          );
         }
       });
     });
     if (!rows.length && scene && Array.isArray(scene.objects)) {
       scene.objects.forEach((obj) => {
         (obj.keyframes || []).forEach((kf) => {
-          if (kf.gain_db != null || kf.duck_exempt) {
-            rows.push({
-              target: obj.label || formatRoleLabelJa(obj.role),
-              t_sec: kf.t_sec ?? kf.t,
-              gain_db: kf.gain_db,
-              distance_m: kf.distance_m,
-              duck_exempt: Boolean(kf.duck_exempt),
-              note: "",
-            });
+          if (kf.gain_db != null || kf.duck_exempt || Math.abs(Number(kf.azimuth_deg || 0)) > 60) {
+            pushKfRow(obj.label || formatRoleLabelJa(obj.role), kf);
           }
         });
       });
@@ -1451,6 +1445,50 @@
       layersRow.classList.add("hidden");
     }
 
+    // 360° ワールド空間拡張ピル（レガシージョブ等データ無し時は自動非表示）
+    const w360Row = $("director-world360-row");
+    if (w360Row) {
+      const wp = (dctx && dctx.world_profile) || (job.result && job.result.world_profile) || null;
+      const w360 =
+        (plan && plan.world_360) ||
+        (dctx && dctx.world_360) ||
+        (state.scene && state.scene.world_360) ||
+        null;
+      const flybys =
+        (Array.isArray(dctx && dctx.flyby_events) && dctx.flyby_events) ||
+        (Array.isArray(plan && plan.flyby_events) && plan.flyby_events) ||
+        [];
+      w360Row.innerHTML = "";
+      if ((wp && Object.keys(wp).length) || (w360 && Object.keys(w360).length) || flybys.length) {
+        w360Row.classList.remove("hidden");
+        const isOn = !w360 || w360.enabled !== false;
+        const envLabel =
+          (w360 && w360.environment_label_ja) ||
+          (wp && wp.environment_label_ja) ||
+          "360°想定空間";
+        const pills = [`🌐 ${envLabel}`];
+        if (isOn) {
+          if (w360 && isFinite(w360.rear_level)) {
+            pills.push(`🔊 後方包囲 ${Number(w360.rear_level).toFixed(2)}x`);
+          }
+          if (w360 && isFinite(w360.height_level)) {
+            pills.push(`⬆️ 頭上ハイト ${Number(w360.height_level).toFixed(2)}x`);
+          }
+          pills.push(`🛫 画面外通過 ${flybys.length}件`);
+        } else {
+          pills.push("⏸ 360°拡張オフ（前方基準）");
+        }
+        pills.forEach((txt) => {
+          const sp = document.createElement("span");
+          sp.className = `world360-pill ${isOn ? "" : "is-off"}`;
+          sp.textContent = txt;
+          w360Row.appendChild(sp);
+        });
+      } else {
+        w360Row.classList.add("hidden");
+      }
+    }
+
     // 監督コメント
     const notesList = $("director-notes-list");
     const notes = collectDirectorNotes(plan, dctx);
@@ -1487,6 +1525,22 @@
         }
         if (kf.distance_m != null && isFinite(kf.distance_m)) {
           parts.push(`${Number(kf.distance_m).toFixed(1)} m`);
+        }
+        if (kf.azimuth_deg != null && isFinite(kf.azimuth_deg)) {
+          const azv = Math.round(Number(kf.azimuth_deg));
+          const zone = Math.abs(azv) >= 115 ? "(後方)" : Math.abs(azv) >= 65 ? "(側面)" : "";
+          parts.push(`${azv >= 0 ? "+" : ""}${azv}°${zone}`);
+        } else if (kf.azimuth_offset_deg != null && Math.abs(Number(kf.azimuth_offset_deg)) >= 1) {
+          const off = Math.round(Number(kf.azimuth_offset_deg));
+          parts.push(`方位${off >= 0 ? "+" : ""}${off}°`);
+        }
+        if (kf.elevation_deg != null && isFinite(kf.elevation_deg)) {
+          const elv = Math.round(Number(kf.elevation_deg));
+          const ez = elv >= 45 ? "(頭上)" : "";
+          parts.push(`仰角${elv >= 0 ? "+" : ""}${elv}°${ez}`);
+        } else if (kf.elevation_offset_deg != null && Math.abs(Number(kf.elevation_offset_deg)) >= 1) {
+          const eoff = Math.round(Number(kf.elevation_offset_deg));
+          parts.push(`高さ${eoff >= 0 ? "+" : ""}${eoff}°`);
         }
         const exemptHtml = kf.duck_exempt
           ? `<span class="director-exempt-tag">ダッキング免除</span>`
@@ -2085,7 +2139,7 @@
     ctx.scale(dpr, dpr);
     ctx.clearRect(0, 0, w, h);
 
-    // 1. 前方スクリーン FOV 90° (-45° 〜 +45°) ガイドウェッジ
+    // 1. 前方スクリーン FOV 90° (-45° 〜 +45°) ガイドウェッジ ＆ 360°想定空間ガイド
     ctx.save();
     ctx.beginPath();
     ctx.moveTo(cx, cy);
@@ -2096,6 +2150,12 @@
     fovGrad.addColorStop(1, "rgba(34, 211, 238, 0.03)");
     ctx.fillStyle = fovGrad;
     ctx.fill();
+    ctx.fillStyle = "rgba(103, 232, 249, 0.45)";
+    ctx.font = "600 9.5px 'Segoe UI', sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("前方視野 (FOV)", cx, cy - maxR * 0.68);
+    ctx.fillStyle = "rgba(148, 163, 184, 0.34)";
+    ctx.fillText("360° 想定ワールド（側面・後方）", cx, cy + maxR * 0.68);
     ctx.restore();
 
     // 上部スクリーンバー
@@ -2243,8 +2303,20 @@
         ctx.restore();
       }
 
-      // ノード本体
+      // ノード本体 ＆ 仰角(頭上/下方)インジケータリング
+      const elev = Number(pose.elevation_deg ?? 0);
       const nodeR = isSelected ? 11 : 9;
+      if (Math.abs(elev) >= 5) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(pos.x, pos.y, nodeR + 4.5, 0, Math.PI * 2);
+        ctx.strokeStyle = elev > 0 ? "#67e8f9" : "#fda4af";
+        ctx.globalAlpha = 0.72;
+        ctx.lineWidth = 1.6;
+        if (elev > 0) ctx.setLineDash([2.5, 2.5]);
+        ctx.stroke();
+        ctx.restore();
+      }
       ctx.beginPath();
       ctx.arc(pos.x, pos.y, nodeR, 0, Math.PI * 2);
       ctx.fillStyle = color;
@@ -2264,7 +2336,9 @@
 
     pendingLabels.forEach(({ obj, idx, color, isSelected, pose, pos, nodeR }) => {
       const label = obj.label || obj.id || `Obj ${idx + 1}`;
-      const coordTxt = `${Math.round(pose.azimuth_deg)}° · ${pose.distance_m.toFixed(1)}m`;
+      const elevNum = Math.round(Number(pose.elevation_deg ?? 0));
+      const elevStr = Math.abs(elevNum) >= 5 ? (elevNum > 0 ? ` ↑+${elevNum}°` : ` ↓${elevNum}°`) : "";
+      const coordTxt = `${Math.round(pose.azimuth_deg)}° · ${pose.distance_m.toFixed(1)}m${elevStr}`;
       ctx.font = "700 11.5px 'Segoe UI', sans-serif";
       const labelW = ctx.measureText(label).width;
       ctx.font = "10px Consolas, monospace";
@@ -2442,7 +2516,7 @@
           kf.distance_m = Math.round(clamp(Number(kf.distance_m ?? 2.0) + dDist, 0.5, 12.0) * 10) / 10;
         }
         if (newElev != null) {
-          kf.elevation_deg = Math.round(clamp(Number(kf.elevation_deg ?? 0) + dElev, -45, 45) * 10) / 10;
+          kf.elevation_deg = Math.round(clamp(Number(kf.elevation_deg ?? 0) + dElev, -90, 90) * 10) / 10;
         }
       });
     } else {
@@ -2459,12 +2533,12 @@
       if (nearest && nearestDiff <= 0.35) {
         if (newAz != null) nearest.azimuth_deg = Math.round(clamp(newAz, -180, 180) * 10) / 10;
         if (newDist != null) nearest.distance_m = Math.round(clamp(newDist, 0.5, 12.0) * 10) / 10;
-        if (newElev != null) nearest.elevation_deg = Math.round(clamp(newElev, -45, 45) * 10) / 10;
+        if (newElev != null) nearest.elevation_deg = Math.round(clamp(newElev, -90, 90) * 10) / 10;
       } else {
         obj.keyframes.push({
           t: Math.round(curT * 100) / 100,
           azimuth_deg: Math.round(clamp(newAz ?? curPose.azimuth_deg, -180, 180) * 10) / 10,
-          elevation_deg: Math.round(clamp(newElev ?? curPose.elevation_deg, -45, 45) * 10) / 10,
+          elevation_deg: Math.round(clamp(newElev ?? curPose.elevation_deg, -90, 90) * 10) / 10,
           distance_m: Math.round(clamp(newDist ?? curPose.distance_m, 0.5, 12.0) * 10) / 10,
         });
         obj.keyframes.sort((a, b) => Number(a.t ?? a.t_sec ?? 0) - Number(b.t ?? b.t_sec ?? 0));
@@ -2543,7 +2617,7 @@
     $("slider-distance").value = String(clamp(pose.distance_m, 0.5, 12.0).toFixed(1));
     $("val-distance").textContent = `${pose.distance_m.toFixed(1)} m`;
 
-    $("slider-elevation").value = String(Math.round(clamp(pose.elevation_deg, -45, 45)));
+    $("slider-elevation").value = String(Math.round(clamp(pose.elevation_deg, -90, 90)));
     $("val-elevation").textContent = `${Math.round(pose.elevation_deg)}°`;
   }
 

@@ -492,6 +492,10 @@
                 <input id="chk-enable-director" type="checkbox" checked>
                 <span class="toggle-label">映像シーン温度によるAIダビング監督演出を有効にする <small>映像の動き・フラッシュ・カット展開に応じて効果音と重低音を自動演出</small></span>
               </label>
+              <label class="toggle-line">
+                <input id="chk-world-360" type="checkbox" checked>
+                <span class="toggle-label">360°ワールド空間拡張（後方包囲・頭上ハイト・画面外通過を自動演出） <small>見えている前方映像の外側（側面・背後・頭上）を想定して空間配置と通過演出を自動設計</small></span>
+              </label>
             </div>
 
             <!-- 無音Foleyオプション -->
@@ -804,6 +808,7 @@
               <div id="director-temp-timeline" class="director-temp-timeline" title="区間をクリックすると該当時刻へシークします"></div>
               <div id="director-segments-list" class="director-segments-list"></div>
               <div id="director-sfx-layers-row" class="director-sfx-layers hidden"></div>
+              <div id="director-world360-row" class="director-world360-row hidden"></div>
             </div>
           </div>
 
@@ -912,7 +917,7 @@
                   <span>⬆️ 仰角（高さ）</span>
                   <output id="val-elevation">0°</output>
                 </div>
-                <input id="slider-elevation" type="range" min="-45" max="45" step="1" value="0">
+                <input id="slider-elevation" type="range" min="-90" max="90" step="1" value="0">
               </label>
             </div>
 

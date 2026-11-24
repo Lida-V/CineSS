@@ -30,8 +30,11 @@ from app.spatial import (
     ambisonics_channel_count,
     build_max_re_decoder_matrix,
     compute_dialog_ducking_gain,
+    decorrelate_allpass,
+    highpass_air,
     interpolate_keyframe_duck_exempt,
     interpolate_keyframe_gain_db,
+    lowpass_rear_air,
     master_audio,
     measure_audio_metrics,
     measure_lufs,
@@ -1158,6 +1161,98 @@ class TestSpatialEngine(unittest.TestCase):
         self.assertEqual(res["metrics"]["channels"], 13)
         bin_sig, _ = sf.read(res["binaural_wav"], dtype="float64")
         self.assertGreater(_measure_lr_diff_db(bin_sig), 2.0)
+
+    # ------------------------------------------------------------------
+    # 18. 360° 無相関ベッド（Atmos 7.1.4 / Ambisonics）＆後方/頭上オブジェクト検証
+    # ------------------------------------------------------------------
+    def test_decorrelate_allpass_and_360_surround_rendering(self) -> None:
+        dur = 1.0
+        n = int(dur * SAMPLE_RATE)
+        rng = np.random.default_rng(777)
+        noise = (rng.standard_normal(n) * 0.25).astype(np.float32)
+
+        # 1) decorrelate_allpass: エネルギー保存 (±0.5 dB) & 無相関化
+        ap_a = decorrelate_allpass(noise, 211, coeff=0.52)
+        ap_b = decorrelate_allpass(noise, 389, coeff=0.52)
+        rms_in = float(np.sqrt(np.mean(noise.astype(np.float64) ** 2)))
+        rms_a = float(np.sqrt(np.mean(ap_a.astype(np.float64) ** 2)))
+        self.assertLess(abs(20.0 * math.log10(rms_a / max(rms_in, 1e-12))), 0.5)
+        corr_ab = float(np.corrcoef(ap_a, ap_b)[0, 1])
+        self.assertLess(abs(corr_ab), 0.35)
+        ap2_a = decorrelate_allpass(ap_a, 293, coeff=0.50)
+        ap2_b = decorrelate_allpass(decorrelate_allpass(noise, 223, coeff=0.52), 307, coeff=-0.50)
+        self.assertLess(abs(float(np.corrcoef(ap2_a, ap2_b)[0, 1])), 0.15)
+
+        # 2) AtmosRenderer 360° ambience ベッド: world_360 による後方/頭上変化＆左右対称性
+        atmos = AtmosRenderer(sample_rate=SAMPLE_RATE)
+        bed_high = atmos._route_bed_track_714(
+            noise, role="ambience", world_360={"enabled": True, "rear_level": 1.4, "height_level": 1.4}
+        )
+        bed_low = atmos._route_bed_track_714(
+            noise, role="ambience", world_360={"enabled": True, "rear_level": 0.5, "height_level": 0.4}
+        )
+        rear_high = float(np.sqrt(np.mean(bed_high[:, [6, 7]] ** 2)))
+        rear_low = float(np.sqrt(np.mean(bed_low[:, [6, 7]] ** 2)))
+        top_high = float(np.sqrt(np.mean(bed_high[:, [8, 9, 10, 11]] ** 2)))
+        top_low = float(np.sqrt(np.mean(bed_low[:, [8, 9, 10, 11]] ** 2)))
+        self.assertGreater(rear_high / max(rear_low, 1e-9), 2.0)
+        self.assertGreater(top_high / max(top_low, 1e-9), 2.5)
+
+        bin_bed = atmos.render_bed_to_binaural(bed_high)
+        self.assertLess(abs(_measure_lr_diff_db(bin_bed)), 0.5)
+
+        # 3) AmbisonicsRenderer 360° ambience & sfx_sub ACN0 維持
+        ambi = AmbisonicsRenderer(order=3, sample_rate=SAMPLE_RATE)
+        ambix_amb = ambi.encode_bed_source(
+            noise, role="ambience", world_360={"enabled": True, "rear_level": 1.3, "height_level": 1.3}
+        )
+        # ACN 2 (Z: 上下) に明確なエネルギー、ACN 1 (Y: 左右) は左右対称フィード相殺で小さい
+        self.assertGreater(float(np.sqrt(np.mean(ambix_amb[:, 2] ** 2))), 0.01)
+        self.assertGreater(float(np.sqrt(np.mean(ambix_amb[:, 3] ** 2))), 0.01)
+        sub_sig = (0.3 * np.sin(2.0 * math.pi * 60.0 * np.arange(n) / SAMPLE_RATE)).astype(np.float32)
+        ambix_sub = ambi.encode_bed_source(sub_sig, role="sfx_sub", world_360={"rear_level": 1.5, "height_level": 1.5})
+        self.assertGreater(float(np.max(np.abs(ambix_sub[:, 0]))), 0.1)
+        self.assertEqual(float(np.max(np.abs(ambix_sub[:, 1:]))), 0.0)
+
+        # 4) 真後ろ (azimuth=180°) ＆ 頭上 (elevation=75°) 動的オブジェクト検証
+        wav_rear = self._write_wav("obj_rear.wav", noise)
+        wav_over = self._write_wav("obj_overhead.wav", noise)
+        scene_360 = {
+            "duration_sec": dur,
+            "sample_rate": SAMPLE_RATE,
+            "room": {"rt60_sec": 0.35, "size": "medium"},
+            "world_360": {"enabled": True, "rear_level": 1.25, "height_level": 1.25},
+            "objects": [
+                {
+                    "id": "rear_obj",
+                    "role": "sfx_impact",
+                    "audio_path": str(wav_rear),
+                    "is_bed": False,
+                    "keyframes": [{"t_sec": 0.0, "azimuth_deg": 180.0, "elevation_deg": 0.0, "distance_m": 2.0}],
+                },
+                {
+                    "id": "over_obj",
+                    "role": "sfx_impact",
+                    "audio_path": str(wav_over),
+                    "is_bed": False,
+                    "keyframes": [{"t_sec": 0.0, "azimuth_deg": 0.0, "elevation_deg": 75.0, "distance_m": 2.0}],
+                },
+            ],
+        }
+        atmos_out = atmos.render_scene(scene_360)
+        s714 = atmos_out["surround_714"]
+        self.assertTrue(np.isfinite(atmos_out["binaural"]).all())
+        self.assertLess(abs(_measure_lr_diff_db(atmos_out["binaural"])), 0.8)
+        # Rear (6,7) および Top (8..11) が Front (0,1,2) を十分に上回る
+        front_e = float(np.sum(s714[:, [0, 1, 2]] ** 2))
+        rear_e = float(np.sum(s714[:, [6, 7]] ** 2))
+        top_e = float(np.sum(s714[:, [8, 9, 10, 11]] ** 2))
+        self.assertGreater(rear_e, front_e * 0.5)
+        self.assertGreater(top_e, front_e * 0.5)
+
+        ambi_out = ambi.render_scene(scene_360)
+        self.assertTrue(np.isfinite(ambi_out["binaural"]).all())
+        self.assertLess(abs(_measure_lr_diff_db(ambi_out["binaural"])), 0.8)
 
 
 if __name__ == "__main__":

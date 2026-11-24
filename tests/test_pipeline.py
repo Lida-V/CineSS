@@ -31,7 +31,7 @@ import cv2
 import numpy as np
 import soundfile as sf
 
-from app.audio.foley_engine import MISSING_FOLEY_MESSAGE, find_hunyuan_foley, generate_foley
+from app.audio.foley_engine import MISSING_FOLEY_MESSAGE, build_foley_prompt, find_hunyuan_foley, generate_foley
 from app.audio.sfx_splitter import split_sfx_layers
 from app.audio.speaker_splitter import (
     apply_dialog_pan_mode_to_keyframes,
@@ -44,7 +44,7 @@ from app.director import (
     build_auto_director_plan,
     validate_director_plan,
 )
-from app.pipeline import apply_director_plan_and_remix, remix_job, run_job
+from app.pipeline import apply_director_plan_and_remix, inspect_video_world, remix_job, run_job
 from app.spatial.adm_bwf import validate_adm_bwf
 from app.spatial.mastering import measure_lufs
 from app.vision.analyzer import (
@@ -974,6 +974,147 @@ class TestCineSSPipeline(unittest.TestCase):
         self.assertTrue(Path(r2["binaural_output_mp4"]).is_file())
         ctx_after = json.loads((job_dir / "work" / "director_context.json").read_text(encoding="utf-8"))
         self.assertEqual(ctx_after["director_plan"]["source"], "test_custom_director")
+
+    def test_13_world_360_flyby_director_coords_and_inspect_world(self) -> None:
+        """360°ワールドプロファイル・フライバイ検出・監督360°座標冪等適用・inspect_video_world を検証する。"""
+        # 1) 画面中央から右端へ急接近通過 ＋ 上端へ急上昇する合成動画を生成
+        fps = 12
+        frames: list[np.ndarray] = []
+        # 前半 (0..11): 明るい屋外空背景上で物体が中央→右端へ拡大しながら高速移動
+        for fi in range(12):
+            img = np.full((240, 426, 3), (210, 175, 120), dtype=np.uint8)
+            img[:90, :, 0] = 235  # 上部に青空風帯域
+            cx = 175 + fi * 21
+            rad = 26 + fi * 4
+            cv2.circle(img, (min(420, cx), 128), rad, (40, 80, 220), -1)
+            cv2.rectangle(img, (max(0, cx - 22), 95), (min(425, cx + 22), 160), (20, 230, 240), 3)
+            frames.append(img)
+        # 後半 (12..23): 上部エリアで中央から上端へ高速上昇移動
+        for fi in range(12):
+            img = np.full((240, 426, 3), (210, 175, 120), dtype=np.uint8)
+            img[:90, :, 0] = 235
+            cy = max(10, 86 - fi * 7)
+            cv2.circle(img, (213, cy), 30, (30, 90, 235), -1)
+            frames.append(img)
+
+        vid_fly = _encode_frames_to_mp4(frames, fps, self.root / "world360_flyby.mp4")
+
+        vr = analyze_video_spatial(vid_fly, sample_fps=12.0)
+        wp = vr.get("world_profile") or {}
+        flybys = vr.get("flyby_events") or []
+        self.assertIn("environment_type", wp)
+        self.assertIn("rear_immersion_strength", wp)
+        self.assertIn("sky_overhead_presence", wp)
+        self.assertTrue(wp.get("foley_world_hints"))
+        kinds = {e.get("kind") for e in flybys}
+        self.assertTrue(
+            "side_rear_right" in kinds or "overhead_pass" in kinds,
+            f"画面外通過イベントが未検出でした: {flybys}",
+        )
+
+        # 2) inspect_video_world の返却・コンタクトシート・Foleyプロンプト検証
+        insp_dir = self.root / "world_inspect_out"
+        w_info = inspect_video_world(vid_fly, out_dir=insp_dir, sample_fps=8.0, max_frames=6)
+        self.assertTrue(w_info["ok"])
+        self.assertTrue(Path(w_info["director_sheet_path"]).is_file())
+        self.assertTrue(w_info["suggested_foley_prompt"])
+        self.assertIn("360°", w_info["spatial_360_guide_ja"])
+
+        # build_foley_prompt の 360° 環境 + 物体ヒント結合検証
+        built_prompt = build_foley_prompt(
+            vr.get("scene_summary"),
+            user_prompt="雨",
+            world_profile=wp,
+            scene_objects_hint="two speeding cars, metallic collision",
+        )
+        self.assertIn("rain", built_prompt)
+        self.assertIn("two speeding cars, metallic collision", built_prompt)
+        self.assertTrue(any(h in built_prompt for h in wp["foley_world_hints"]))
+
+        # 3) AI監督 360°座標制御（後方 -135°・頭上 +65°・world_360）＆ 2回連続完全冪等リミックス
+        auto_w360 = build_auto_director_plan(
+            vr,
+            sfx_info={"impact_events": [{"t_sec": 0.4, "peak_db": -10.0, "dominant_side": "right"}]},
+            enable_world_360=True,
+        )
+        self.assertTrue((auto_w360.get("world_360") or {}).get("enabled"))
+        self.assertGreaterEqual((auto_w360["world_360"]).get("rear_level", 0.0), 1.0)
+
+        # 軽量E2Eジョブを作成しカスタム360°プランを2回適用して波形完全一致を検証
+        dur = 1.6
+        n_s = int(dur * SAMPLE_RATE)
+        t_ax = np.arange(n_s, dtype=np.float64) / SAMPLE_RATE
+        speech = (0.28 * np.sin(2.0 * math.pi * 240.0 * t_ax)).astype(np.float32)
+        imp_noise = np.random.default_rng(99).standard_normal(n_s).astype(np.float32) * 0.25
+        stereo_src = np.stack([speech + imp_noise * 0.4, speech + imp_noise * 0.8], axis=1).astype(np.float32)
+        wav_src = self.root / "w360_src.wav"
+        sf.write(str(wav_src), stereo_src, SAMPLE_RATE, subtype="FLOAT")
+
+        f_list = [np.full((180, 320, 3), (40, 44, 52), dtype=np.uint8) for _ in range(16)]
+        vid_job = _encode_frames_to_mp4(f_list, 10, self.root / "w360_job.mp4", audio_wav=wav_src)
+
+        job_dir = self.root / "job_world360_idemp"
+        r0 = run_job(
+            job_dir,
+            {
+                "video_path": str(vid_job),
+                "mode": "voiced",
+                "spatial_format": "atmos",
+                "quality_preset": "fast",
+                "target_lufs": -18.0,
+                "enable_dereverb": False,
+                "force_dsp_fallback": True,
+                "enable_sfx_multilayer": True,
+                "enable_director": True,
+                "enable_world_360": True,
+            },
+        )
+        self.assertTrue(r0["ok"])
+        self.assertTrue(r0["enable_world_360"])
+
+        custom_360_plan = {
+            "source": "custom_360_director",
+            "summary_ja": "真後ろ通過＆頭上ハイト360°検証プラン",
+            "world_360": {
+                "enabled": True,
+                "environment_type": "outdoor_night_action",
+                "environment_label_ja": "夜間・暗所アクション空間",
+                "rear_level": 1.38,
+                "height_level": 1.30,
+                "surround_wrap": 0.90,
+                "rt60_sec": 0.58,
+            },
+            "tracks": {
+                "sfx_impact": [
+                    {"t_sec": 0.0, "azimuth_deg": -135.0, "elevation_deg": 65.0, "distance_m": 1.4, "gain_db": 3.0, "duck_exempt": True},
+                    {"t_sec": dur, "azimuth_deg": 135.0, "elevation_deg": 20.0, "distance_m": 1.8, "gain_db": 2.0, "duck_exempt": True},
+                ],
+                "sfx_impact_left": [
+                    {"t_sec": 0.0, "azimuth_deg": -135.0, "elevation_deg": 65.0, "distance_m": 1.4, "gain_db": 3.0, "duck_exempt": True},
+                    {"t_sec": dur, "azimuth_offset_deg": -25.0, "elevation_deg": 35.0, "distance_m": 1.7, "gain_db": 2.5, "duck_exempt": True},
+                ],
+                "ambience": [
+                    {"t_sec": 0.0, "gain_db": 1.5, "duck_exempt": True},
+                ],
+            },
+        }
+        res_1 = apply_director_plan_and_remix(job_dir, custom_360_plan)
+        scene_1 = json.loads((job_dir / "scene.json").read_text(encoding="utf-8"))
+        wav_1, _ = sf.read(res_1["binaural_wav"], dtype="float64")
+
+        res_2 = apply_director_plan_and_remix(job_dir, custom_360_plan)
+        scene_2 = json.loads((job_dir / "scene.json").read_text(encoding="utf-8"))
+        wav_2, _ = sf.read(res_2["binaural_wav"], dtype="float64")
+
+        self.assertEqual(scene_1["world_360"], scene_2["world_360"])
+        self.assertEqual(scene_1["objects"], scene_2["objects"])
+        self.assertAlmostEqual(float(np.max(np.abs(wav_1 - wav_2))), 0.0, places=6)
+        imp_objs = [o for o in scene_2["objects"] if o.get("role") == "sfx_impact"]
+        self.assertTrue(imp_objs)
+        self.assertTrue(
+            any(abs(float(k.get("azimuth_deg", 0.0))) >= 110.0 and float(k.get("elevation_deg", 0.0)) >= 50.0 for o in imp_objs for k in (o.get("keyframes") or [])),
+            f"360° 真後ろ・頭上座標が反映されていません: {imp_objs[0].get('keyframes')}",
+        )
 
 
 if __name__ == "__main__":

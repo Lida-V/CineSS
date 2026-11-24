@@ -435,9 +435,10 @@ class TestRealSystemAndInfrastructure(unittest.TestCase):
             "ciness_cancel_job",
             "ciness_get_director_context",
             "ciness_apply_director_plan",
+            "ciness_inspect_video_world",
         }
         self.assertEqual(names, expected)
-        self.assertEqual(len(listed["tools"]), 8)
+        self.assertEqual(len(listed["tools"]), 9)
 
     def test_foley_env_detection_and_shutdown_endpoint(self) -> None:
         from fastapi.testclient import TestClient

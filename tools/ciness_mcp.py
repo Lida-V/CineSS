@@ -11,6 +11,7 @@
 - ciness_cancel_job: 実行中/待機中ジョブのキャンセル
 - ciness_get_director_context: シーン温度・SFX4層・監督コンテキストとコンタクトシートURLを取得
 - ciness_apply_director_plan: AIダビング監督プランを適用して空間リミックスを再実行
+- ciness_inspect_video_world: 処理前に動画の 360° 環境・画面外通過候補・コンタクトシート・Foley推奨プロンプトを高速事前解析
 """
 from __future__ import annotations
 
@@ -41,6 +42,7 @@ try:
         _validate_job_id,
         cmd_apply_director,
         cmd_director_context,
+        cmd_inspect_world,
         cmd_run_job,
         cmd_start_server,
         cmd_status,
@@ -55,6 +57,7 @@ except ImportError:
         _validate_job_id,
         cmd_apply_director,
         cmd_director_context,
+        cmd_inspect_world,
         cmd_run_job,
         cmd_start_server,
         cmd_status,
@@ -167,13 +170,31 @@ TOOLS: list[dict[str, Any]] = [
                 "job_id": {"type": "string", "description": "対象の job_id"},
                 "director_plan": {
                     "type": "object",
-                    "description": "適用する監督プランJSONオブジェクト（keyframes / notes 等）",
+                    "description": (
+                        "適用する監督プランJSONオブジェクト（tracks/keyframes で gain_db, distance_m, "
+                        "azimuth_deg [-180..+180], elevation_deg [-90..+90], azimuth_offset_deg, "
+                        "elevation_offset_deg, duck_exempt とトップレベル world_360 を制御可能）"
+                    ),
                 },
                 "server_url": {"type": "string", "description": "省略時は http://127.0.0.1:8780"},
             },
             ["job_id", "director_plan"],
         ),
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+    },
+    {
+        "name": "ciness_inspect_video_world",
+        "description": "処理前に動画の 360° 世界環境（屋外/夜間/室内/広間・後方包囲/頭上ハイト）、画面外通過（フライバイ）候補、代表フレームコンタクトシート画像、および推奨 Foley プロンプトを高速解析して返す。",
+        "inputSchema": _schema(
+            {
+                "video_path": {"type": "string", "description": "解析対象のローカル動画ファイルパス"},
+                "out_dir": {"type": "string", "description": "コンタクトシート保存先ディレクトリ（省略時は一時ディレクトリ）"},
+                "sample_fps": {"type": "number", "description": "映像サンプリングFPS（既定 4.0）"},
+                "max_frames": {"type": "integer", "description": "コンタクトシート最大コマ数（1〜8、既定 8）"},
+            },
+            ["video_path"],
+        ),
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
     },
 ]
 
@@ -392,6 +413,20 @@ class CineSSMcpServer:
     ) -> dict[str, Any]:
         return cmd_apply_director(job_id, director_plan, server_url=server_url)
 
+    def inspect_video_world(
+        self,
+        video_path: str,
+        out_dir: str | None = None,
+        sample_fps: float = 4.0,
+        max_frames: int = 8,
+    ) -> dict[str, Any]:
+        return cmd_inspect_world(
+            video_path,
+            out_dir=out_dir,
+            sample_fps=float(sample_fps),
+            max_frames=int(max_frames),
+        )
+
 
 class ProtocolError(Exception):
     def __init__(self, code: int, message: str) -> None:
@@ -418,8 +453,9 @@ def dispatch(request: Any, server: CineSSMcpServer) -> dict[str, Any] | None:
             "instructions": (
                 "ローカル映像サラウンドMixMaster＆バイノーラル出力アプリ CineSS。"
                 "まず ciness_status で環境確認し、ciness_start_server でWeb UIを起動する。"
+                "必要に応じて ciness_inspect_video_world で処理前に動画の360°世界環境・コンタクトシート・物体ヒントを確認できる。"
                 "ユーザーがWeb UIで「▶ 処理開始」を押したら ciness_wait_job → ciness_claim_and_run_job → ciness_job_status で完了まで伴走する。"
-                "完了後は ciness_get_director_context でシーン温度・コンタクトシートを確認し、必要に応じて ciness_apply_director_plan で監督リミックスを調整できる。"
+                "完了後は ciness_get_director_context でシーン温度・360°環境・コンタクトシートを確認し、ciness_apply_director_plan で 360°方位角(±180°)/仰角(±90°)含む監督リミックスを調整できる。"
                 "推論時の暗黙モデルダウンロードは行わない。"
             ),
         }
@@ -439,6 +475,7 @@ def dispatch(request: Any, server: CineSSMcpServer) -> dict[str, Any] | None:
         "ciness_cancel_job": server.cancel_job,
         "ciness_get_director_context": server.get_director_context,
         "ciness_apply_director_plan": server.apply_director_plan,
+        "ciness_inspect_video_world": server.inspect_video_world,
     }
     name = params.get("name")
     args = params.get("arguments", {})

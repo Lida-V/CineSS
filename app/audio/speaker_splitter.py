@@ -805,8 +805,11 @@ def _match_speakers_to_persons(
                 conf = round(max(0.15, min(0.99, 0.5 + 0.5 * sc)), 3)
                 matched_person_by_sp[si] = (pi, conf)
 
-    # オフスクリーン話者配置用の水平角プリセット（cinema / immersive）
+    # オフスクリーン話者配置用の水平角プリセット（cinema / immersive + 画面内人物有り時の360°画面外配置）
     unmatched_indices = [i for i in range(n_sp) if i not in matched_person_by_sp]
+    has_matched_person = bool(matched_person_by_sp)
+    use_immersive_surround = (mode == "immersive") and has_matched_person
+    immersive_360_slot = [-78.0, 78.0, -112.0, 112.0, -64.0, 64.0]
     if len(unmatched_indices) >= 2:
         cinema_slot = [-14.0, 14.0, -20.0, 20.0, -10.0, 10.0, -22.0, 22.0]
         immersive_slot = [-22.0, 22.0, -34.0, 34.0, -42.0, 42.0, -12.0, 12.0]
@@ -850,12 +853,19 @@ def _match_speakers_to_persons(
             sp["mean_elevation_deg"] = round(float(np.mean([k["elevation_deg"] for k in kfs])), 2)
             sp["mean_distance_m"] = float(person.get("mean_distance_m", 2.0))
         else:
-            az_raw = immersive_slot[off_counter % len(immersive_slot)]
-            az = offscreen_slot[off_counter % len(offscreen_slot)]
-            dist = 1.6 if len(unmatched_indices) == 1 else 2.0
+            if use_immersive_surround:
+                az_raw = immersive_360_slot[off_counter % len(immersive_360_slot)]
+                az = az_raw
+                dist = 2.4
+                off_label = "オフスクリーン（画面外360°）"
+            else:
+                az_raw = immersive_slot[off_counter % len(immersive_slot)]
+                az = offscreen_slot[off_counter % len(offscreen_slot)]
+                dist = 1.6 if len(unmatched_indices) == 1 else 2.0
+                off_label = "オフスクリーン / ナレーション"
             off_counter += 1
             sp["matched_person_id"] = None
-            sp["matched_person_label"] = "オフスクリーン / ナレーション"
+            sp["matched_person_label"] = off_label
             sp["match_confidence"] = 0.0
             sp["is_offscreen"] = True
             sp["raw_keyframes"] = [{"t": 0.0, "azimuth_deg": az_raw, "elevation_deg": 0.0, "distance_m": dist}]
