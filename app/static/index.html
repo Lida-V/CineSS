@@ -44,6 +44,10 @@
         <button id="btn-open-models" class="btn btn-outline-cyan" type="button" title="SoundSeparator共有モデルおよびCineSS追加モデルの管理">
           <span class="btn-icon">📦</span> AIモデル管理
         </button>
+
+        <button id="btn-shutdown-app" class="btn btn-danger-outline" type="button" title="CineSS サーバーと待機エージェントを停止して終了">
+          <span class="btn-icon">⏻</span> アプリ停止
+        </button>
       </div>
     </div>
   </header>
@@ -879,6 +883,15 @@
       <div id="models-modal-body" class="modal-body">
         <div class="loading-placeholder">モデルカタログを読み込んでいます…</div>
       </div>
+    </div>
+  </div>
+
+  <!-- アプリ停止完了オーバーレイ -->
+  <div id="shutdown-overlay" class="shutdown-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="shutdown-overlay-title">
+    <div class="shutdown-card">
+      <div class="shutdown-icon">⏻</div>
+      <h2 id="shutdown-overlay-title">CineSS を停止しました</h2>
+      <p>サーバーと待機エージェントを終了しました。<br>このブラウザタブは閉じて構いません。</p>
     </div>
   </div>
 

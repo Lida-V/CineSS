@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 from pathlib import Path
 
@@ -273,7 +274,17 @@ class TestCineSSPipeline(unittest.TestCase):
 
     def test_03_foley_missing_model_and_preview_fallback(self) -> None:
         s_analysis = analyze_video_spatial(self.silent_video, sample_fps=4.0)
-        if not find_hunyuan_foley()["available"]:
+        unavail = {
+            "available": False,
+            "weights_found": False,
+            "root": None,
+            "code_dir": None,
+            "infer_script": None,
+            "python_exe": None,
+            "hf_home": None,
+            "variants": {"XXL": None, "XL": None},
+        }
+        with mock.patch("app.audio.foley_engine.find_hunyuan_foley", return_value=unavail):
             with self.assertRaises(RuntimeError) as ctx:
                 generate_foley(
                     self.silent_video,
@@ -283,13 +294,13 @@ class TestCineSSPipeline(unittest.TestCase):
                 )
             self.assertIn(MISSING_FOLEY_MESSAGE, str(ctx.exception))
 
-        fb = generate_foley(
-            self.silent_video,
-            self.root / "foley_preview.wav",
-            scene_analysis=s_analysis,
-            user_prompt="風と移動音",
-            allow_preview_fallback=True,
-        )
+            fb = generate_foley(
+                self.silent_video,
+                self.root / "foley_preview.wav",
+                scene_analysis=s_analysis,
+                user_prompt="風と移動音",
+                allow_preview_fallback=True,
+            )
         self.assertEqual(fb["method"], "motion_synth_preview")
         self.assertTrue(Path(fb["audio_wav"]).is_file())
         self.assertTrue(Path(fb["sfx_mono_wav"]).is_file())
@@ -441,18 +452,29 @@ class TestCineSSPipeline(unittest.TestCase):
 
     def test_06_run_job_silent_foley_e2e(self) -> None:
         job_dir = self.root / "job_silent_foley"
-        res = run_job(
-            job_dir,
-            {
-                "video_path": str(self.silent_video),
-                "mode": "auto",
-                "spatial_format": "atmos",
-                "quality_preset": "fast",
-                "target_lufs": -18.0,
-                "foley_prompt": "smooth whoosh motion across room",
-                "allow_foley_fallback": True,
-            },
-        )
+        unavail = {
+            "available": False,
+            "weights_found": False,
+            "root": None,
+            "code_dir": None,
+            "infer_script": None,
+            "python_exe": None,
+            "hf_home": None,
+            "variants": {"XXL": None, "XL": None},
+        }
+        with mock.patch("app.audio.foley_engine.find_hunyuan_foley", return_value=unavail):
+            res = run_job(
+                job_dir,
+                {
+                    "video_path": str(self.silent_video),
+                    "mode": "auto",
+                    "spatial_format": "atmos",
+                    "quality_preset": "fast",
+                    "target_lufs": -18.0,
+                    "foley_prompt": "smooth whoosh motion across room",
+                    "allow_foley_fallback": True,
+                },
+            )
         self.assertTrue(res["ok"])
         self.assertEqual(res["mode"], "silent_foley")
         self.assertTrue(Path(res["binaural_output_mp4"]).is_file())

@@ -35,7 +35,14 @@ APP_ROOT = Path(__file__).resolve().parent.parent
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
-from app.config import AGENT_STATE_PATH, DEFAULT_PORT, JOBS_DIR, OUTPUT_DIR, ensure_directories  # noqa: E402
+from app.config import (  # noqa: E402
+    AGENT_STATE_PATH,
+    DEFAULT_PORT,
+    JOBS_DIR,
+    OUTPUT_DIR,
+    SHUTDOWN_FLAG_PATH,
+    ensure_directories,
+)
 from app.hardware_advisor import check_system  # noqa: E402
 from app.model_manager import list_models  # noqa: E402
 
@@ -563,14 +570,42 @@ def cmd_watch(
 
     last_result: dict[str, Any] = {"status": "stopped", "processed_jobs": 0}
     processed = 0
+    consecutive_failures = 0
 
     try:
         while not stop_event.is_set():
+            if SHUTDOWN_FLAG_PATH.is_file():
+                print(
+                    "[ciness-agent] アプリ停止要求を検知したため待機ランナーを終了します。",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                last_result = {"status": "shutdown", "processed_jobs": processed}
+                break
+
             try:
                 resp = _http_json("GET", f"{url}/api/agent/next", timeout=5.0)
+                consecutive_failures = 0
+                if isinstance(resp, dict) and resp.get("shutdown"):
+                    print(
+                        "[ciness-agent] サーバーから停止シグナルを受信したため待機ランナーを終了します。",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    last_result = {"status": "shutdown", "processed_jobs": processed}
+                    break
                 job = _extract_job_payload(resp)
             except Exception:
                 job = None
+                consecutive_failures += 1
+                if consecutive_failures >= 6:
+                    print(
+                        "[ciness-agent] サーバー停止（連続接続失敗）を検知したため待機ランナーを終了します。",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    last_result = {"status": "server_gone", "processed_jobs": processed}
+                    break
 
             if job is not None:
                 job_id = str(job["job_id"])

@@ -15,6 +15,7 @@ JOBS_DIR = OUTPUT_DIR / "jobs"
 MODELS_DIR = APP_ROOT / "models"
 ENGINE_DIR = APP_ROOT / "engine"
 AGENT_STATE_PATH = OUTPUT_DIR / "_agent_state.json"
+SHUTDOWN_FLAG_PATH = OUTPUT_DIR / "_shutdown.flag"
 
 SAMPLE_RATE = 48000
 
@@ -58,6 +59,42 @@ def find_soundseparator_dir() -> Path | None:
     for candidate in candidates:
         try:
             if candidate.is_dir():
+                return candidate.resolve()
+        except OSError:
+            continue
+    return None
+
+
+def _looks_like_foley_dir(path: Path) -> bool:
+    return (
+        (path / "app" / "infer.py").is_file()
+        or (path / "infer.py").is_file()
+        or (path / "models").is_dir()
+    )
+
+
+def find_hunyuan_foley_dir() -> Path | None:
+    """ローカルに導入済みの HunyuanVideo-Foley ディレクトリを探索する。
+
+    優先順:
+    1. 環境変数 `HUNYUAN_FOLEY_DIR`
+    2. `engine/hunyuan_foley`
+    3. 隣接 `../HunyuanVideo-Foley`
+    4. Windows 標準配置 `C:/AI/HunyuanVideo-Foley`
+    """
+    candidates: list[Path] = []
+    env_dir = os.environ.get("HUNYUAN_FOLEY_DIR")
+    if env_dir:
+        candidates.append(Path(env_dir).expanduser())
+    candidates.append(ENGINE_DIR / "hunyuan_foley")
+    candidates.append(ENGINE_DIR / "HunyuanVideo-Foley")
+    candidates.append(APP_ROOT.parent / "HunyuanVideo-Foley")
+    if os.name == "nt":
+        candidates.append(Path("C:/AI/HunyuanVideo-Foley"))
+
+    for candidate in candidates:
+        try:
+            if candidate.is_dir() and _looks_like_foley_dir(candidate):
                 return candidate.resolve()
         except OSError:
             continue

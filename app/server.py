@@ -28,6 +28,7 @@ import threading
 import time
 import traceback
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
@@ -46,6 +47,7 @@ from app.config import (  # noqa: E402
     DEFAULT_PORT,
     JOBS_DIR,
     OUTPUT_DIR,
+    SHUTDOWN_FLAG_PATH,
 )
 
 STATIC_DIR = BASE_DIR / "static"
@@ -136,6 +138,10 @@ class AgentCompleteRequest(BaseModel):
     error: Optional[str] = None
     message: Optional[str] = None
     actor: str = "agent"
+
+
+class ShutdownRequest(BaseModel):
+    force: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -797,9 +803,19 @@ def _download_model_worker(model_id: str) -> None:
 # ---------------------------------------------------------------------------
 # FastAPI アプリケーション定義
 # ---------------------------------------------------------------------------
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    try:
+        SHUTDOWN_FLAG_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
+    yield
+
+
 app = FastAPI(
     title="CineSS — 映像サラウンドMixMaster & バイノーラルスタジオ",
     version="1.0.0",
+    lifespan=_lifespan,
 )
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -825,6 +841,44 @@ def api_health() -> dict[str, Any]:
         "agent_name": agent["agent_name"],
         "active_job_id": agent["active_job_id"],
         "server_time": _now_ts(),
+    }
+
+
+@app.post("/api/system/shutdown")
+def api_system_shutdown(req: Optional[ShutdownRequest] = Body(default=None)):
+    """Web UI からの停止操作を受け、待機エージェントとサーバー自身を安全に終了する。"""
+    payload = req or ShutdownRequest()
+    running = [
+        st
+        for st in _list_all_job_states()
+        if st.get("status") in ("agent_running", "local_running", "remixing")
+    ]
+    if running and not payload.force:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": f"処理中のジョブが {len(running)} 件あります。強制停止しますか？",
+                "running_jobs": [str(r.get("job_id")) for r in running],
+            },
+        )
+
+    _atomic_write_json(
+        SHUTDOWN_FLAG_PATH,
+        {"requested_at": _now_ts(), "requested_at_iso": _now_iso(), "force": bool(payload.force)},
+    )
+    if AGENT_STATE_PATH.is_file():
+        _update_agent_state(status="offline", active_job_id=None)
+
+    if os.environ.get("CINESS_DISABLE_EXIT") != "1":
+        def _delayed_exit() -> None:
+            time.sleep(0.5)
+            os._exit(0)
+
+        threading.Thread(target=_delayed_exit, name="ciness-shutdown", daemon=True).start()
+
+    return {
+        "status": "shutting_down",
+        "message": "CineSS サーバーと待機エージェントを停止しています...",
     }
 
 
@@ -1403,6 +1457,8 @@ def api_agent_heartbeat(req: Optional[AgentHeartbeatRequest] = Body(default=None
 @app.get("/api/agent/next")
 def api_agent_next() -> dict[str, Any]:
     """最も古い queued_for_agent ジョブを1件返す（なければ {"job": null}）。"""
+    if SHUTDOWN_FLAG_PATH.is_file():
+        return {"job": None, "shutdown": True}
     with _state_lock:
         queued = [
             st

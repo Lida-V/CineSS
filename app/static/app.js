@@ -2127,6 +2127,78 @@
     }
   }
 
+  function stopAllTimers() {
+    [
+      "jobPollTimer",
+      "elapsedTimer",
+      "healthTimer",
+      "modelsPollTimer",
+    ].forEach((key) => {
+      if (state[key]) {
+        clearInterval(state[key]);
+        state[key] = null;
+      }
+    });
+    if (state.radarAnimFrame) {
+      cancelAnimationFrame(state.radarAnimFrame);
+      state.radarAnimFrame = null;
+    }
+  }
+
+  async function shutdownApp() {
+    if (!window.confirm("CineSS サーバーと待機エージェントを停止しますか？")) {
+      return;
+    }
+    const btn = $("btn-shutdown-app");
+    if (btn) btn.disabled = true;
+
+    const sendShutdown = async (forceFlag) => {
+      const resp = await fetch("/api/system/shutdown", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ force: Boolean(forceFlag) }),
+      });
+      let data = null;
+      try {
+        data = await resp.json();
+      } catch (_) {
+        data = null;
+      }
+      return { resp, data };
+    };
+
+    try {
+      let { resp, data } = await sendShutdown(false);
+      if (resp.status === 409) {
+        const msg = (data && data.detail) || "処理中のジョブがあります。強制停止しますか？";
+        if (!window.confirm(`${msg}\n強制的に停止してよろしいですか？`)) {
+          if (btn) btn.disabled = false;
+          return;
+        }
+        ({ resp, data } = await sendShutdown(true));
+      }
+      if (!resp.ok) {
+        const detail = (data && (data.detail || data.error || data.message)) || `HTTP ${resp.status}`;
+        throw new Error(detail);
+      }
+      stopAllTimers();
+      pauseStudioPlayback();
+      stopWebAudioNodes();
+      const badge = $("agent-status-badge");
+      const badgeText = $("agent-status-text");
+      if (badge && badgeText) {
+        badge.classList.remove("is-connected", "is-working");
+        badge.classList.add("is-offline");
+        badgeText.textContent = "CineSS 停止済み";
+      }
+      const overlay = $("shutdown-overlay");
+      if (overlay) overlay.classList.remove("hidden");
+    } catch (err) {
+      if (btn) btn.disabled = false;
+      showToast(`アプリの停止に失敗しました: ${err.message}`, "error");
+    }
+  }
+
   // --------------------------------------------------------------------------
   // イベント結線・初期化
   // --------------------------------------------------------------------------
@@ -2134,6 +2206,7 @@
     // ヘッダー
     $("btn-recheck-system").addEventListener("click", () => loadSystemCheck(true));
     $("btn-open-models").addEventListener("click", openModelsModal);
+    $("btn-shutdown-app").addEventListener("click", shutdownApp);
     $("btn-close-models").addEventListener("click", closeModelsModal);
     $("btn-refresh-models").addEventListener("click", loadModelsCatalog);
     $("models-modal").addEventListener("click", (e) => {

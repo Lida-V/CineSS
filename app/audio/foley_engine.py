@@ -27,7 +27,7 @@ import numpy as np
 import soundfile as sf
 from scipy.signal import butter, resample_poly, sosfilt
 
-from app.config import ENGINE_DIR, MODELS_DIR, SAMPLE_RATE
+from app.config import ENGINE_DIR, MODELS_DIR, SAMPLE_RATE, find_hunyuan_foley_dir
 
 MISSING_FOLEY_MESSAGE = "HunyuanVideo-Foleyモデルが未取得です。モデル管理画面から取得してください"
 
@@ -128,42 +128,126 @@ def _has_weights(folder: Path) -> bool:
     return False
 
 
-def find_hunyuan_foley() -> dict[str, Any]:
-    """ローカルに導入された HunyuanVideo-Foley コード・重みの有無を検出する。"""
-    code_candidates = [
-        ENGINE_DIR / "hunyuan_foley",
-        ENGINE_DIR / "HunyuanVideo-Foley",
-        MODELS_DIR / "hunyuanvideo-foley",
-    ]
-    infer_script: Path | None = None
-    code_dir: Path | None = None
-    for cdir in code_candidates:
-        if not cdir.is_dir():
+def _detect_official_foley_variants(model_dirs: list[Path]) -> dict[str, str | None]:
+    """公式 HunyuanVideo-Foley 重み構成 (synchformer + vae + xl/xxl) または汎用フォールバックを検出する。"""
+    variants: dict[str, str | None] = {"XXL": None, "XL": None}
+    for mdir in model_dirs:
+        if not mdir.is_dir():
             continue
-        for script_name in ("infer.py", "inference.py", "generate.py", "predict.py"):
-            cand = cdir / script_name
-            if cand.is_file():
-                code_dir = cdir
-                infer_script = cand
+        has_shared = (mdir / "synchformer_state_dict.pth").is_file() and (mdir / "vae_128d_48k.pth").is_file()
+        if has_shared:
+            if variants["XXL"] is None and (mdir / "hunyuanvideo_foley.pth").is_file():
+                variants["XXL"] = str(mdir)
+            if variants["XL"] is None and (mdir / "hunyuanvideo_foley_xl.pth").is_file():
+                variants["XL"] = str(mdir)
+
+    # テスト・カスタム配置互換: xxl / xl サブフォルダ配下に *.pth 等が置かれている場合も拾う
+    for mdir in model_dirs:
+        if variants["XXL"] is None and mdir.name.lower() == "xxl" and _has_weights(mdir):
+            variants["XXL"] = str(mdir)
+        if variants["XL"] is None and mdir.name.lower() == "xl" and _has_weights(mdir):
+            variants["XL"] = str(mdir)
+    return variants
+
+
+def find_hunyuan_foley(
+    models_root: Path | None = None,
+    check_external: bool | None = None,
+) -> dict[str, Any]:
+    """ローカルに導入された HunyuanVideo-Foley コード・専用venv・HFキャッシュ・重みの有無を検出する。"""
+    use_external = (models_root is None) if check_external is None else bool(check_external)
+    active_models_root = models_root or MODELS_DIR
+
+    root_candidates: list[Path] = []
+    if use_external:
+        ext = find_hunyuan_foley_dir()
+        if ext is not None:
+            root_candidates.append(ext)
+        root_candidates.extend(
+            [
+                ENGINE_DIR / "hunyuan_foley",
+                ENGINE_DIR / "HunyuanVideo-Foley",
+            ]
+        )
+    root_candidates.append(active_models_root / "hunyuanvideo-foley")
+
+    seen_roots: set[Path] = set()
+    ordered_roots: list[Path] = []
+    for rc in root_candidates:
+        try:
+            resolved = rc.resolve()
+        except OSError:
+            resolved = rc
+        if resolved not in seen_roots and rc.is_dir():
+            seen_roots.add(resolved)
+            ordered_roots.append(rc)
+
+    root_dir: Path | None = None
+    code_dir: Path | None = None
+    infer_script: Path | None = None
+    for rc in ordered_roots:
+        for cdir in (rc / "app", rc):
+            if not cdir.is_dir():
+                continue
+            for script_name in ("infer.py", "inference.py", "generate.py", "predict.py"):
+                cand = cdir / script_name
+                if cand.is_file():
+                    root_dir = rc
+                    code_dir = cdir
+                    infer_script = cand
+                    break
+            if infer_script:
                 break
         if infer_script:
             break
 
-    xxl_candidates = [MODELS_DIR / "hunyuanvideo-foley" / "xxl", MODELS_DIR / "hunyuanvideo-foley"]
-    xl_candidates = [MODELS_DIR / "hunyuanvideo-foley" / "xl"]
+    model_dirs: list[Path] = []
+    if root_dir is not None:
+        model_dirs.extend(
+            [
+                root_dir / "models" / "HunyuanVideo-Foley",
+                root_dir / "models",
+            ]
+        )
+    model_dirs.extend(
+        [
+            active_models_root / "hunyuanvideo-foley" / "HunyuanVideo-Foley",
+            active_models_root / "hunyuanvideo-foley" / "xxl",
+            active_models_root / "hunyuanvideo-foley" / "xl",
+            active_models_root / "hunyuanvideo-foley",
+        ]
+    )
 
-    xxl_dir = next((p for p in xxl_candidates if _has_weights(p)), None)
-    xl_dir = next((p for p in xl_candidates if _has_weights(p)), None)
+    variants = _detect_official_foley_variants(model_dirs)
+    # 従来の単一ディレクトリ配置フォールバック
+    if variants["XXL"] is None and variants["XL"] is None:
+        fallback_dir = active_models_root / "hunyuanvideo-foley"
+        if _has_weights(fallback_dir):
+            variants["XXL"] = str(fallback_dir)
+
+    python_exe = sys.executable
+    hf_home: str | None = None
+    if root_dir is not None:
+        for py_cand in (
+            root_dir / ".venv" / "Scripts" / "python.exe",
+            root_dir / ".venv" / "bin" / "python",
+        ):
+            if py_cand.is_file():
+                python_exe = str(py_cand)
+                break
+        hf_cand = root_dir / "hf-cache"
+        if hf_cand.is_dir():
+            hf_home = str(hf_cand)
 
     return {
-        "available": bool(infer_script and (xxl_dir or xl_dir)),
-        "weights_found": bool(xxl_dir or xl_dir),
+        "available": bool(infer_script and (variants["XXL"] or variants["XL"])),
+        "weights_found": bool(variants["XXL"] or variants["XL"]),
+        "root": str(root_dir) if root_dir else None,
         "code_dir": str(code_dir) if code_dir else None,
         "infer_script": str(infer_script) if infer_script else None,
-        "variants": {
-            "XXL": str(xxl_dir) if xxl_dir else None,
-            "XL": str(xl_dir) if xl_dir else None,
-        },
+        "python_exe": python_exe,
+        "hf_home": hf_home,
+        "variants": variants,
     }
 
 
@@ -262,20 +346,32 @@ def _run_hunyuan_foley_inference(
             chunk_out_dir = tmp_dir / f"out_{ci:03d}"
             chunk_out_dir.mkdir(parents=True, exist_ok=True)
 
+            python_exe = str(info.get("python_exe") or sys.executable)
+            steps = "30" if quality == "fast" else "50"
             cmd = [
-                sys.executable,
+                python_exe,
                 "-X", "utf8",
-                info["infer_script"],
+                str(info["infer_script"]),
                 "--model_path", str(model_dir),
-                "--video_path", str(chunk_video),
-                "--prompt", prompt,
+                "--model_size", variant.lower(),
+                "--single_video", str(chunk_video),
+                "--single_prompt", prompt,
                 "--output_dir", str(chunk_out_dir),
+                "--num_inference_steps", steps,
+                "--guidance_scale", "4.5",
             ]
+            cfg_yaml = Path(str(info["code_dir"])) / "configs" / f"hunyuanvideo-foley-{variant.lower()}.yaml"
+            if cfg_yaml.is_file():
+                cmd += ["--config_path", str(cfg_yaml)]
             if enable_offload:
                 cmd.append("--enable_offload")
 
             env = os.environ.copy()
             env["PYTHONUTF8"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
+            if info.get("hf_home"):
+                env["HF_HOME"] = str(info["hf_home"])
+                env["HF_HUB_OFFLINE"] = "1"
             proc = subprocess.run(
                 cmd,
                 cwd=info["code_dir"],

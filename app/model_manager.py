@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
+import shutil
+import subprocess
 import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
 from typing import Callable
 
-from app.config import MODELS_DIR, find_soundseparator_dir
+from app.config import ENGINE_DIR, MODELS_DIR, find_soundseparator_dir
 
 ProgressCallback = Callable[[int, str], None]
 
@@ -310,7 +313,18 @@ def _resolve_model_status(
     local_root = models_root or MODELS_DIR
     files = spec.get("files") or []
 
-    # 1. CineSS 自身の models/ を確認
+    # 1. HunyuanVideo-Foley は専用推論コード＋専用重み/キャッシュを検出（models_root未指定時は外部導入環境も自動検出）
+    if spec["id"] in ("hunyuan_foley_xxl", "hunyuan_foley_xl"):
+        from app.audio.foley_engine import find_hunyuan_foley
+
+        foley_info = find_hunyuan_foley(models_root=models_root)
+        variant_key = "XXL" if spec["id"] == "hunyuan_foley_xxl" else "XL"
+        variant_path = foley_info.get("variants", {}).get(variant_key)
+        if foley_info.get("infer_script") and variant_path:
+            return "installed", Path(variant_path)
+        return "missing", None
+
+    # 2. CineSS 自身の models/ を確認
     if files:
         if all(_file_present(local_root, f) for f in files):
             first = local_root / files[0]["rel_path"]
@@ -428,6 +442,157 @@ def _fetch_file(
     raise RuntimeError(f"{target.name} の取得に失敗しました: {last_error}")
 
 
+def _download_hunyuan_foley(spec: dict, progress_cb: ProgressCallback | None = None) -> dict:
+    """HunyuanVideo-Foley の推論コード・独立 venv・モデル重み・補助エンコーダを取得構築する。"""
+    uv_bin = shutil.which("uv")
+    git_bin = shutil.which("git")
+    if not git_bin or not uv_bin:
+        missing = [name for name, path in (("git", git_bin), ("uv", uv_bin)) if not path]
+        raise RuntimeError(
+            f"{spec['label']} の自動セットアップには {', '.join(missing)} が必要です。"
+            "導入後に再試行するか、手動で環境を構築してください。"
+        )
+
+    try:
+        from huggingface_hub import snapshot_download  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            f"{spec['label']} の自動取得には huggingface_hub が必要です。\n"
+            "既存のCUDA版PyTorchを壊さないよう以下を実行してから再試行してください:\n"
+            "  uv pip install --python .venv huggingface-hub"
+        ) from exc
+
+    foley_root = ENGINE_DIR / "hunyuan_foley"
+    app_dir = foley_root / "app"
+    venv_dir = foley_root / ".venv"
+    venv_py = venv_dir / ("Scripts" if os.name == "nt" else "bin") / ("python.exe" if os.name == "nt" else "python")
+    model_dir = foley_root / "models" / "HunyuanVideo-Foley"
+    hf_hub_cache = foley_root / "hf-cache" / "hub"
+
+    foley_root.mkdir(parents=True, exist_ok=True)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    hf_hub_cache.mkdir(parents=True, exist_ok=True)
+
+    app_repo = "https://github.com/Tencent-Hunyuan/HunyuanVideo-Foley"
+    app_commit = "df7b005b5023df2a9b73e1d66dd51d452799884e"
+    model_repo = "tencent/HunyuanVideo-Foley"
+    model_rev = "3abd4e833b95b8db0fc9c687afc52483a48e9a97"
+    variant_file = "hunyuanvideo_foley.pth" if spec["id"] == "hunyuan_foley_xxl" else "hunyuanvideo_foley_xl.pth"
+
+    def _run_step(cmd: list[str], label: str) -> None:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if proc.returncode != 0:
+            tail = (proc.stderr or proc.stdout or "").strip()[-500:]
+            raise RuntimeError(f"{label} に失敗しました: {tail}")
+
+    # 1. 公式推論コード取得
+    _emit(progress_cb, 5, "HunyuanVideo-Foley 公式推論コードを取得しています...")
+    if not (app_dir / ".git").is_dir():
+        _run_step([git_bin, "clone", "--depth", "1", app_repo, str(app_dir)], "git clone")
+    head = subprocess.run(
+        [git_bin, "-C", str(app_dir), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    ).stdout.strip()
+    if head != app_commit:
+        _run_step([git_bin, "-C", str(app_dir), "fetch", "--depth", "1", "origin", app_commit], "git fetch")
+        _run_step([git_bin, "-C", str(app_dir), "checkout", app_commit], "git checkout")
+
+    # 2. 独立 Python 3.11 仮想環境構築（CineSS 本体の transformers 等と隔離）
+    _emit(progress_cb, 15, "HunyuanVideo-Foley 用 Python 3.11 環境を構築中...")
+    if not venv_py.is_file():
+        _run_step([uv_bin, "venv", "--python", "3.11", str(venv_dir)], "uv venv")
+
+    has_nvidia = bool(shutil.which("nvidia-smi"))
+    torch_index = "https://download.pytorch.org/whl/cu124" if has_nvidia else "https://download.pytorch.org/whl/cpu"
+    torch_pkgs = ["torch==2.6.0", "torchvision==0.21.0", "torchaudio==2.6.0"]
+    _emit(progress_cb, 22, "PyTorch と推論依存パッケージを導入しています...")
+    _run_step(
+        [uv_bin, "pip", "install", "--python", str(venv_py), *torch_pkgs, "--index-url", torch_index],
+        "PyTorch 導入",
+    )
+
+    req_src = app_dir / "requirements.txt"
+    if req_src.is_file():
+        skip_re = re.compile(r"^(black|isort|flake8|mypy|pre-commit|torch|torchvision|torchaudio)\b")
+        lines = [
+            ln for ln in req_src.read_text(encoding="utf-8", errors="replace").splitlines()
+            if ln.strip() and not skip_re.match(ln.strip())
+        ]
+        runtime_req = foley_root / "requirements.runtime.txt"
+        runtime_req.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        _run_step(
+            [
+                uv_bin, "pip", "install", "--python", str(venv_py),
+                "-r", str(runtime_req), "soundfile", *torch_pkgs,
+                "--extra-index-url", torch_index, "--index-strategy", "unsafe-best-match",
+            ],
+            "HunyuanVideo-Foley 依存パッケージ導入",
+        )
+
+    # 3. 本体・Synchformer・VAE 重みのダウンロード
+    _emit(progress_cb, 40, f"{spec['label']} 重みを HuggingFace から取得しています（大容量）...")
+    allow_models = [variant_file, "synchformer_state_dict.pth", "vae_128d_48k.pth", "LICENSE", "NOTICE"]
+    try:
+        snapshot_download(
+            repo_id=model_repo,
+            revision=model_rev,
+            local_dir=str(model_dir),
+            allow_patterns=allow_models,
+            max_workers=1,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"HuggingFace からの {spec['label']} 重み取得に失敗しました: {exc}\n"
+            f"ネットワーク接続・ディスク空き容量（目安 {spec['download_mb'] / 1024:.1f} GB以上）を確認してください。"
+        ) from exc
+
+    # 4. 補助エンコーダ（SigLIP2 / CLAP）を専用 hf-cache へ取得し refs/main を設定
+    encoders = [
+        (
+            "google/siglip2-base-patch16-512",
+            "a89f5c5093f902bf39d3cd4d81d2c09867f0724b",
+            ["config.json", "preprocessor_config.json", "model.safetensors"],
+            75,
+        ),
+        (
+            "laion/larger_clap_general",
+            "ada0c23a36c4e8582805bb38fec3905903f18b41",
+            [
+                "config.json", "preprocessor_config.json", "pytorch_model.bin",
+                "merges.txt", "vocab.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json",
+            ],
+            88,
+        ),
+    ]
+    for repo_id, rev, allow_pats, pct in encoders:
+        _emit(progress_cb, pct, f"補助エンコーダ ({repo_id}) を取得しています...")
+        snap_path = Path(
+            snapshot_download(
+                repo_id=repo_id,
+                revision=rev,
+                cache_dir=str(hf_hub_cache),
+                allow_patterns=allow_pats,
+                max_workers=1,
+            )
+        )
+        ref_main = snap_path.parents[1] / "refs" / "main"
+        ref_main.parent.mkdir(parents=True, exist_ok=True)
+        ref_main.write_text(rev, encoding="ascii")
+
+    _emit(progress_cb, 100, f"{spec['label']} の構築と取得が完了しました")
+    new_status, new_path = _resolve_model_status(spec)
+    return {
+        "id": spec["id"],
+        "label": spec["label"],
+        "status": new_status,
+        "path": str(new_path) if new_path else str(model_dir),
+        "message": f"{spec['label']} の構築と取得が完了しました。",
+    }
+
+
 def download_model(model_id: str, progress_cb: ProgressCallback | None = None) -> dict:
     """指定モデルを明示的に取得する。推論処理から暗黙呼び出ししてはならない。"""
     spec = next((s for s in _catalog_specs() if s["id"] == model_id), None)
@@ -447,6 +612,9 @@ def download_model(model_id: str, progress_cb: ProgressCallback | None = None) -
             "path": str(existing),
             "message": label,
         }
+
+    if model_id in ("hunyuan_foley_xxl", "hunyuan_foley_xl"):
+        return _download_hunyuan_foley(spec, progress_cb=progress_cb)
 
     files = spec.get("files") or []
     if files:

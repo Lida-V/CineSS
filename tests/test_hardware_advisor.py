@@ -421,6 +421,61 @@ class TestRealSystemAndInfrastructure(unittest.TestCase):
         }
         self.assertEqual(names, expected)
 
+    def test_foley_env_detection_and_shutdown_endpoint(self) -> None:
+        from fastapi.testclient import TestClient
+        from app.audio.foley_engine import find_hunyuan_foley
+        from app.server import app
+
+        config.ensure_directories()
+        # 1. 一時的な擬似 HunyuanVideo-Foley ディレクトリでの検出テスト
+        with tempfile.TemporaryDirectory(dir=str(config.OUTPUT_DIR)) as tmp:
+            root = Path(tmp)
+            (root / "app").mkdir(parents=True)
+            (root / "app" / "infer.py").write_text("# dummy", encoding="utf-8")
+            (root / "hf-cache").mkdir()
+            mdir = root / "models" / "HunyuanVideo-Foley"
+            mdir.mkdir(parents=True)
+            for fname in (
+                "hunyuanvideo_foley.pth",
+                "hunyuanvideo_foley_xl.pth",
+                "synchformer_state_dict.pth",
+                "vae_128d_48k.pth",
+            ):
+                (mdir / fname).write_bytes(b"WEIGHT")
+
+            with mock.patch.dict(os.environ, {"HUNYUAN_FOLEY_DIR": str(root)}):
+                info = find_hunyuan_foley()
+                self.assertTrue(info["available"])
+                self.assertEqual(Path(info["infer_script"]).name, "infer.py")
+                self.assertEqual(info["hf_home"], str(root.resolve() / "hf-cache"))
+                self.assertIsNotNone(info["variants"]["XXL"])
+                self.assertIsNotNone(info["variants"]["XL"])
+
+        # 2. 実機に C:/AI/HunyuanVideo-Foley が存在する環境ならそれも自動検出されること
+        if Path("C:/AI/HunyuanVideo-Foley/app/infer.py").is_file():
+            real_info = find_hunyuan_foley()
+            self.assertTrue(real_info["available"])
+            self.assertTrue(real_info["variants"]["XXL"] or real_info["variants"]["XL"])
+
+        # 3. POST /api/system/shutdown と停止フラグ・エージェント通知確認（exit 無効化下）
+        flag = config.SHUTDOWN_FLAG_PATH
+        had_flag = flag.is_file()
+        try:
+            with mock.patch.dict(os.environ, {"CINESS_DISABLE_EXIT": "1"}):
+                client = TestClient(app)
+                resp = client.post("/api/system/shutdown", json={"force": False})
+                self.assertEqual(resp.status_code, 200)
+                body = resp.json()
+                self.assertEqual(body["status"], "shutting_down")
+                self.assertTrue(flag.is_file())
+
+                nxt = client.get("/api/agent/next")
+                self.assertEqual(nxt.status_code, 200)
+                self.assertTrue(nxt.json().get("shutdown"))
+        finally:
+            if not had_flag:
+                flag.unlink(missing_ok=True)
+
 
 if __name__ == "__main__":
     unittest.main()

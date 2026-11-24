@@ -33,6 +33,7 @@ engine/
 
 # 出力・ジョブ・メディア生成物
 output/
+test_videos/
 *.wav
 *.mp4
 *.mov
