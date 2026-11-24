@@ -271,6 +271,7 @@ def _apply_dynamic_distance_mono(
     rt60_sec: float,
     sample_rate: int = SAMPLE_RATE,
     block_size: int = 2048,
+    role: str = "sfx",
 ) -> tuple[np.ndarray, np.ndarray]:
     """距離減衰＋距離依存空気吸収 LPF を Hann 窓 50% オーバーラップでモノラル信号へ滑らかに適用する。"""
     x = np.asarray(mono_audio, dtype=np.float32).reshape(-1)
@@ -304,9 +305,9 @@ def _apply_dynamic_distance_mono(
 
         seg_w = seg * window
         dist = float(dist_arr[i])
-        g_dir = distance_direct_gain(dist)
-        g_rev = distance_reverb_send(dist, rt60_sec=rt60_sec)
-        h_air = air_absorption_response(freqs, dist)
+        g_dir = distance_direct_gain(dist, role=role)
+        g_rev = distance_reverb_send(dist, rt60_sec=rt60_sec, role=role)
+        h_air = air_absorption_response(freqs, dist, role=role)
 
         spec = np.fft.rfft(seg_w, n=n_fft)
         y = np.fft.irfft(spec * h_air * g_dir, n=n_fft)[: block_size + 128]
@@ -530,12 +531,14 @@ class AmbisonicsRenderer:
                     else np.mean(audio_fit, axis=1, dtype=np.float64).astype(np.float32)
                 )
                 keyframes = obj.get("keyframes")
+                role = str(obj.get("role", "sfx"))
                 direct_mono, rev_send = _apply_dynamic_distance_mono(
                     mono,
                     keyframes=keyframes,
                     gain_db=gain_db,
                     rt60_sec=rt60_sec,
                     sample_rate=self.sample_rate,
+                    role=role,
                 )
                 ambix_mix += self.encode_point_source(direct_mono, keyframes=keyframes)
                 reverb_bus_mono += rev_send

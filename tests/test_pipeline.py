@@ -31,10 +31,15 @@ import numpy as np
 import soundfile as sf
 
 from app.audio.foley_engine import MISSING_FOLEY_MESSAGE, find_hunyuan_foley, generate_foley
-from app.audio.speaker_splitter import split_speakers
+from app.audio.speaker_splitter import (
+    apply_dialog_pan_mode_to_keyframes,
+    map_dialog_azimuth,
+    split_speakers,
+)
 from app.config import SAMPLE_RATE
 from app.pipeline import remix_job, run_job
 from app.spatial.adm_bwf import validate_adm_bwf
+from app.spatial.mastering import measure_lufs
 from app.vision.analyzer import analyze_video_spatial, inspect_video
 
 
@@ -512,6 +517,182 @@ class TestCineSSPipeline(unittest.TestCase):
             self.assertEqual(r_sr, SAMPLE_RATE)
             self.assertEqual(wav.ndim, 1, "話者出力は48kHzモノラルであるべきです")
             self.assertTrue(np.isfinite(wav).all())
+
+    def test_08_dialog_pan_mode_cinema_vs_immersive_and_match_original(self) -> None:
+        """dialog_pan_mode (cinema vs immersive) と loudness_mode=match_original (run_job & remix_job) を検証する。"""
+        _json = __import__("json")
+
+        # 1) 定位写像関数とキーフレーム適用（元配列非破壊）の単体確認
+        self.assertEqual(map_dialog_azimuth(28.0, "immersive"), 28.0)
+        cin_28 = map_dialog_azimuth(28.0, "cinema")
+        self.assertGreater(cin_28, 10.0)
+        self.assertLessEqual(cin_28, 24.0)
+
+        raw_kfs = [{"t": 0.0, "azimuth_deg": -32.0, "elevation_deg": 2.0, "distance_m": 1.8}]
+        cin_kfs = apply_dialog_pan_mode_to_keyframes(raw_kfs, "cinema")
+        imm_kfs = apply_dialog_pan_mode_to_keyframes(raw_kfs, "immersive")
+        self.assertEqual(raw_kfs[0]["azimuth_deg"], -32.0)
+        self.assertEqual(imm_kfs[0]["azimuth_deg"], -32.0)
+        self.assertGreater(cin_kfs[0]["azimuth_deg"], -24.5)
+        self.assertLess(cin_kfs[0]["azimuth_deg"], -10.0)
+
+        # 2) split_speakers での cinema vs immersive 角度差とオフスクリーン分散・raw_keyframes 保持
+        sr = SAMPLE_RATE
+        dur = 2.4
+        n = int(dur * sr)
+        t = np.arange(n, dtype=np.float64) / sr
+        sp1 = _synth_voice_wave(t, 130.0, [(1, 1.0), (2, 0.8), (4, 0.6)], 3.2)
+        sp2 = _synth_voice_wave(t, 285.0, [(1, 0.8), (2, 1.0), (5, 0.6)], 4.0)
+        mono_dlg = np.zeros(n, dtype=np.float32)
+        mono_dlg[int(0.15 * sr):int(1.05 * sr)] = sp1[int(0.15 * sr):int(1.05 * sr)]
+        mono_dlg[int(1.30 * sr):int(2.25 * sr)] = sp2[int(1.30 * sr):int(2.25 * sr)]
+        dlg_dir = self.root / "pan_mode_split"
+        dlg_dir.mkdir(parents=True, exist_ok=True)
+        dlg_wav = dlg_dir / "dialog.wav"
+        sf.write(str(dlg_wav), np.stack([mono_dlg, mono_dlg], axis=1), sr, subtype="FLOAT")
+
+        dummy_tracks = [
+            {
+                "person_id": "person_0",
+                "label": "人物1（左）",
+                "mean_azimuth_deg": -34.0,
+                "mean_elevation_deg": 0.0,
+                "mean_distance_m": 1.8,
+                "keyframes": [
+                    {"t": 0.1, "azimuth_deg": -34.0, "elevation_deg": 0.0, "distance_m": 1.8, "mouth_activity": 0.85},
+                    {"t": 1.0, "azimuth_deg": -34.0, "elevation_deg": 0.0, "distance_m": 1.8, "mouth_activity": 0.85},
+                    {"t": 1.3, "azimuth_deg": -34.0, "elevation_deg": 0.0, "distance_m": 1.8, "mouth_activity": 0.05},
+                    {"t": 2.2, "azimuth_deg": -34.0, "elevation_deg": 0.0, "distance_m": 1.8, "mouth_activity": 0.05},
+                ],
+            },
+            {
+                "person_id": "person_1",
+                "label": "人物2（右）",
+                "mean_azimuth_deg": 34.0,
+                "mean_elevation_deg": 0.0,
+                "mean_distance_m": 1.8,
+                "keyframes": [
+                    {"t": 0.1, "azimuth_deg": 34.0, "elevation_deg": 0.0, "distance_m": 1.8, "mouth_activity": 0.05},
+                    {"t": 1.0, "azimuth_deg": 34.0, "elevation_deg": 0.0, "distance_m": 1.8, "mouth_activity": 0.05},
+                    {"t": 1.3, "azimuth_deg": 34.0, "elevation_deg": 0.0, "distance_m": 1.8, "mouth_activity": 0.85},
+                    {"t": 2.2, "azimuth_deg": 34.0, "elevation_deg": 0.0, "distance_m": 1.8, "mouth_activity": 0.85},
+                ],
+            },
+        ]
+        res_cin = split_speakers(dlg_wav, dlg_dir / "cin", vision_tracks=dummy_tracks, force_fallback=True, dialog_pan_mode="cinema")
+        res_imm = split_speakers(dlg_wav, dlg_dir / "imm", vision_tracks=dummy_tracks, force_fallback=True, dialog_pan_mode="immersive")
+        self.assertEqual(len(res_cin["speakers"]), 2)
+        self.assertEqual(len(res_imm["speakers"]), 2)
+        for s_c, s_i in zip(res_cin["speakers"], res_imm["speakers"]):
+            self.assertTrue(s_c.get("raw_keyframes"))
+            self.assertLess(abs(s_c["mean_azimuth_deg"]), abs(s_i["mean_azimuth_deg"]) - 5.0)
+            self.assertLessEqual(abs(s_c["mean_azimuth_deg"]), 24.0)
+            self.assertGreater(abs(s_i["mean_azimuth_deg"]), 28.0)
+
+        # オフスクリーン複数話者の cinema vs immersive プリセット確認
+        off_cin = split_speakers(dlg_wav, dlg_dir / "off_cin", vision_tracks=None, force_fallback=True, dialog_pan_mode="cinema")
+        off_imm = split_speakers(dlg_wav, dlg_dir / "off_imm", vision_tracks=None, force_fallback=True, dialog_pan_mode="immersive")
+        self.assertEqual([abs(sp["mean_azimuth_deg"]) for sp in off_cin["speakers"][:2]], [14.0, 14.0])
+        self.assertEqual([abs(sp["mean_azimuth_deg"]) for sp in off_imm["speakers"][:2]], [22.0, 22.0])
+
+        # 3) run_job (match_original + cinema + ducking=True) の LUFS 整合＆scene保存確認
+        job_dir = self.root / "job_match_original"
+        res = run_job(
+            job_dir,
+            {
+                "video_path": str(self.voiced_video),
+                "mode": "voiced",
+                "spatial_format": "atmos",
+                "quality_preset": "fast",
+                "loudness_mode": "match_original",
+                "dialog_pan_mode": "cinema",
+                "enable_dialog_ducking": True,
+                "enable_dereverb": False,
+                "force_dsp_fallback": True,
+            },
+        )
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["loudness_mode"], "match_original")
+        self.assertEqual(res["dialog_pan_mode"], "cinema")
+        self.assertTrue(res["enable_dialog_ducking"])
+        self.assertIsNotNone(res["original_lufs"])
+
+        expected_lufs = max(-24.0, min(-11.0, float(res["original_lufs"])))
+        self.assertAlmostEqual(float(res["effective_target_lufs"]), expected_lufs, delta=0.1)
+
+        bin_data, bin_sr = sf.read(res["binaural_wav"], dtype="float32", always_2d=True)
+        out_lufs = measure_lufs(bin_data, sample_rate=bin_sr)
+        self.assertAlmostEqual(out_lufs, expected_lufs, delta=1.2, msg=f"match_original LUFS誤差過大: out={out_lufs:.2f}, expected={expected_lufs:.2f}")
+
+        scene = _json.loads((job_dir / "scene.json").read_text(encoding="utf-8"))
+        self.assertEqual(scene["mix_settings"]["dialog_pan_mode"], "cinema")
+        self.assertEqual(scene["mix_settings"]["loudness_mode"], "match_original")
+        dialog_objs = [o for o in scene["objects"] if o.get("role") == "dialog" and o.get("raw_keyframes")]
+        self.assertGreaterEqual(len(dialog_objs), 2)
+        for obj in dialog_objs:
+            self.assertLessEqual(abs(obj["keyframes"][0]["azimuth_deg"]), 24.0)
+            self.assertGreater(abs(obj["raw_keyframes"][0]["azimuth_deg"]), 24.0)
+
+        # 4) remix_job での固定→match_original 復帰と recompute_dialog_pan=True (immersive)
+        remix_fixed = remix_job(job_dir, scene, spatial_format="atmos", loudness_mode="fixed", target_lufs=-24.0)
+        fixed_data, f_sr = sf.read(remix_fixed["binaural_wav"], dtype="float32", always_2d=True)
+        self.assertAlmostEqual(measure_lufs(fixed_data, sample_rate=f_sr), -24.0, delta=1.2)
+
+        scene_recompute = _json.loads((job_dir / "scene.json").read_text(encoding="utf-8"))
+        scene_recompute["recompute_dialog_pan"] = True
+        remix_match = remix_job(
+            job_dir,
+            scene_recompute,
+            spatial_format="atmos",
+            target_lufs="match_original",
+            loudness_mode="match_original",
+            dialog_pan_mode="immersive",
+            enable_dialog_ducking=False,
+        )
+        self.assertEqual(remix_match["loudness_mode"], "match_original")
+        self.assertEqual(remix_match["dialog_pan_mode"], "immersive")
+        self.assertFalse(remix_match["enable_dialog_ducking"])
+        match_data, m_sr = sf.read(remix_match["binaural_wav"], dtype="float32", always_2d=True)
+        match_lufs = measure_lufs(match_data, sample_rate=m_sr)
+        self.assertAlmostEqual(match_lufs, expected_lufs, delta=1.2, msg=f"remix match_original LUFS誤差過大: out={match_lufs:.2f}, expected={expected_lufs:.2f}")
+
+        scene_after = _json.loads((job_dir / "scene.json").read_text(encoding="utf-8"))
+        self.assertNotIn("recompute_dialog_pan", scene_after)
+        self.assertEqual(scene_after["mix_settings"]["dialog_pan_mode"], "immersive")
+        self.assertFalse(scene_after["mix_settings"]["enable_dialog_ducking"])
+        for obj in scene_after["objects"]:
+            if obj.get("role") == "dialog" and obj.get("raw_keyframes"):
+                self.assertGreater(abs(obj["keyframes"][0]["azimuth_deg"]), 24.0)
+
+    def test_09_anime_skin_fallback_conservative(self) -> None:
+        """Haar/通常顔検出が0件のアニメ調動画では連続>=3フレームで補助検出し、単発フラッシュは弾く。"""
+        fps = 6
+        # ケースA: 非対称の横向きアニメ風肌領域が6フレーム連続で存在
+        frames_a: list[np.ndarray] = []
+        for fi in range(8):
+            img = np.full((360, 640, 3), (34, 38, 46), dtype=np.uint8)
+            if 1 <= fi <= 6:
+                # 画面左寄りの上部に非対称なアニメ調頭部肌色＋濃い目の線
+                cv2.ellipse(img, (210, 145), (42, 48), 0, 0, 360, (165, 192, 232), -1)
+                cv2.line(img, (185, 130), (205, 130), (35, 32, 40), 3)
+                cv2.line(img, (188, 170), (205, 170), (45, 40, 60), 2)
+            frames_a.append(img)
+        vid_a = _encode_frames_to_mp4(frames_a, fps, self.root / "anime_fallback_hit.mp4")
+        res_a = analyze_video_spatial(vid_a, sample_fps=6.0)
+        self.assertEqual(len(res_a["person_tracks"]), 1, f"連続アニメ調人物は1名検出されるべき: {res_a['person_tracks']}")
+        self.assertLess(res_a["person_tracks"][0]["mean_azimuth_deg"], -5.0)
+
+        # ケースB: 単発1フレームの暖色フラッシュは連続>=3フレーム条件で除外される
+        frames_b: list[np.ndarray] = []
+        for fi in range(8):
+            img = np.full((360, 640, 3), (34, 38, 46), dtype=np.uint8)
+            if fi == 3:
+                cv2.ellipse(img, (210, 145), (42, 48), 0, 0, 360, (165, 192, 232), -1)
+                cv2.line(img, (185, 130), (205, 130), (35, 32, 40), 3)
+            frames_b.append(img)
+        vid_b = _encode_frames_to_mp4(frames_b, fps, self.root / "anime_fallback_flash.mp4")
+        res_b = analyze_video_spatial(vid_b, sample_fps=6.0)
+        self.assertEqual(len(res_b["person_tracks"]), 0, "単発フラッシュを誤検出すべきではありません")
 
 
 if __name__ == "__main__":

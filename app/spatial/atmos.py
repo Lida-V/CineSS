@@ -220,6 +220,7 @@ def _apply_distance_to_object_mono(
     rt60_sec: float,
     sample_rate: int = SAMPLE_RATE,
     block_size: int = 2048,
+    role: str = "sfx",
 ) -> tuple[np.ndarray, np.ndarray]:
     """オブジェクト音声へ距離減衰・空気吸収LPFを滑らかに適用し、直接音とリバーブセンドを返す。"""
     x = np.asarray(mono_audio, dtype=np.float32).reshape(-1)
@@ -253,9 +254,9 @@ def _apply_distance_to_object_mono(
 
         seg_w = seg * window
         dist = float(dist_arr[i])
-        g_dir = distance_direct_gain(dist)
-        g_rev = distance_reverb_send(dist, rt60_sec=rt60_sec)
-        h_air = air_absorption_response(freqs, dist)
+        g_dir = distance_direct_gain(dist, role=role)
+        g_rev = distance_reverb_send(dist, rt60_sec=rt60_sec, role=role)
+        h_air = air_absorption_response(freqs, dist, role=role)
 
         spec = np.fft.rfft(seg_w, n=n_fft)
         y = np.fft.irfft(spec * h_air * g_dir, n=n_fft)[: block_size + 128]
@@ -514,6 +515,7 @@ class AtmosRenderer:
                 gain_db=gain_db,
                 rt60_sec=rt60_sec,
                 sample_rate=self.sample_rate,
+                role=role,
             )
             reverb_bus_mono += rev_send
 
@@ -525,6 +527,7 @@ class AtmosRenderer:
                 rt60_sec=rt60_sec,
                 block_size=2048,
                 apply_distance=True,
+                role=role,
             )
             binaural_direct += obj_bin
 

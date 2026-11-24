@@ -42,6 +42,40 @@ from app.config import MODELS_DIR, SAMPLE_RATE
 SPEAKER_LETTERS = "ABCDEFGH"
 SPEAKER_NAMES = [f"話者{c}" for c in SPEAKER_LETTERS]
 
+DIALOG_PAN_MODES = ("cinema", "immersive")
+CINEMA_DIALOG_PAN_LIMIT_DEG = 22.0
+
+
+def _normalize_dialog_pan_mode(dialog_pan_mode: str | None) -> str:
+    mode = str(dialog_pan_mode or "cinema").strip().lower()
+    if mode == "immersive":
+        return "immersive"
+    return "cinema"
+
+
+def map_dialog_azimuth(azimuth_deg: float, dialog_pan_mode: str = "cinema") -> float:
+    """映像水平角をセリフ定位モード（cinema: ±22°センター軸 / immersive: 原角）へ写像する。"""
+    az = max(-180.0, min(180.0, float(azimuth_deg)))
+    mode = _normalize_dialog_pan_mode(dialog_pan_mode)
+    if mode == "immersive":
+        return round(az, 2)
+    limit = CINEMA_DIALOG_PAN_LIMIT_DEG
+    return round(limit * math.tanh(az / limit), 2)
+
+
+def apply_dialog_pan_mode_to_keyframes(
+    raw_keyframes: list[dict[str, Any]],
+    dialog_pan_mode: str = "cinema",
+) -> list[dict[str, Any]]:
+    """原角キーフレーム列へセリフ定位モードを適用した新しいキーフレーム列を返す。"""
+    mode = _normalize_dialog_pan_mode(dialog_pan_mode)
+    mapped: list[dict[str, Any]] = []
+    for kf in raw_keyframes or []:
+        new_kf = dict(kf)
+        new_kf["azimuth_deg"] = map_dialog_azimuth(float(kf.get("azimuth_deg", 0.0)), mode)
+        mapped.append(new_kf)
+    return mapped
+
 
 def _emit_progress(cb: Callable[..., Any] | None, pct: float, message: str) -> None:
     if not cb:
@@ -675,8 +709,10 @@ def _match_speakers_to_persons(
     speaker_items: list[dict[str, Any]],
     vision_tracks: list[dict[str, Any]] | None,
     duration_sec: float,
+    dialog_pan_mode: str = "cinema",
 ) -> None:
     """口元モーション活性度の時間相関＋ステレオ定位補助で話者↔人物を自動対応付ける。"""
+    mode = _normalize_dialog_pan_mode(dialog_pan_mode)
     tracks = vision_tracks or []
     n_sp = len(speaker_items)
     n_p = len(tracks)
@@ -728,21 +764,22 @@ def _match_speakers_to_persons(
                 conf = round(max(0.15, min(0.99, 0.5 + 0.5 * sc)), 3)
                 matched_person_by_sp[si] = (pi, conf)
 
-    # オフスクリーン話者配置用の自然な水平角プリセット
-    offscreen_angles = [0.0, -18.0, 18.0, -32.0, 32.0, -42.0, 42.0, 0.0]
+    # オフスクリーン話者配置用の水平角プリセット（cinema / immersive）
     unmatched_indices = [i for i in range(n_sp) if i not in matched_person_by_sp]
     if len(unmatched_indices) >= 2:
-        # 複数オフスクリーン話者は中央を避けて左右へ微分散
-        offscreen_slot = [-18.0, 18.0, -32.0, 32.0, -42.0, 42.0, -10.0, 10.0]
+        cinema_slot = [-14.0, 14.0, -20.0, 20.0, -10.0, 10.0, -22.0, 22.0]
+        immersive_slot = [-22.0, 22.0, -34.0, 34.0, -42.0, 42.0, -12.0, 12.0]
     else:
-        offscreen_slot = offscreen_angles
+        cinema_slot = [0.0]
+        immersive_slot = [0.0]
+    offscreen_slot = cinema_slot if mode == "cinema" else immersive_slot
 
     off_counter = 0
     for si, sp in enumerate(speaker_items):
         if si in matched_person_by_sp:
             pi, conf = matched_person_by_sp[si]
             person = tracks[pi]
-            kfs = [
+            raw_kfs = [
                 {
                     "t": float(k["t"]),
                     "azimuth_deg": float(k["azimuth_deg"]),
@@ -751,25 +788,28 @@ def _match_speakers_to_persons(
                 }
                 for k in person.get("keyframes", [])
             ]
-            if not kfs:
-                kfs = [{
+            if not raw_kfs:
+                raw_kfs = [{
                     "t": 0.0,
                     "azimuth_deg": float(person.get("mean_azimuth_deg", 0.0)),
                     "elevation_deg": float(person.get("mean_elevation_deg", 0.0)),
                     "distance_m": float(person.get("mean_distance_m", 2.0)),
                 }]
-            elif kfs[0]["t"] > 0.05:
-                kfs.insert(0, {**kfs[0], "t": 0.0})
+            elif raw_kfs[0]["t"] > 0.05:
+                raw_kfs.insert(0, {**raw_kfs[0], "t": 0.0})
 
+            kfs = apply_dialog_pan_mode_to_keyframes(raw_kfs, mode)
             sp["matched_person_id"] = person["person_id"]
             sp["matched_person_label"] = person.get("label", person["person_id"])
             sp["match_confidence"] = conf
             sp["is_offscreen"] = False
-            sp["mean_azimuth_deg"] = float(person.get("mean_azimuth_deg", 0.0))
-            sp["mean_elevation_deg"] = float(person.get("mean_elevation_deg", 0.0))
-            sp["mean_distance_m"] = float(person.get("mean_distance_m", 2.0))
+            sp["raw_keyframes"] = raw_kfs
             sp["keyframes"] = kfs
+            sp["mean_azimuth_deg"] = round(float(np.mean([k["azimuth_deg"] for k in kfs])), 2)
+            sp["mean_elevation_deg"] = round(float(np.mean([k["elevation_deg"] for k in kfs])), 2)
+            sp["mean_distance_m"] = float(person.get("mean_distance_m", 2.0))
         else:
+            az_raw = immersive_slot[off_counter % len(immersive_slot)]
             az = offscreen_slot[off_counter % len(offscreen_slot)]
             dist = 1.6 if len(unmatched_indices) == 1 else 2.0
             off_counter += 1
@@ -777,10 +817,11 @@ def _match_speakers_to_persons(
             sp["matched_person_label"] = "オフスクリーン / ナレーション"
             sp["match_confidence"] = 0.0
             sp["is_offscreen"] = True
+            sp["raw_keyframes"] = [{"t": 0.0, "azimuth_deg": az_raw, "elevation_deg": 0.0, "distance_m": dist}]
+            sp["keyframes"] = [{"t": 0.0, "azimuth_deg": az, "elevation_deg": 0.0, "distance_m": dist}]
             sp["mean_azimuth_deg"] = az
             sp["mean_elevation_deg"] = 0.0
             sp["mean_distance_m"] = dist
-            sp["keyframes"] = [{"t": 0.0, "azimuth_deg": az, "elevation_deg": 0.0, "distance_m": dist}]
 
 
 def split_speakers(
@@ -791,6 +832,7 @@ def split_speakers(
     force_fallback: bool = False,
     progress_cb: Callable[..., Any] | None = None,
     log_cb: Callable[..., Any] | None = None,
+    dialog_pan_mode: str = "cinema",
 ) -> dict[str, Any]:
     """セリフWAVを話者ごとの48kHzモノラルWAVへ分離し、映像人物と自動紐付けする。"""
     src = Path(dialog_wav)
@@ -798,6 +840,7 @@ def split_speakers(
     if not src.is_file():
         raise FileNotFoundError(f"セリフWAVが見つかりません: {src}")
     dst_dir.mkdir(parents=True, exist_ok=True)
+    norm_pan_mode = _normalize_dialog_pan_mode(dialog_pan_mode)
 
     audio, sr = sf.read(str(src), dtype="float32", always_2d=True)
     if sr != SAMPLE_RATE:
@@ -814,6 +857,7 @@ def split_speakers(
         return {
             "method": "silent_bypass",
             "overlap_method": "none",
+            "dialog_pan_mode": norm_pan_mode,
             "speakers": [],
             "turns": [],
             "overlap_wav": None,
@@ -899,7 +943,7 @@ def split_speakers(
 
     # --- Step 3: 話者 ↔ 映像人物の自動紐付け ---
     _emit_progress(progress_cb, 82, "口元モーション相関から話者と映像上の人物を自動紐付け中...")
-    _match_speakers_to_persons(speaker_items, vision_tracks, duration_sec)
+    _match_speakers_to_persons(speaker_items, vision_tracks, duration_sec, dialog_pan_mode=norm_pan_mode)
 
     # 内部作業キーを掃除してクリーンな返却JSONにする
     for sp in speaker_items:
@@ -909,13 +953,15 @@ def split_speakers(
     matched_count = sum(1 for sp in speaker_items if not sp.get("is_offscreen"))
     _emit_log(
         log_cb,
-        f"話者分離完了（方式={method}, 話者数={len(speaker_items)}, 映像人物紐付け={matched_count}名, 重なり処理={overlap_method}）。",
+        f"話者分離完了（方式={method}, 話者数={len(speaker_items)}, 映像人物紐付け={matched_count}名, "
+        f"定位モード={norm_pan_mode}, 重なり処理={overlap_method}）。",
     )
     _emit_progress(progress_cb, 100, f"話者分離完了（{len(speaker_items)}名）")
 
     return {
         "method": method,
         "overlap_method": overlap_method,
+        "dialog_pan_mode": norm_pan_mode,
         "speakers": speaker_items,
         "turns": turns,
         "overlap_wav": overlap_wav_path,

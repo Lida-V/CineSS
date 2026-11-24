@@ -1450,6 +1450,9 @@ body {
 
 .option-checks {
   margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .foley-options-box {
@@ -2179,7 +2182,7 @@ body {
 }
 
 .mt-val-sm {
-  font-size: 12.5px;
+  font-size: 12px;
   color: var(--text-primary);
 }
 
@@ -2472,10 +2475,8 @@ body {
 
 .remix-action-bar {
   display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
+  flex-direction: column;
   gap: 12px;
-  flex-wrap: wrap;
   padding: 12px 14px;
   border-radius: var(--radius-sm);
   background: rgba(245, 158, 11, 0.08);
@@ -2483,19 +2484,36 @@ body {
 }
 
 .remix-params {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
-  flex: 1;
-  min-width: 220px;
+  width: 100%;
 }
 
 .remix-params .field-group {
-  flex: 1;
+  min-width: 0;
+}
+
+.remix-params .field-span-2 {
+  grid-column: 1 / -1;
+}
+
+.remix-footer-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.remix-ducking-toggle {
+  font-size: 12.5px;
 }
 
 .btn-remix {
   padding: 10px 20px;
   font-size: 14px;
+  margin-left: auto;
 }
 
 .stems-drawer {
@@ -2834,6 +2852,7 @@ body {
   .radio-grid.cols-2,
   .ambi-order-grid,
   .settings-two-col,
+  .remix-params,
   .download-grid,
   .metrics-grid {
     grid-template-columns: 1fr;

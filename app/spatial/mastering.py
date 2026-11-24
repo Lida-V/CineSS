@@ -56,14 +56,139 @@ def _peaking_sos(center_hz: float, gain_db: float, q: float, sample_rate: int = 
     return np.array([[b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]], dtype=np.float64)
 
 
+def _apply_voice_compressor(y: np.ndarray, sample_rate: int) -> np.ndarray:
+    """映画ダビング準拠のセリフ用ボイスコンプレッサー（2ms RMS, -20dB, 2.5:1, ゲート-55dB, 自動メイクアップ）。"""
+    n = y.shape[0]
+    if n == 0 or float(np.max(np.abs(y))) < 1e-9:
+        return y
+
+    blk = max(1, int(round(0.002 * sample_rate)))
+    n_blks = int(math.ceil(n / blk))
+    pad = n_blks * blk - n
+    linked_sq = np.mean(y * y, axis=1)
+    if pad > 0:
+        linked_sq = np.pad(linked_sq, (0, pad), mode="edge")
+    rms_blk = np.sqrt(np.mean(linked_sq.reshape(n_blks, blk), axis=1))
+
+    att_a = math.exp(-float(blk) / max(1.0, 0.008 * sample_rate))
+    rel_a = math.exp(-float(blk) / max(1.0, 0.090 * sample_rate))
+    env = np.empty_like(rms_blk)
+    cur = float(rms_blk[0])
+    for i in range(n_blks):
+        v = float(rms_blk[i])
+        coeff = att_a if v > cur else rel_a
+        cur = coeff * cur + (1.0 - coeff) * v
+        env[i] = cur
+
+    env_db = 20.0 * np.log10(np.maximum(env, 1e-10))
+    gate_db = -55.0
+    voiced_mask = env_db > gate_db
+    if not np.any(voiced_mask):
+        return y
+
+    threshold_db = -20.0
+    ratio = 2.5
+    knee_db = 4.0
+    half_k = 0.5 * knee_db
+    slope = (1.0 / ratio) - 1.0
+
+    gr_db = np.zeros_like(env_db)
+    above = env_db >= (threshold_db + half_k)
+    in_knee = (env_db > (threshold_db - half_k)) & (~above)
+    gr_db[above] = slope * (env_db[above] - threshold_db)
+    gr_db[in_knee] = slope * ((env_db[in_knee] - threshold_db + half_k) ** 2) / (2.0 * knee_db)
+    gr_db[~voiced_mask] = 0.0
+
+    mean_gr_db = float(-np.mean(gr_db[voiced_mask]))
+    makeup_db = min(4.0, max(0.0, 0.65 * mean_gr_db))
+    total_db = np.where(voiced_mask, gr_db + makeup_db, 0.0)
+
+    gain_blk = 10.0 ** (total_db / 20.0)
+    blk_centers = (np.arange(n_blks, dtype=np.float64) + 0.5) * blk
+    gain_sample = np.interp(np.arange(n, dtype=np.float64), blk_centers, gain_blk)
+    return y * gain_sample[:, np.newaxis]
+
+
+def _apply_deesser(y: np.ndarray, sample_rate: int) -> np.ndarray:
+    """5.0〜9.5 kHz 歯擦音検出＆5.0〜10.0 kHz 相補 LR4 動的減衰ディエッサー（声の芯 100Hz〜4kHz 無劣化）。"""
+    n = y.shape[0]
+    if n == 0 or sample_rate < 22000 or float(np.max(np.abs(y))) < 1e-9:
+        return y
+
+    hi_det = min(9500.0, 0.45 * float(sample_rate))
+    if hi_det <= 5200.0:
+        return y
+
+    sos_det = signal.butter(2, [5000.0, hi_det], btype="bandpass", fs=sample_rate, output="sos")
+    sib_sig = signal.sosfilt(sos_det, y, axis=0)
+
+    blk = max(1, int(round(0.001 * sample_rate)))
+    n_blks = int(math.ceil(n / blk))
+    pad = n_blks * blk - n
+
+    sib_sq = np.mean(sib_sig * sib_sig, axis=1)
+    full_sq = np.mean(y * y, axis=1)
+    if pad > 0:
+        sib_sq = np.pad(sib_sq, (0, pad), mode="edge")
+        full_sq = np.pad(full_sq, (0, pad), mode="edge")
+
+    sib_rms = np.sqrt(np.mean(sib_sq.reshape(n_blks, blk), axis=1))
+    full_rms = np.sqrt(np.mean(full_sq.reshape(n_blks, blk), axis=1))
+
+    sib_db = 20.0 * np.log10(np.maximum(sib_rms, 1e-10))
+    sib_ratio = sib_rms / np.maximum(full_rms, 1e-10)
+
+    excess_db = np.maximum(0.0, sib_db - (-22.0))
+    ratio_weight = np.clip((sib_ratio - 0.25) / 0.20, 0.0, 1.0)
+    target_atten_db = np.minimum(6.0, excess_db * 0.75 * ratio_weight)
+
+    att_a = math.exp(-float(blk) / max(1.0, 0.003 * sample_rate))
+    rel_a = math.exp(-float(blk) / max(1.0, 0.045 * sample_rate))
+    atten_env = np.empty_like(target_atten_db)
+    cur = 0.0
+    for i in range(n_blks):
+        v = float(target_atten_db[i])
+        coeff = att_a if v > cur else rel_a
+        cur = coeff * cur + (1.0 - coeff) * v
+        atten_env[i] = cur
+
+    if float(np.max(atten_env)) < 1e-3:
+        return y
+
+    # 位相整合済み LR4 相補3バンド分割（5kHz・10kHz）で 5.0〜10.0kHz のみを動的減衰
+    hi_cut = min(10000.0, 0.45 * float(sample_rate))
+    sos_5k_lp = signal.butter(2, 5000.0, btype="lowpass", fs=sample_rate, output="sos")
+    sos_5k_hp = signal.butter(2, 5000.0, btype="highpass", fs=sample_rate, output="sos")
+    sos_10k_lp = signal.butter(2, hi_cut, btype="lowpass", fs=sample_rate, output="sos")
+    sos_10k_hp = signal.butter(2, hi_cut, btype="highpass", fs=sample_rate, output="sos")
+
+    y_low5 = signal.sosfilt(sos_5k_lp, signal.sosfilt(sos_5k_lp, y, axis=0), axis=0)
+    y_hi5 = signal.sosfilt(sos_5k_hp, signal.sosfilt(sos_5k_hp, y, axis=0), axis=0)
+
+    # 低域側にも 10kHz オールパスを通すことで 5kHz/10kHz クロス境界の位相を完全一致させる
+    y_low5_aligned = signal.sosfilt(sos_10k_lp, signal.sosfilt(sos_10k_lp, y_low5, axis=0), axis=0) + signal.sosfilt(
+        sos_10k_hp, signal.sosfilt(sos_10k_hp, y_low5, axis=0), axis=0
+    )
+    y_5_10k = signal.sosfilt(sos_10k_lp, signal.sosfilt(sos_10k_lp, y_hi5, axis=0), axis=0)
+    y_above_10k = signal.sosfilt(sos_10k_hp, signal.sosfilt(sos_10k_hp, y_hi5, axis=0), axis=0)
+
+    gain_blk = 10.0 ** (-atten_env / 20.0)
+    blk_centers = (np.arange(n_blks, dtype=np.float64) + 0.5) * blk
+    gain_sample = np.interp(np.arange(n, dtype=np.float64), blk_centers, gain_blk)
+
+    return y_low5_aligned + (y_5_10k * gain_sample[:, np.newaxis]) + y_above_10k
+
+
 def process_dialog_stem(
     audio: np.ndarray,
     sample_rate: int = SAMPLE_RATE,
     hpf_hz: float = 80.0,
-    presence_db: float = 1.5,
+    presence_db: float = 1.2,
     presence_hz: float = 3200.0,
+    enable_compressor: bool = True,
+    enable_deesser: bool = True,
 ) -> np.ndarray:
-    """セリフステム向け保護フィルタ（80Hz HPF ＋ 軽い 3.2kHz プレゼンス明瞭化）。"""
+    """映画ダビング準拠セリフ処理チェーン（80Hz HPF → ボイスコンプ → ディエッサー → 3.2kHz プレゼンス）。"""
     arr = np.asarray(audio, dtype=np.float32)
     if arr.size == 0 or float(np.max(np.abs(arr))) < 1e-9:
         return arr.copy()
@@ -71,8 +196,17 @@ def process_dialog_stem(
     orig_1d = arr.ndim == 1
     x = arr[:, np.newaxis].astype(np.float64) if orig_1d else arr.astype(np.float64)
 
-    sos_hpf = signal.butter(2, hpf_hz, btype="highpass", fs=sample_rate, output="sos")
-    y = signal.sosfilt(sos_hpf, x, axis=0)
+    if hpf_hz > 0.0 and hpf_hz < 0.45 * sample_rate:
+        sos_hpf = signal.butter(2, hpf_hz, btype="highpass", fs=sample_rate, output="sos")
+        y = signal.sosfilt(sos_hpf, x, axis=0)
+    else:
+        y = x.copy()
+
+    if enable_compressor:
+        y = _apply_voice_compressor(y, sample_rate=sample_rate)
+
+    if enable_deesser:
+        y = _apply_deesser(y, sample_rate=sample_rate)
 
     if abs(presence_db) > 1e-3 and presence_hz < 0.45 * sample_rate:
         sos_pres = _peaking_sos(presence_hz, presence_db, q=1.2, sample_rate=sample_rate)
@@ -80,6 +214,69 @@ def process_dialog_stem(
 
     out = y.astype(np.float32)
     return out[:, 0] if orig_1d else out
+
+
+def compute_dialog_ducking_gain(
+    dialog_mono: np.ndarray,
+    sample_rate: int = SAMPLE_RATE,
+    duck_db: float = -3.0,
+    threshold_db: float = -34.0,
+    attack_ms: float = 15.0,
+    release_ms: float = 220.0,
+    hold_ms: float = 40.0,
+) -> np.ndarray:
+    """セリフ合算モノラルから発話エンベロープを検出し、発話中のみ滑らかに duck_db 分減衰するゲイン曲線 (N,) を返す。"""
+    x = np.asarray(dialog_mono, dtype=np.float64).reshape(-1)
+    n = x.shape[0]
+    if n == 0:
+        return np.ones((0,), dtype=np.float32)
+
+    overall_rms = float(np.sqrt(np.mean(x * x)))
+    if overall_rms < 10.0 ** (-60.0 / 20.0) or duck_db >= -1e-4:
+        return np.ones((n,), dtype=np.float32)
+
+    blk = max(1, int(round(0.005 * sample_rate)))
+    n_blks = int(math.ceil(n / blk))
+    pad = n_blks * blk - n
+    sq = x * x
+    if pad > 0:
+        sq = np.pad(sq, (0, pad), mode="edge")
+    rms_blk = np.sqrt(np.mean(sq.reshape(n_blks, blk), axis=1))
+    rms_db = 20.0 * np.log10(np.maximum(rms_blk, 1e-10))
+
+    active = rms_db > float(threshold_db)
+    if not np.any(active):
+        return np.ones((n,), dtype=np.float32)
+
+    hold_blks = max(0, int(round(float(hold_ms) * 1e-3 * sample_rate / blk)))
+    held_active = active.copy()
+    if hold_blks > 0:
+        rem = 0
+        for i in range(n_blks):
+            if active[i]:
+                rem = hold_blks
+                held_active[i] = True
+            elif rem > 0:
+                held_active[i] = True
+                rem -= 1
+
+    target_db = np.where(held_active, float(duck_db), 0.0)
+    att_a = math.exp(-float(blk) / max(1.0, float(attack_ms) * 1e-3 * sample_rate))
+    rel_a = math.exp(-float(blk) / max(1.0, float(release_ms) * 1e-3 * sample_rate))
+
+    env_db = np.empty_like(target_db)
+    cur_db = 0.0
+    for i in range(n_blks):
+        t_val = float(target_db[i])
+        coeff = att_a if t_val < cur_db else rel_a
+        cur_db = coeff * cur_db + (1.0 - coeff) * t_val
+        env_db[i] = cur_db
+
+    gain_blk = 10.0 ** (env_db / 20.0)
+    blk_centers = (np.arange(n_blks, dtype=np.float64) + 0.5) * blk
+    gain_sample = np.interp(np.arange(n, dtype=np.float64), blk_centers, gain_blk)
+    min_gain = float(10.0 ** (float(duck_db) / 20.0))
+    return np.clip(gain_sample, min_gain, 1.0).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------

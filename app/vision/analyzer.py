@@ -497,6 +497,92 @@ class _DetectorBundle:
 
         return detections
 
+    @staticmethod
+    def detect_anime_skin_clusters(frame_bgr: np.ndarray) -> list[dict[str, Any]]:
+        """アニメ調等の人物向け保守的ウォーム肌色クラスタ検出（フォールバック専用）。"""
+        h, w = frame_bgr.shape[:2]
+        if h < 16 or w < 16:
+            return []
+        work_w = min(320, w)
+        work_h = max(16, int(round(h * (work_w / max(w, 1)))))
+        small = cv2.resize(frame_bgr, (work_w, work_h), interpolation=cv2.INTER_AREA) if work_w < w else frame_bgr
+        gray_s = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        ycrcb = cv2.cvtColor(small, cv2.COLOR_BGR2YCrCb)
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+
+        # 彩度・赤みの上限を抑えて炎や赤いエフェクト誤検出を抑制しつつアニメ肌色を抽出
+        mask_ycrcb = cv2.inRange(
+            ycrcb,
+            np.array([65, 133, 78], dtype=np.uint8),
+            np.array([250, 174, 128], dtype=np.uint8),
+        )
+        mask_hsv1 = cv2.inRange(
+            hsv,
+            np.array([0, 20, 70], dtype=np.uint8),
+            np.array([26, 175, 255], dtype=np.uint8),
+        )
+        mask_hsv2 = cv2.inRange(
+            hsv,
+            np.array([168, 20, 70], dtype=np.uint8),
+            np.array([180, 175, 255], dtype=np.uint8),
+        )
+        b_ch, g_ch, r_ch = cv2.split(small)
+        bgr_ok = (
+            (r_ch > 75)
+            & (r_ch > g_ch)
+            & (r_ch > b_ch)
+            & ((r_ch.astype(np.int16) - np.minimum(g_ch, b_ch).astype(np.int16)) >= 16)
+        ).astype(np.uint8) * 255
+
+        skin_mask = cv2.bitwise_and(mask_ycrcb, cv2.bitwise_or(mask_hsv1, mask_hsv2))
+        skin_mask = cv2.bitwise_and(skin_mask, bgr_ok)
+
+        k_sz = max(3, int(round(min(work_w, work_h) * 0.015)) | 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_sz, k_sz))
+        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, kernel)
+        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(skin_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        frame_area = float(work_w * work_h)
+        sx = w / float(work_w)
+        sy = h / float(work_h)
+        detections: list[dict[str, Any]] = []
+
+        for cnt in contours:
+            area = float(cv2.contourArea(cnt))
+            area_ratio = area / max(frame_area, 1.0)
+            if not (0.008 <= area_ratio <= 0.25):
+                continue
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            aspect = bw / max(bh, 1)
+            if not (0.55 <= aspect <= 1.6):
+                continue
+            # フレーム中央〜上 75% の人物頭部付近に限定
+            if (by + bh * 0.5) > work_h * 0.75:
+                continue
+            extent = area / max(float(bw * bh), 1.0)
+            if extent < 0.42:
+                continue
+
+            roi = gray_s[by:by + bh, bx:bx + bw]
+            if roi.size < 16 or float(np.std(roi)) < 7.0:
+                continue
+            grad_y = np.abs(cv2.Sobel(roi.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3))
+            if float(np.mean(grad_y)) < 4.0:
+                continue
+
+            fx = max(0, min(w - 1, int(round(bx * sx))))
+            fy = max(0, min(h - 1, int(round(by * sy))))
+            fw = max(1, min(w - fx, int(round(bw * sx))))
+            fh = max(1, min(h - fy, int(round(bh * sy))))
+            detections.append({
+                "bbox": (fx, fy, fw, fh),
+                "kind": "face",
+                "confidence": 0.52,
+            })
+
+        return _nms_detections(detections, iou_thresh=0.35)
+
     def detect(self, frame_bgr: np.ndarray, gray: np.ndarray) -> list[dict[str, Any]]:
         h, w = gray.shape[:2]
         min_face = max(20, int(min(w, h) * 0.045))
@@ -709,9 +795,36 @@ class _PersonTracker:
             "kind": kind,
         })
 
-    def finalize(self, total_sampled_frames: int) -> list[dict[str, Any]]:
-        min_obs = 2 if total_sampled_frames >= 3 else 1
-        kept = [tr for tr in self.tracks if len(tr["keyframes"]) >= min_obs]
+    @staticmethod
+    def _has_consecutive_run(kfs: list[dict[str, Any]], sample_dt: float, min_run: int) -> bool:
+        if min_run <= 1:
+            return len(kfs) >= 1
+        if len(kfs) < min_run:
+            return False
+        max_gap = max(sample_dt * 1.65, 0.15)
+        run = 1
+        for idx in range(1, len(kfs)):
+            if (float(kfs[idx]["t"]) - float(kfs[idx - 1]["t"])) <= max_gap:
+                run += 1
+                if run >= min_run:
+                    return True
+            else:
+                run = 1
+        return False
+
+    def finalize(
+        self,
+        total_sampled_frames: int,
+        min_obs_override: int | None = None,
+        min_consecutive_run: int = 0,
+        sample_dt: float = 0.25,
+    ) -> list[dict[str, Any]]:
+        min_obs = min_obs_override if min_obs_override is not None else (2 if total_sampled_frames >= 3 else 1)
+        kept = [
+            tr for tr in self.tracks
+            if len(tr["keyframes"]) >= min_obs
+            and (min_consecutive_run <= 1 or self._has_consecutive_run(tr["keyframes"], sample_dt, min_consecutive_run))
+        ]
 
         # 左から右へ並び替え（person_0=画面左、person_1=画面右…）
         kept.sort(key=lambda tr: float(np.mean([k["azimuth_deg"] for k in tr["keyframes"]])))
@@ -873,6 +986,7 @@ def analyze_video_spatial(
         detectors = _DetectorBundle()
         depth_est = _OptionalDepthEstimator(enabled=use_depth_model)
         tracker = _PersonTracker(width, height, max_missed_sec=max(1.5, 6.0 / eff_sample_fps))
+        anime_fallback_tracker = _PersonTracker(width, height, max_missed_sec=max(0.9, 2.5 / eff_sample_fps))
 
         motion_track: list[dict[str, Any]] = []
         brightness_list: list[float] = []
@@ -900,6 +1014,8 @@ def analyze_video_spatial(
                 height, width = frame.shape[:2]
                 tracker.width, tracker.height = width, height
                 tracker.diag = math.hypot(width, height)
+                anime_fallback_tracker.width, anime_fallback_tracker.height = width, height
+                anime_fallback_tracker.diag = math.hypot(width, height)
 
             t = frame_idx / fps
             last_t = t
@@ -918,6 +1034,10 @@ def analyze_video_spatial(
             # 人物・顔検出とマルチトラック追跡
             detections = detectors.detect(frame, gray)
             tracker.update(t, detections, gray, depth_map=depth_map)
+            if not detections:
+                anime_dets = detectors.detect_anime_skin_clusters(frame)
+                if anime_dets:
+                    anime_fallback_tracker.update(t, anime_dets, gray, depth_map=depth_map)
 
             # 動き重心（フレーム間差分 + Farneback オプティカルフロー）
             work_w = min(320, width)
@@ -1013,6 +1133,14 @@ def analyze_video_spatial(
         duration_sec = max(last_t + (1.0 / max(fps, 1.0)), 0.1)
 
     person_tracks = tracker.finalize(sampled_count)
+    if not person_tracks and sampled_count >= 3:
+        sample_dt = step / max(fps, 1.0)
+        person_tracks = anime_fallback_tracker.finalize(
+            sampled_count,
+            min_obs_override=3,
+            min_consecutive_run=3,
+            sample_dt=sample_dt,
+        )
     scene_summary = _build_scene_summary(
         brightness_list=brightness_list,
         warmth_list=warmth_list,

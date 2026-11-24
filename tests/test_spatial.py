@@ -28,17 +28,24 @@ from app.spatial import (
     acn_sn3d_gains,
     ambisonics_channel_count,
     build_max_re_decoder_matrix,
+    compute_dialog_ducking_gain,
     master_audio,
     measure_audio_metrics,
     measure_lufs,
     measure_true_peak_dbtp,
+    process_dialog_stem,
     render_spatial_mix,
     validate_adm_bwf,
     write_adm_bwf,
     write_spatial_wav,
 )
-from app.spatial.ambisonics import max_re_weights
+from app.spatial.ambisonics import AmbisonicsRenderer, max_re_weights
 from app.spatial.atmos import AtmosRenderer
+from app.spatial.hrtf import (
+    air_absorption_cutoff_hz,
+    distance_direct_gain,
+    distance_reverb_send,
+)
 from app.spatial.mastering import _measure_lufs_builtin
 
 
@@ -411,6 +418,7 @@ class TestSpatialEngine(unittest.TestCase):
         # 存在しない SOFA は自動で物理モデルへフォールバック
         eng_fb = HRTFEngine(sofa_path=self.tmpdir / "missing.sofa")
         self.assertEqual(eng_fb.source_name, "physical_woodworth_brown_duda")
+        self.assertFalse(eng_fb.diffuse_field_eq_applied)
         self.assertIsNotNone(eng_fb.fallback_reason)
 
         # 合成 SimpleFreeFieldHRIR SOFA (h5py 利用可能時)
@@ -437,6 +445,7 @@ class TestSpatialEngine(unittest.TestCase):
 
             eng_sofa = HRTFEngine(sofa_path=sofa_path)
             self.assertEqual(eng_sofa.source_name, "sofa:mock_kemar.sofa")
+            self.assertFalse(eng_sofa.diffuse_field_eq_applied)
             hl, hr = eng_sofa.get_hrir(-60.0, 0.0)
             self.assertGreater(float(np.max(np.abs(hl))), float(np.max(np.abs(hr))) * 2.5)
 
@@ -582,6 +591,221 @@ class TestSpatialEngine(unittest.TestCase):
         hot_mastered, _ = master_audio(hot, target_lufs=-14.0, ceiling_dbtp=-1.0)
         hot_metrics = measure_audio_metrics(hot_mastered, sample_rate=SAMPLE_RATE)
         self.assertLessEqual(hot_metrics["true_peak_dbtp"], -0.9)
+
+    # ------------------------------------------------------------------
+    # 8. MIT KEMAR SOFA Diffuse-Field EQ 実測検証
+    # ------------------------------------------------------------------
+    def test_mit_kemar_sofa_diffuse_field_eq(self) -> None:
+        eng_phys = HRTFEngine()
+        self.assertFalse(eng_phys.diffuse_field_eq_applied)
+
+        sofa_path = Path(__file__).resolve().parent.parent / "models" / "hrtf" / "mit_kemar_normal_pinna.sofa"
+        if not sofa_path.is_file():
+            self.skipTest("MIT KEMAR SOFA ファイルが存在しないため実測 DF-EQ テストをスキップします")
+
+        eng = HRTFEngine(sofa_path=sofa_path)
+        self.assertTrue(eng.diffuse_field_eq_applied)
+
+        hl0, hr0 = eng.get_hrir(0.0, 0.0)
+        corr0 = float(np.dot(hl0, hr0) / (np.linalg.norm(hl0) * np.linalg.norm(hr0) + 1e-12))
+        self.assertGreater(corr0, 0.85, f"正面 (0°,0°) 左右相関が不足: {corr0:.4f}")
+
+        n_fft = 4096
+        freqs = np.fft.rfftfreq(n_fft, d=1.0 / SAMPLE_RATE)
+        sl = np.abs(np.fft.rfft(hl0.astype(np.float64), n=n_fft))
+        sr = np.abs(np.fft.rfft(hr0.astype(np.float64), n=n_fft))
+        m_lo = (freqs >= 100.0) & (freqs <= 400.0)
+        m_hi = (freqs >= 2000.0) & (freqs <= 6000.0)
+        m_mid = (freqs >= 200.0) & (freqs <= 4000.0)
+
+        lo_db = 20.0 * math.log10(math.sqrt(float(np.mean(0.5 * (sl[m_lo] ** 2 + sr[m_lo] ** 2)))))
+        hi_db = 20.0 * math.log10(math.sqrt(float(np.mean(0.5 * (sl[m_hi] ** 2 + sr[m_hi] ** 2)))))
+        mid_db = 20.0 * math.log10(math.sqrt(float(np.mean(0.5 * (sl[m_mid] ** 2 + sr[m_mid] ** 2)))))
+        self.assertLessEqual(abs(hi_db - lo_db), 4.0, f"2-6kHz と 100-400Hz 差が過大: {hi_db - lo_db:+.2f} dB")
+        self.assertLessEqual(abs(mid_db), 1.0, f"正面 200-4000Hz 正規化誤差が過大: {mid_db:+.2f} dB")
+
+        # 左右定位・ITD 方向性が EQ 後も正常であること
+        sig = _make_speech_like_signal(0.8, seed=77)
+        bin_l, _ = eng.render_mono_dynamic(sig, [{"t": 0.0, "azimuth_deg": -60.0, "elevation_deg": 0.0, "distance_m": 1.4}])
+        bin_r, _ = eng.render_mono_dynamic(sig, [{"t": 0.0, "azimuth_deg": 60.0, "elevation_deg": 0.0, "distance_m": 1.4}])
+        self.assertGreaterEqual(_measure_lr_diff_db(bin_l), 3.0)
+        self.assertGreater(_estimate_itd_lead_samples(bin_l), 0)
+        self.assertLessEqual(_measure_lr_diff_db(bin_r), -3.0)
+        self.assertLess(_estimate_itd_lead_samples(bin_r), 0)
+
+    # ------------------------------------------------------------------
+    # 9. セリフ処理チェーン（HPF・ボイスコンプレッサー・ディエッサー）検証
+    # ------------------------------------------------------------------
+    def test_process_dialog_stem_compressor_and_deesser(self) -> None:
+        t_hpf = np.arange(SAMPLE_RATE // 2, dtype=np.float64) / float(SAMPLE_RATE)
+        low_45 = (0.4 * np.sin(2.0 * math.pi * 45.0 * t_hpf)).astype(np.float32)
+        out_low = process_dialog_stem(low_45, enable_compressor=False, enable_deesser=False, presence_db=0.0)
+        rms_in_low = math.sqrt(float(np.mean(low_45[2400:] ** 2)))
+        rms_out_low = math.sqrt(float(np.mean(out_low[2400:] ** 2)))
+        self.assertLess(20.0 * math.log10(rms_out_low / rms_in_low), -8.0)
+
+        # ボイスコンプレッサー: 強弱差縮小 & ゲート (-55dB 以下) 無動作
+        n_half = int(0.4 * SAMPLE_RATE)
+        t_seg = np.arange(n_half, dtype=np.float64) / float(SAMPLE_RATE)
+        loud = 0.50 * np.sin(2.0 * math.pi * 1000.0 * t_seg)
+        quiet = 0.04 * np.sin(2.0 * math.pi * 1000.0 * t_seg)
+        dyn_sig = np.concatenate([loud, quiet]).astype(np.float32)
+
+        out_comp = process_dialog_stem(dyn_sig, enable_compressor=True, enable_deesser=False, presence_db=0.0)
+        out_nocomp = process_dialog_stem(dyn_sig, enable_compressor=False, enable_deesser=False, presence_db=0.0)
+
+        def _dr_db(x: np.ndarray) -> float:
+            r1 = math.sqrt(float(np.mean(x[int(0.1 * SAMPLE_RATE) : n_half - 480] ** 2)))
+            r2 = math.sqrt(float(np.mean(x[n_half + int(0.15 * SAMPLE_RATE) : -480] ** 2)))
+            return 20.0 * math.log10(max(r1, 1e-12) / max(r2, 1e-12))
+
+        self.assertLess(_dr_db(out_comp), _dr_db(out_nocomp) - 1.5)
+
+        tiny_sig = (10.0 ** (-65.0 / 20.0) * np.sin(2.0 * math.pi * 1000.0 * t_seg)).astype(np.float32)
+        out_tiny_c = process_dialog_stem(tiny_sig, enable_compressor=True, enable_deesser=False, presence_db=0.0)
+        out_tiny_nc = process_dialog_stem(tiny_sig, enable_compressor=False, enable_deesser=False, presence_db=0.0)
+        tiny_diff = 20.0 * math.log10(
+            math.sqrt(float(np.mean(out_tiny_c[2400:] ** 2))) / max(1e-12, math.sqrt(float(np.mean(out_tiny_nc[2400:] ** 2))))
+        )
+        self.assertLess(abs(tiny_diff), 0.2)
+
+        # ディエッサー: 7kHz 歯擦音減衰 & 1kHz 声の芯無劣化
+        t_ds = np.arange(SAMPLE_RATE, dtype=np.float64) / float(SAMPLE_RATE)
+        core_1k = (0.30 * np.sin(2.0 * math.pi * 1000.0 * t_ds)).astype(np.float32)
+        sib_7k = (0.35 * np.sin(2.0 * math.pi * 7000.0 * t_ds)).astype(np.float32)
+
+        c_ds = process_dialog_stem(core_1k, enable_compressor=False, enable_deesser=True, presence_db=0.0)
+        c_nods = process_dialog_stem(core_1k, enable_compressor=False, enable_deesser=False, presence_db=0.0)
+        core_delta_db = 20.0 * math.log10(
+            math.sqrt(float(np.mean(c_ds[4800:] ** 2))) / max(1e-12, math.sqrt(float(np.mean(c_nods[4800:] ** 2))))
+        )
+        self.assertLess(abs(core_delta_db), 0.2)
+
+        s_ds = process_dialog_stem(sib_7k, enable_compressor=False, enable_deesser=True, presence_db=0.0)
+        s_nods = process_dialog_stem(sib_7k, enable_compressor=False, enable_deesser=False, presence_db=0.0)
+        sib_delta_db = 20.0 * math.log10(
+            math.sqrt(float(np.mean(s_ds[4800:] ** 2))) / max(1e-12, math.sqrt(float(np.mean(s_nods[4800:] ** 2))))
+        )
+        self.assertLess(sib_delta_db, -2.5)
+
+    # ------------------------------------------------------------------
+    # 10. サイドチェインダッキング＆render_spatial_mix 統合検証
+    # ------------------------------------------------------------------
+    def test_dialog_ducking_gain_and_render_spatial_mix(self) -> None:
+        n_tot = int(2.0 * SAMPLE_RATE)
+        silent = np.zeros(n_tot, dtype=np.float32)
+        g_silent = compute_dialog_ducking_gain(silent)
+        self.assertEqual(g_silent.dtype, np.float32)
+        self.assertEqual(g_silent.shape, (n_tot,))
+        np.testing.assert_allclose(g_silent, np.ones(n_tot, dtype=np.float32), atol=1e-6)
+
+        speech = np.zeros(n_tot, dtype=np.float32)
+        n_sp = int(0.8 * SAMPLE_RATE)
+        speech[:n_sp] = _make_speech_like_signal(0.8, seed=31)
+        g_duck = compute_dialog_ducking_gain(speech, duck_db=-3.0)
+        self.assertEqual(g_duck.dtype, np.float32)
+        mid_speech = float(np.mean(g_duck[int(0.2 * SAMPLE_RATE) : int(0.65 * SAMPLE_RATE)]))
+        tail_quiet = float(np.min(g_duck[int(1.65 * SAMPLE_RATE) :]))
+        self.assertGreater(mid_speech, 0.65)
+        self.assertLess(mid_speech, 0.76)
+        self.assertGreaterEqual(tail_quiet, 0.98)
+
+        # render_spatial_mix でダッキングON/OFFを比較
+        t_bgm = np.arange(n_tot, dtype=np.float64) / float(SAMPLE_RATE)
+        bgm_m = (0.18 * np.sin(2.0 * math.pi * 220.0 * t_bgm) + 0.10 * np.sin(2.0 * math.pi * 440.0 * t_bgm)).astype(
+            np.float32
+        )
+        bgm_stereo = np.stack([bgm_m, bgm_m], axis=1)
+        sfx_tone = (0.15 * np.sin(2.0 * math.pi * 880.0 * t_bgm)).astype(np.float32)
+
+        wav_dlg = self._write_wav("duck_dlg.wav", speech)
+        wav_bgm = self._write_wav("duck_bgm.wav", bgm_stereo)
+        wav_sfx = self._write_wav("duck_sfx.wav", sfx_tone)
+
+        scene = {
+            "duration_sec": 2.0,
+            "sample_rate": SAMPLE_RATE,
+            "room": {"rt60_sec": 0.25, "size": "small"},
+            "objects": [
+                {"id": "dlg", "role": "dialog", "audio_path": str(wav_dlg), "is_bed": False, "keyframes": [{"t": 0.0, "azimuth_deg": 0.0, "elevation_deg": 0.0, "distance_m": 2.0}]},
+                {"id": "bgm", "role": "music", "audio_path": str(wav_bgm), "is_bed": True, "gain_db": 0.0},
+                {"id": "sfx", "role": "sfx", "audio_path": str(wav_sfx), "is_bed": False, "gain_db": -3.0, "keyframes": [{"t": 0.0, "azimuth_deg": 35.0, "elevation_deg": 0.0, "distance_m": 2.5}]},
+            ],
+        }
+
+        res_on = render_spatial_mix(
+            scene,
+            out_dir=str(self.tmpdir / "duck_on"),
+            spatial_format="atmos",
+            target_lufs=-18.0,
+            enable_dialog_ducking=True,
+        )
+        res_off = render_spatial_mix(
+            scene,
+            out_dir=str(self.tmpdir / "duck_off"),
+            spatial_format="atmos",
+            target_lufs=-18.0,
+            enable_dialog_ducking=False,
+        )
+        self.assertTrue(res_on["metrics"]["dialog_ducking_applied"])
+        self.assertFalse(res_off["metrics"]["dialog_ducking_applied"])
+        self.assertEqual(res_on["metrics"]["target_lufs"], -18.0)
+        self.assertIn("diffuse_field_eq", res_on["metrics"])
+
+        y_on, _ = sf.read(res_on["binaural_wav"], dtype="float64")
+        y_off, _ = sf.read(res_off["binaural_wav"], dtype="float64")
+
+        def _tail_to_speech_ratio_db(sig: np.ndarray) -> float:
+            e_sp = float(np.mean(sig[int(0.2 * SAMPLE_RATE) : int(0.7 * SAMPLE_RATE)] ** 2))
+            e_tail = float(np.mean(sig[int(1.4 * SAMPLE_RATE) : int(1.9 * SAMPLE_RATE)] ** 2))
+            return 10.0 * math.log10(max(e_tail, 1e-15) / max(e_sp, 1e-15))
+
+        # ダッキングON時は発話区間のBGM/SFXが抑えられるため、後半BGM単独区間との相対比が明確に増大する
+        self.assertGreater(_tail_to_speech_ratio_db(y_on) - _tail_to_speech_ratio_db(y_off), 1.5)
+
+    # ------------------------------------------------------------------
+    # 11. セリフ専用 Perspective 距離カーブ検証（role="dialog" vs "sfx"）
+    # ------------------------------------------------------------------
+    def test_dialog_perspective_distance_model(self) -> None:
+        self.assertAlmostEqual(distance_direct_gain(2.0, role="dialog"), 1.0, places=6)
+        self.assertAlmostEqual(distance_direct_gain(1.0, role="dialog"), 1.22, places=6)
+        self.assertAlmostEqual(distance_direct_gain(15.0, role="dialog"), 0.38, places=6)
+        self.assertGreater(distance_direct_gain(8.0, role="dialog"), distance_direct_gain(8.0, role="sfx"))
+
+        self.assertAlmostEqual(
+            distance_reverb_send(4.0, role="dialog"),
+            0.55 * distance_reverb_send(4.0, role="sfx"),
+            places=6,
+        )
+        self.assertAlmostEqual(air_absorption_cutoff_hz(2.0, role="dialog"), 20000.0, places=3)
+        self.assertLess(air_absorption_cutoff_hz(2.0, role="sfx"), 15000.0)
+
+        sig = _make_speech_like_signal(0.8, seed=88)
+        wav = self._write_wav("dist_role.wav", sig)
+        eng = HRTFEngine()
+        for renderer in (AtmosRenderer(hrtf_engine=eng), AmbisonicsRenderer(order=3, hrtf_engine=eng)):
+            def _render_role(r: str) -> np.ndarray:
+                sc = {
+                    "duration_sec": 0.8,
+                    "sample_rate": SAMPLE_RATE,
+                    "room": {"rt60_sec": 0.25, "size": "small"},
+                    "objects": [
+                        {
+                            "id": "src",
+                            "role": r,
+                            "audio_path": str(wav),
+                            "is_bed": False,
+                            "keyframes": [{"t": 0.0, "azimuth_deg": 0.0, "elevation_deg": 0.0, "distance_m": 6.0}],
+                        }
+                    ],
+                }
+                return renderer.render_scene(sc)["binaural"]
+
+            b_dlg = _render_role("dialog")
+            b_sfx = _render_role("sfx")
+            rms_dlg = math.sqrt(float(np.mean(b_dlg.astype(np.float64) ** 2)))
+            rms_sfx = math.sqrt(float(np.mean(b_sfx.astype(np.float64) ** 2)))
+            self.assertGreater(20.0 * math.log10(rms_dlg / max(rms_sfx, 1e-12)), 4.0)
 
 
 if __name__ == "__main__":

@@ -635,13 +635,21 @@
 
     const trimEnabled = $("chk-preview-trim").checked;
     const { spatial_format, ambisonics_order } = getSpatialSelection();
+    const rawLufs = $("select-lufs").value;
+    const isMatchOriginal = rawLufs === "match_original";
+    const dialogPanMode = $("select-dialog-pan-mode").value === "immersive" ? "immersive" : "cinema";
+    const enableDialogDucking = $("chk-dialog-ducking").checked;
+
     const payload = {
       upload_id: state.upload.upload_id,
       mode: getRadioValue("proc_mode", "auto"),
       spatial_format,
       ambisonics_order,
       quality_preset: $("select-quality").value,
-      target_lufs: Number($("select-lufs").value),
+      loudness_mode: isMatchOriginal ? "match_original" : "fixed",
+      target_lufs: isMatchOriginal ? null : Number(rawLufs),
+      dialog_pan_mode: dialogPanMode,
+      enable_dialog_ducking: enableDialogDucking,
       foley_prompt: $("input-foley-prompt").value.trim(),
       allow_foley_fallback: $("chk-foley-fallback").checked,
       preview_start: trimEnabled ? Math.max(0, Number($("input-preview-start").value) || 0) : 0.0,
@@ -942,21 +950,79 @@
     return ROLE_COLORS[role] || "#38bdf8";
   }
 
-  function formatHrtfLabel(raw) {
+  function formatHrtfLabel(raw, metrics = null) {
     const s = String(raw || "").trim();
     if (!s) return "物理HRTF (Woodworth)";
     const low = s.toLowerCase();
-    if (low.includes("woodworth") || low.includes("physical") || low.includes("physics")) {
+    const hasDfEq = Boolean(
+      (metrics && metrics.diffuse_field_eq) ||
+        low.includes("df-eq") ||
+        low.includes("diffuse-field") ||
+        low.includes("diffuse_field")
+    );
+    if (low.includes("woodworth") || low.includes("physical") || low.includes("physics") || low.includes("内蔵物理")) {
       return "物理HRTF (Woodworth)";
     }
     if (low.includes("kemar")) {
-      return "SOFA HRTF (MIT KEMAR)";
+      return hasDfEq ? "SOFA (KEMAR·DF-EQ)" : "SOFA (MIT KEMAR)";
     }
     if (low.includes("sofa")) {
-      const base = s.split(/[\\/]/).pop() || s;
-      return `SOFA (${base.replace(/\.sofa$/i, "")})`;
+      const base = (s.split(/[\\/]/).pop() || s).replace(/\.sofa$/i, "");
+      const shortBase = base.length > 14 ? `${base.slice(0, 12)}…` : base;
+      return hasDfEq ? `SOFA (${shortBase}·DF-EQ)` : `SOFA (${shortBase})`;
     }
     return s;
+  }
+
+  function syncRemixControlsFromJob(job) {
+    const req = (job && job.request) || {};
+    const mix = (state.scene && state.scene.mix_settings) || {};
+
+    const fmtVal = req.spatial_format || mix.spatial_format;
+    if (fmtVal && $("remix-format")) {
+      $("remix-format").value = fmtVal;
+    }
+
+    const lufsEl = $("remix-lufs");
+    if (lufsEl) {
+      const lMode = mix.loudness_mode || req.loudness_mode;
+      const rawLufsVal = req.target_lufs != null ? req.target_lufs : mix.target_lufs;
+      if (lMode === "match_original" || (lMode == null && rawLufsVal == null)) {
+        lufsEl.value = "match_original";
+      } else if (rawLufsVal != null && isFinite(Number(rawLufsVal))) {
+        const targetNum = Number(rawLufsVal);
+        const numericOpts = Array.from(lufsEl.options).filter((o) => isFinite(Number(o.value)));
+        const exact = numericOpts.find((o) => o.value === String(Math.round(targetNum)));
+        if (exact) {
+          lufsEl.value = exact.value;
+        } else if (numericOpts.length) {
+          // 既定選択肢外の数値には最も近いプリセットへ合わせる
+          numericOpts.sort(
+            (a, b) => Math.abs(Number(a.value) - targetNum) - Math.abs(Number(b.value) - targetNum)
+          );
+          lufsEl.value = numericOpts[0].value;
+        }
+      } else {
+        lufsEl.value = "match_original";
+      }
+    }
+
+    const panEl = $("remix-dialog-pan-mode");
+    if (panEl) {
+      const panMode = mix.dialog_pan_mode || req.dialog_pan_mode || "cinema";
+      panEl.value = panMode === "immersive" ? "immersive" : "cinema";
+    }
+
+    const duckEl = $("chk-remix-ducking");
+    if (duckEl) {
+      const duckVal =
+        mix.enable_dialog_ducking !== undefined
+          ? mix.enable_dialog_ducking
+          : req.enable_dialog_ducking !== undefined
+          ? req.enable_dialog_ducking
+          : true;
+      duckEl.checked = Boolean(duckVal);
+    }
   }
 
   async function enterStudioView(job) {
@@ -976,9 +1042,7 @@
     state.selectedObjectId = objects.length ? objects[0].id : null;
 
     // 再Mix設定欄をジョブの現在値へ同期
-    const req = job.request || {};
-    if (req.spatial_format) $("remix-format").value = req.spatial_format;
-    if (req.target_lufs != null) $("remix-lufs").value = String(Math.round(Number(req.target_lufs)));
+    syncRemixControlsFromJob(job);
 
     renderMetricsAndDownloads(job);
     renderTrackList();
@@ -1014,8 +1078,9 @@
 
     const rawHrtf = metrics.hrtf_source || "内蔵物理HRTF";
     const hrtfEl = $("metric-hrtf");
-    hrtfEl.textContent = formatHrtfLabel(rawHrtf);
-    hrtfEl.title = rawHrtf;
+    hrtfEl.textContent = formatHrtfLabel(rawHrtf, metrics);
+    const dfNote = metrics.diffuse_field_eq ? " [Diffuse-Field EQ 適用済み]" : "";
+    hrtfEl.title = `${rawHrtf}${dfNote}`;
 
     const chText = metrics.channels ? `${metrics.channels} ch` : fmt === "atmos" ? "7.1.4 + Obj" : "--";
     const chEl = $("metric-channels");
@@ -1947,6 +2012,42 @@
     $("val-elevation").textContent = `${Math.round(pose.elevation_deg)}°`;
   }
 
+  function handleRemixDialogPanModeChange() {
+    if (!state.scene || !Array.isArray(state.scene.objects)) return;
+    const mode = $("remix-dialog-pan-mode").value === "immersive" ? "immersive" : "cinema";
+    let hasRawKeyframes = false;
+
+    state.scene.objects.forEach((obj) => {
+      if (String(obj.role || "").toLowerCase() !== "dialog") return;
+      if (Array.isArray(obj.raw_keyframes) && obj.raw_keyframes.length) {
+        hasRawKeyframes = true;
+        obj.keyframes = obj.raw_keyframes.map((rkf) => {
+          const rawAz = Number(rkf.azimuth_deg ?? 0);
+          const mappedAz =
+            mode === "immersive"
+              ? Math.round(rawAz * 100) / 100
+              : Math.round(22 * Math.tanh(rawAz / 22) * 100) / 100;
+          return { ...rkf, azimuth_deg: mappedAz };
+        });
+      }
+    });
+
+    if (hasRawKeyframes) {
+      state.scene.recompute_dialog_pan = false;
+      renderTrackList();
+      syncInspectorToSelected();
+      drawSpatialRadar();
+    } else {
+      state.scene.recompute_dialog_pan = true;
+    }
+
+    if (!state.scene.mix_settings || typeof state.scene.mix_settings !== "object") {
+      state.scene.mix_settings = {};
+    }
+    state.scene.mix_settings.dialog_pan_mode = mode;
+    markSceneDirty();
+  }
+
   async function applyRemix() {
     if (!state.activeJobId || !state.scene) return;
     const btn = $("btn-remix-apply");
@@ -1965,6 +2066,12 @@
       ambisonics_hoa5: 5,
       ambisonics_hoa7: 7,
     };
+    const rawRemixLufs = $("remix-lufs").value;
+    const isMatchOriginal = rawRemixLufs === "match_original";
+    const dialogPanMode =
+      $("remix-dialog-pan-mode").value === "immersive" ? "immersive" : "cinema";
+    const enableDialogDucking = $("chk-remix-ducking").checked;
+
     try {
       const resp = await apiJson(`/api/jobs/${encodeURIComponent(state.activeJobId)}/remix`, {
         method: "POST",
@@ -1973,18 +2080,29 @@
           scene: state.scene,
           spatial_format: remixFmt,
           ambisonics_order: remixOrderMap[remixFmt] || null,
-          target_lufs: Number($("remix-lufs").value),
+          loudness_mode: isMatchOriginal ? "match_original" : "fixed",
+          target_lufs: isMatchOriginal ? null : Number(rawRemixLufs),
+          dialog_pan_mode: dialogPanMode,
+          enable_dialog_ducking: enableDialogDucking,
         }),
       });
 
       const updatedJob = resp.state || state.activeJob;
       if (resp.media_urls) updatedJob.media_urls = resp.media_urls;
       if (resp.result) updatedJob.result = resp.result;
+      if (resp.scene) {
+        updatedJob.scene = resp.scene;
+        state.scene = deepClone(resp.scene);
+      }
       state.activeJob = updatedJob;
       state.sceneDirty = false;
       $("scene-dirty-badge").classList.add("hidden");
 
+      syncRemixControlsFromJob(updatedJob);
       renderMetricsAndDownloads(updatedJob);
+      renderTrackList();
+      syncInspectorToSelected();
+      drawSpatialRadar();
       await loadStudioMedia(updatedJob);
       if (video && resumeTime > 0) {
         video.addEventListener(
@@ -2396,12 +2514,15 @@
       state.scene = deepClone(state.originalScene);
       state.sceneDirty = true;
       $("scene-dirty-badge").classList.remove("hidden");
+      syncRemixControlsFromJob(state.activeJob);
       renderTrackList();
       syncInspectorToSelected();
       drawSpatialRadar();
       showToast("3D音源配置を初期状態に戻しました（「この配置で再Mix」で反映できます）。", "info");
     });
 
+    $("remix-dialog-pan-mode").addEventListener("change", handleRemixDialogPanModeChange);
+    $("chk-remix-ducking").addEventListener("change", () => markSceneDirty());
     $("btn-remix-apply").addEventListener("click", applyRemix);
   }
 

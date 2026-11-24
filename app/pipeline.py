@@ -12,6 +12,8 @@
 """
 from __future__ import annotations
 
+import copy
+import inspect
 import json
 import math
 import os
@@ -28,7 +30,11 @@ import soundfile as sf
 
 from app.audio.foley_engine import generate_foley
 from app.audio.separator_bridge import extract_audio_from_video, separate_dme
-from app.audio.speaker_splitter import split_speakers
+from app.audio.speaker_splitter import (
+    _normalize_dialog_pan_mode,
+    apply_dialog_pan_mode_to_keyframes,
+    split_speakers,
+)
 from app.config import MODELS_DIR, SAMPLE_RATE
 from app.vision.analyzer import analyze_video_spatial, inspect_video
 
@@ -215,6 +221,103 @@ def _wav_rms_db(wav_path: str | Path) -> float:
     return round(20.0 * math.log10(rms), 2) if rms > 1e-10 else -120.0
 
 
+def _resolve_loudness_settings(
+    loudness_mode: Any,
+    target_lufs: Any,
+    default_fixed: float = -18.0,
+) -> tuple[str, float | None]:
+    """loudness_mode と target_lufs 指定から (mode, fixed_lufs_or_none) を決定する。"""
+    raw_mode = str(loudness_mode).strip().lower() if loudness_mode not in (None, "") else ""
+    if raw_mode in ("match_original", "match", "auto"):
+        return "match_original", None
+    if raw_mode == "fixed":
+        if target_lufs is not None and not isinstance(target_lufs, bool):
+            try:
+                val = float(target_lufs)
+                if math.isfinite(val):
+                    return "fixed", val
+            except (TypeError, ValueError):
+                pass
+        return "fixed", float(default_fixed)
+
+    if target_lufs is None:
+        return "match_original", None
+    if isinstance(target_lufs, str) and target_lufs.strip().lower() in ("", "match_original", "match", "auto"):
+        return "match_original", None
+    if not isinstance(target_lufs, bool):
+        try:
+            val = float(target_lufs)
+            if math.isfinite(val):
+                return "fixed", val
+        except (TypeError, ValueError):
+            pass
+    return "match_original", None
+
+
+def _measure_original_lufs(wav_path: Path | str | None) -> float | None:
+    """元音声 WAV の ITU-R BS.1770-4 統合ラウドネス (LKFS) を計測する。"""
+    if not wav_path:
+        return None
+    p = Path(wav_path)
+    if not p.is_file():
+        return None
+    try:
+        audio, sr = sf.read(str(p), dtype="float32", always_2d=True)
+        if audio.size == 0:
+            return None
+        from app.spatial.mastering import measure_lufs
+
+        val = float(measure_lufs(audio, sample_rate=int(sr)))
+        return round(val, 2) if math.isfinite(val) else None
+    except Exception:
+        return None
+
+
+def _compute_effective_target_lufs(
+    loudness_mode: str,
+    fixed_target: float | None,
+    original_lufs: float | None,
+    is_silent: bool = False,
+) -> float:
+    """loudness_mode と実測 original_lufs から実効ターゲット LUFS を算出する。"""
+    if loudness_mode == "fixed":
+        return round(float(fixed_target if fixed_target is not None else -18.0), 2)
+    if is_silent or original_lufs is None or not math.isfinite(original_lufs) or original_lufs <= -60.0:
+        return -14.0
+    return round(max(-24.0, min(-11.0, float(original_lufs))), 2)
+
+
+def _call_render_spatial_mix(
+    *,
+    scene: dict[str, Any],
+    spatial_dir: Path,
+    spatial_format: str,
+    ambisonics_order: int,
+    target_lufs: float,
+    hrtf_sofa_path: str | None,
+    base_dir: Path,
+    enable_dialog_ducking: bool,
+    progress_cb: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """spatial パッケージのバージョン差異を inspect.signature で吸収して render_spatial_mix を呼ぶ。"""
+    from app.spatial import render_spatial_mix
+
+    kwargs: dict[str, Any] = {
+        "scene_dict": scene,
+        "out_dir": str(spatial_dir),
+        "spatial_format": spatial_format,
+        "ambisonics_order": ambisonics_order,
+        "target_lufs": float(target_lufs),
+        "hrtf_sofa_path": hrtf_sofa_path,
+        "base_dir": str(base_dir),
+        "progress_cb": progress_cb,
+    }
+    sig = inspect.signature(render_spatial_mix)
+    if "enable_dialog_ducking" in sig.parameters:
+        kwargs["enable_dialog_ducking"] = bool(enable_dialog_ducking)
+    return render_spatial_mix(**kwargs)
+
+
 def _rel_or_abs(path: Path, base_dir: Path) -> str:
     try:
         return path.resolve().relative_to(base_dir.resolve()).as_posix()
@@ -391,6 +494,7 @@ def _build_voiced_scene(
             "matched_person_id": sp.get("matched_person_id"),
             "match_confidence": float(sp.get("match_confidence", 0.0)),
             "is_offscreen": bool(sp.get("is_offscreen", False)),
+            "raw_keyframes": sp.get("raw_keyframes") or sp.get("keyframes") or [{"t": 0.0, "azimuth_deg": 0.0, "elevation_deg": 0.0, "distance_m": 1.8}],
             "keyframes": sp.get("keyframes") or [{"t": 0.0, "azimuth_deg": 0.0, "elevation_deg": 0.0, "distance_m": 1.8}],
         })
 
@@ -578,7 +682,10 @@ def run_job(
     req_mode = _normalize_mode(request.get("mode"))
     spatial_format = _normalize_spatial_format(request.get("spatial_format"))
     ambisonics_order = _resolve_ambisonics_order(spatial_format, request.get("ambisonics_order"))
-    target_lufs = float(request.get("target_lufs", -18.0))
+    dialog_pan_mode = _normalize_dialog_pan_mode(request.get("dialog_pan_mode"))
+    enable_dialog_ducking = bool(request.get("enable_dialog_ducking", True))
+    raw_target_lufs = request.get("target_lufs") if "target_lufs" in request else None
+    loudness_mode, fixed_target_lufs = _resolve_loudness_settings(request.get("loudness_mode"), raw_target_lufs)
     foley_prompt = str(request.get("foley_prompt") or "")
     allow_foley_fallback = bool(request.get("allow_foley_fallback", False))
     preview_start = max(0.0, float(request.get("preview_start") or 0.0))
@@ -600,7 +707,8 @@ def run_job(
     _emit_log(
         log_cb,
         f"映像検査完了: {video_info['width']}x{video_info['height']} / {video_info['duration_sec']:.1f}秒 / "
-        f"音声RMS={video_info['audio_rms_db']} dBFS → モード={effective_mode}, 品質={quality}, 規格={spatial_format}",
+        f"音声RMS={video_info['audio_rms_db']} dBFS → モード={effective_mode}, 品質={quality}, "
+        f"規格={spatial_format}, セリフ定位={dialog_pan_mode}, ラウドネス={loudness_mode}",
     )
 
     # --- 2) 任意のプレビュー区間切り出し ---
@@ -651,6 +759,8 @@ def run_job(
         "spatial_format": spatial_format,
     }
     speakers_summary: list[dict[str, Any]] = []
+    original_lufs: float | None = None
+    effective_target_lufs: float
 
     # --- 4) 有音モード or 無音Foleyモード ---
     if effective_mode == "voiced":
@@ -658,6 +768,17 @@ def run_job(
         raw_audio_wav = work_dir / "original_48k.wav"
         extract_audio_from_video(working_video, raw_audio_wav, sample_rate=SAMPLE_RATE)
         shutil.copy2(raw_audio_wav, original_preview_wav)
+
+        original_lufs = _measure_original_lufs(original_preview_wav)
+        effective_target_lufs = _compute_effective_target_lufs(
+            loudness_mode, fixed_target_lufs, original_lufs, is_silent=False
+        )
+        if loudness_mode == "match_original":
+            _emit_log(
+                log_cb,
+                f"元音声ラウドネス実測: {original_lufs if original_lufs is not None else '計測不能'} LKFS "
+                f"→ 目標ラウドネス {effective_target_lufs:.1f} LKFS に整合します。",
+            )
 
         _emit_progress(progress_cb, 30, "separate", "音声を 話し声 / 効果音 / BGM に3分離中...")
         sep_result = separate_dme(
@@ -679,6 +800,7 @@ def run_job(
             vision_tracks=person_tracks,
             quality=quality,
             force_fallback=force_dsp_fallback,
+            dialog_pan_mode=dialog_pan_mode,
             progress_cb=_make_sub_progress(progress_cb, "speakers", 54.0, 70.0),
             log_cb=log_cb,
         )
@@ -705,6 +827,10 @@ def run_job(
         # 無音比較用の無音 original_preview.wav を作成
         n_silent = max(SAMPLE_RATE // 2, int(round(duration_sec * SAMPLE_RATE)))
         sf.write(str(original_preview_wav), np.zeros((n_silent, 2), dtype=np.float32), SAMPLE_RATE, subtype="FLOAT")
+
+        effective_target_lufs = _compute_effective_target_lufs(
+            loudness_mode, fixed_target_lufs, None, is_silent=True
+        )
 
         _emit_progress(progress_cb, 28, "separate", "無音動画から Foley 音声を生成中...")
         foley_full_wav = stems_dir / "foley_full.wav"
@@ -747,23 +873,30 @@ def run_job(
         _emit_progress(progress_cb, 72, "mapping", "動き重心同期 3D空間シーン (scene.json) を構築中...")
         scene = _build_silent_foley_scene(jdir, duration_sec, vision_result, foley_result, sfx_wav, amb_wav)
 
+    scene["mix_settings"] = {
+        "dialog_pan_mode": dialog_pan_mode,
+        "enable_dialog_ducking": enable_dialog_ducking,
+        "loudness_mode": loudness_mode,
+        "original_lufs": original_lufs,
+        "target_lufs": effective_target_lufs,
+    }
+
     scene_path = jdir / "scene.json"
     _atomic_write_json(scene_path, scene)
     _emit_log(log_cb, f"3D空間シーンを構築しました（音源オブジェクト数={len(scene['objects'])}）。")
 
     # --- 5) サラウンド MixMaster ＆ バイノーラルレンダリング ---
     _emit_progress(progress_cb, 75, "spatial", f"空間音響MixMasterを実行中 ({spatial_format})...")
-    from app.spatial import render_spatial_mix
-
     sofa_path = _find_local_hrtf_sofa(request.get("hrtf_sofa_path"))
-    spatial_out = render_spatial_mix(
-        scene_dict=scene,
-        out_dir=str(spatial_dir),
+    spatial_out = _call_render_spatial_mix(
+        scene=scene,
+        spatial_dir=spatial_dir,
         spatial_format=spatial_format,
         ambisonics_order=ambisonics_order,
-        target_lufs=target_lufs,
+        target_lufs=effective_target_lufs,
         hrtf_sofa_path=sofa_path,
-        base_dir=str(jdir),
+        base_dir=jdir,
+        enable_dialog_ducking=enable_dialog_ducking,
         progress_cb=_make_sub_progress(progress_cb, "spatial", 75.0, 91.0, unit_scale=True),
     )
     metrics = dict(spatial_out.get("metrics") or {})
@@ -795,7 +928,12 @@ def run_job(
         "spatial_format": spatial_format,
         "ambisonics_order": ambisonics_order if spatial_format != "atmos" else None,
         "quality_preset": quality,
-        "target_lufs": target_lufs,
+        "target_lufs": effective_target_lufs,
+        "effective_target_lufs": effective_target_lufs,
+        "loudness_mode": loudness_mode,
+        "original_lufs": original_lufs,
+        "dialog_pan_mode": dialog_pan_mode,
+        "enable_dialog_ducking": enable_dialog_ducking,
         "duration_sec": duration_sec,
         "is_preview_sliced": is_preview_sliced,
         "elapsed_sec": elapsed,
@@ -840,8 +978,11 @@ def remix_job(
     job_dir: Path | str,
     updated_scene: dict[str, Any],
     spatial_format: str = "atmos",
-    target_lufs: float = -18.0,
+    target_lufs: float | str | None = -18.0,
     ambisonics_order: int | None = None,
+    loudness_mode: str | None = None,
+    enable_dialog_ducking: bool | None = None,
+    dialog_pan_mode: str | None = None,
     progress_cb: Callable[..., Any] | None = None,
     log_cb: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
@@ -862,14 +1003,51 @@ def remix_job(
     # ambisonics_order は明示指定時のみ優先し、省略時は指定フォーマット名から次数を決定する
     # （前回 request.json の旧次数へ巻き戻る不具合を防止）
     eff_order = _resolve_ambisonics_order(norm_format, ambisonics_order)
-    lufs = float(target_lufs)
 
-    # シーンの基本必須フィールドを補完して保存
-    scene = dict(updated_scene)
+    prev_mix = dict(updated_scene.get("mix_settings") or {})
+    eff_pan_mode = _normalize_dialog_pan_mode(
+        dialog_pan_mode
+        if dialog_pan_mode is not None
+        else (prev_mix.get("dialog_pan_mode") or prev_result.get("dialog_pan_mode") or req_data.get("dialog_pan_mode"))
+    )
+    if enable_dialog_ducking is not None:
+        eff_ducking = bool(enable_dialog_ducking)
+    elif "enable_dialog_ducking" in prev_mix:
+        eff_ducking = bool(prev_mix["enable_dialog_ducking"])
+    else:
+        eff_ducking = bool(prev_result.get("enable_dialog_ducking", req_data.get("enable_dialog_ducking", True)))
+
+    eff_loudness_mode, fixed_target = _resolve_loudness_settings(loudness_mode, target_lufs)
+
+    orig_audio = prev_result.get("original_preview_wav") or (
+        str((jdir / "original_preview.wav").resolve()) if (jdir / "original_preview.wav").is_file() else None
+    )
+    is_silent_job = (prev_result.get("mode") == "silent_foley") or (orig_audio is None)
+    measured_orig_lufs = None if prev_result.get("mode") == "silent_foley" else _measure_original_lufs(orig_audio)
+    original_lufs = measured_orig_lufs if measured_orig_lufs is not None else prev_result.get("original_lufs")
+    lufs = _compute_effective_target_lufs(
+        eff_loudness_mode, fixed_target, original_lufs, is_silent=is_silent_job
+    )
+
+    # シーンの基本必須フィールド・mix_settings を補完して保存
+    scene = copy.deepcopy(updated_scene)
+    recompute_pan = bool(scene.pop("recompute_dialog_pan", False))
+    if recompute_pan:
+        for obj in scene.get("objects") or []:
+            if str(obj.get("role", "")).lower() == "dialog" and obj.get("raw_keyframes"):
+                obj["keyframes"] = apply_dialog_pan_mode_to_keyframes(obj["raw_keyframes"], eff_pan_mode)
+
     scene.setdefault("sample_rate", SAMPLE_RATE)
     if not scene.get("duration_sec"):
         scene["duration_sec"] = float(prev_result.get("duration_sec") or 0.0)
     scene.setdefault("room", {"rt60_sec": 0.45, "size": "medium"})
+    scene["mix_settings"] = {
+        "dialog_pan_mode": eff_pan_mode,
+        "enable_dialog_ducking": eff_ducking,
+        "loudness_mode": eff_loudness_mode,
+        "original_lufs": original_lufs,
+        "target_lufs": lufs,
+    }
     scene_path = jdir / "scene.json"
     _atomic_write_json(scene_path, scene)
 
@@ -888,19 +1066,22 @@ def remix_job(
         raise FileNotFoundError(f"再結合対象の元映像が見つかりません（job_dir={jdir}）。")
 
     _emit_progress(progress_cb, 15, "spatial", f"更新後の3D配置で再MixMaster中 ({norm_format})...")
-    _emit_log(log_cb, f"再MixMasterを開始します（規格={norm_format}, 目標={lufs:.1f} LKFS, 音源数={len(scene['objects'])}）。")
-
-    from app.spatial import render_spatial_mix
+    _emit_log(
+        log_cb,
+        f"再MixMasterを開始します（規格={norm_format}, 目標={lufs:.1f} LKFS [{eff_loudness_mode}], "
+        f"定位={eff_pan_mode}, ダッキング={'ON' if eff_ducking else 'OFF'}, 音源数={len(scene['objects'])}）。",
+    )
 
     sofa_path = _find_local_hrtf_sofa(req_data.get("hrtf_sofa_path"))
-    spatial_out = render_spatial_mix(
-        scene_dict=scene,
-        out_dir=str(spatial_dir),
+    spatial_out = _call_render_spatial_mix(
+        scene=scene,
+        spatial_dir=spatial_dir,
         spatial_format=norm_format,
         ambisonics_order=eff_order,
         target_lufs=lufs,
         hrtf_sofa_path=sofa_path,
-        base_dir=str(jdir),
+        base_dir=jdir,
+        enable_dialog_ducking=eff_ducking,
         progress_cb=_make_sub_progress(progress_cb, "spatial", 15.0, 82.0, unit_scale=True),
     )
 
@@ -927,16 +1108,17 @@ def remix_job(
     models_used["hrtf"] = metrics.get("hrtf_source", models_used.get("hrtf") or "physics_hrtf")
     models_used["spatial_format"] = norm_format
 
-    orig_audio = prev_result.get("original_preview_wav") or (
-        str((jdir / "original_preview.wav").resolve()) if (jdir / "original_preview.wav").is_file() else None
-    )
-
     result = {
         **prev_result,
         "ok": True,
         "spatial_format": norm_format,
         "ambisonics_order": eff_order if norm_format != "atmos" else None,
         "target_lufs": lufs,
+        "effective_target_lufs": lufs,
+        "loudness_mode": eff_loudness_mode,
+        "original_lufs": original_lufs,
+        "dialog_pan_mode": eff_pan_mode,
+        "enable_dialog_ducking": eff_ducking,
         "remix_elapsed_sec": elapsed,
         "working_video": str(working_video.resolve()),
         "scene_path": str(scene_path.resolve()),

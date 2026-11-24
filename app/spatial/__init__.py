@@ -42,6 +42,7 @@ from .hrtf import (
 )
 from .mastering import (
     LOUDNESS_PRESETS,
+    compute_dialog_ducking_gain,
     linked_bus_compressor,
     master_audio,
     measure_audio_metrics,
@@ -73,6 +74,7 @@ __all__ = [
     "write_adm_bwf",
     "validate_adm_bwf",
     "process_dialog_stem",
+    "compute_dialog_ducking_gain",
     "linked_bus_compressor",
     "true_peak_limiter",
     "measure_lufs",
@@ -166,27 +168,91 @@ def write_spatial_wav(
     return path, wav_format
 
 
-def _prepare_dialog_overrides(
+def _prepare_stem_overrides(
     scene_dict: dict[str, Any],
     base_dir: str | None,
     sample_rate: int,
-) -> dict[str, np.ndarray]:
-    """`role == "dialog"` のステムへダイアログ保護フィルタ（80Hz HPF + 軽プレゼンス）を前処理適用する。"""
+    enable_dialog_ducking: bool = True,
+) -> tuple[dict[str, np.ndarray], bool]:
+    """セリフ処理チェーンと発話連動サイドチェインダッキング（BGM -3dB / SFX・Foley -2dB）を適用する。"""
     overrides: dict[str, np.ndarray] = {}
-    for idx, obj in enumerate(scene_dict.get("objects") or []):
+    objects = scene_dict.get("objects") or []
+    dialog_monos: list[np.ndarray] = []
+
+    for idx, obj in enumerate(objects):
         if obj.get("muted", False) or not obj.get("enabled", True):
             continue
-        if str(obj.get("role", "")).lower() != "dialog":
-            continue
-        if obj.get("disable_dialog_protection", False):
+        if str(obj.get("role", "")).strip().lower() != "dialog":
             continue
         audio_path = obj.get("audio_path")
         if not audio_path:
             continue
         obj_id = str(obj.get("id", f"obj_{idx}"))
         audio, _ = load_audio_48k(audio_path, base_dir=base_dir, target_sr=sample_rate, mono=False)
-        overrides[obj_id] = process_dialog_stem(audio, sample_rate=sample_rate)
-    return overrides
+        if obj.get("disable_dialog_protection", False):
+            processed = audio
+        else:
+            processed = process_dialog_stem(audio, sample_rate=sample_rate)
+            overrides[obj_id] = processed
+
+        gain_lin = float(10.0 ** (float(obj.get("gain_db", 0.0)) / 20.0))
+        if processed.ndim == 1:
+            mono = processed.astype(np.float64)
+        elif processed.shape[1] == 1:
+            mono = processed[:, 0].astype(np.float64)
+        else:
+            mono = np.mean(processed, axis=1, dtype=np.float64)
+        dialog_monos.append(mono * gain_lin)
+
+    if not enable_dialog_ducking or not dialog_monos:
+        return overrides, False
+
+    max_len = max(m.shape[0] for m in dialog_monos)
+    duration_sec = float(scene_dict.get("duration_sec") or 0.0)
+    if duration_sec > 0.0:
+        max_len = max(max_len, int(round(duration_sec * sample_rate)))
+    if max_len <= 0:
+        return overrides, False
+
+    dialog_bus = np.zeros(max_len, dtype=np.float64)
+    for m in dialog_monos:
+        dialog_bus[: m.shape[0]] += m
+
+    duck_music = compute_dialog_ducking_gain(dialog_bus, sample_rate=sample_rate, duck_db=-3.0)
+    if float(np.min(duck_music)) >= 0.995:
+        return overrides, False
+
+    duck_sfx = compute_dialog_ducking_gain(dialog_bus, sample_rate=sample_rate, duck_db=-2.0)
+    ducking_applied = False
+
+    for idx, obj in enumerate(objects):
+        if obj.get("muted", False) or not obj.get("enabled", True):
+            continue
+        role = str(obj.get("role", "")).strip().lower()
+        if role not in ("music", "sfx", "foley"):
+            continue
+        audio_path = obj.get("audio_path")
+        if not audio_path:
+            continue
+        obj_id = str(obj.get("id", f"obj_{idx}"))
+        audio, _ = load_audio_48k(audio_path, base_dir=base_dir, target_sr=sample_rate, mono=False)
+        n_sig = audio.shape[0]
+        if n_sig == 0:
+            continue
+
+        gain_curve = duck_music if role == "music" else duck_sfx
+        if gain_curve.shape[0] >= n_sig:
+            g = gain_curve[:n_sig]
+        else:
+            g = np.pad(gain_curve, (0, n_sig - gain_curve.shape[0]), mode="constant", constant_values=1.0)
+
+        if audio.ndim == 1:
+            overrides[obj_id] = (audio * g).astype(np.float32)
+        else:
+            overrides[obj_id] = (audio * g[:, np.newaxis]).astype(np.float32)
+        ducking_applied = True
+
+    return overrides, ducking_applied
 
 
 def render_spatial_mix(
@@ -198,6 +264,7 @@ def render_spatial_mix(
     hrtf_sofa_path: str | None = None,
     base_dir: str | None = None,
     progress_cb: Callable[..., Any] | None = None,
+    enable_dialog_ducking: bool | None = None,
 ) -> dict[str, Any]:
     """CineSS 空間音響レンダリング＆マスタリング統一エントリ関数。
 
@@ -210,6 +277,7 @@ def render_spatial_mix(
         hrtf_sofa_path: 実測 SOFA ファイルパス（省略または読込不可時は内蔵物理モデルへ自動フォールバック）。
         base_dir: `audio_path` が相対パスだった場合の基準ディレクトリ。
         progress_cb: 進捗コールバック `(progress: float, message: str)`。
+        enable_dialog_ducking: 発話連動の BGM/SFX サイドチェインダッキング有効化（None 時は scene_dict["mix_settings"] 参照・既定 True）。
 
     Returns:
         `{"binaural_wav", "master_spatial_wav", "surround_714_wav", "metrics": {...}}`
@@ -219,12 +287,23 @@ def render_spatial_mix(
 
     fmt, resolved_order = resolve_spatial_format(spatial_format, ambisonics_order=ambisonics_order)
 
+    if enable_dialog_ducking is None:
+        mix_settings = scene_dict.get("mix_settings")
+        eff_ducking = bool(mix_settings.get("enable_dialog_ducking", True)) if isinstance(mix_settings, dict) else True
+    else:
+        eff_ducking = bool(enable_dialog_ducking)
+
     sr = SAMPLE_RATE
     _emit_progress(progress_cb, 0.05, "HRTF 空間音響エンジンを初期化しています")
     hrtf_engine = HRTFEngine(sofa_path=hrtf_sofa_path, sample_rate=sr)
 
-    _emit_progress(progress_cb, 0.15, "ダイアログ保護フィルタとステム前処理を実行しています")
-    dialog_overrides = _prepare_dialog_overrides(scene_dict, base_dir=base_dir, sample_rate=sr)
+    _emit_progress(progress_cb, 0.15, "ダイアログ処理とダッキング・ステム前処理を実行しています")
+    stem_overrides, ducking_applied = _prepare_stem_overrides(
+        scene_dict,
+        base_dir=base_dir,
+        sample_rate=sr,
+        enable_dialog_ducking=eff_ducking,
+    )
 
     binaural_wav = out_path / "binaural.wav"
     surround_714_wav: Path | None = None
@@ -239,7 +318,7 @@ def render_spatial_mix(
             "Dolby Atmos 互換（ITU-R BS.2076 7.1.4 Bed + Dynamic Objects）をレンダリングしています",
         )
         renderer = AtmosRenderer(hrtf_engine=hrtf_engine, sample_rate=sr)
-        rendered = renderer.render_scene(scene_dict, base_dir=base_dir, audio_overrides=dialog_overrides)
+        rendered = renderer.render_scene(scene_dict, base_dir=base_dir, audio_overrides=stem_overrides)
 
         _emit_progress(progress_cb, 0.65, "バイノーラル＆7.1.4ミックスをマスタリング・ラウドネス正規化しています")
         binaural_master, bin_metrics = master_audio(
@@ -304,7 +383,7 @@ def render_spatial_mix(
         n_ch = ambisonics_channel_count(order)
         _emit_progress(progress_cb, 0.30, f"Ambisonics AmbiX ({order}次 / {n_ch}ch) をレンダリングしています")
         renderer = AmbisonicsRenderer(order=order, hrtf_engine=hrtf_engine, sample_rate=sr)
-        rendered = renderer.render_scene(scene_dict, base_dir=base_dir, audio_overrides=dialog_overrides)
+        rendered = renderer.render_scene(scene_dict, base_dir=base_dir, audio_overrides=stem_overrides)
 
         _emit_progress(progress_cb, 0.65, "バイノーラル出力と AmbiX マスターをマスタリングしています")
         binaural_master, bin_metrics = master_audio(
@@ -342,6 +421,9 @@ def render_spatial_mix(
         "correlation": float(bin_metrics["correlation"]),
         "format": fmt,
         "hrtf_source": hrtf_engine.source_name,
+        "diffuse_field_eq": bool(hrtf_engine.diffuse_field_eq_applied),
+        "dialog_ducking_applied": bool(ducking_applied),
+        "target_lufs": round(float(target_lufs), 2),
         "channels": int(master_channels),
         "container": master_container,
     }

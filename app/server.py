@@ -94,7 +94,10 @@ class CreateJobRequest(BaseModel):
     spatial_format: str = "atmos"
     ambisonics_order: Optional[int] = Field(default=None, ge=1, le=7)
     quality_preset: str = "auto"
-    target_lufs: float = -18.0
+    target_lufs: Optional[float] = None
+    loudness_mode: Optional[str] = None  # "match_original" | "fixed"
+    dialog_pan_mode: str = "cinema"      # "cinema" | "immersive"
+    enable_dialog_ducking: bool = True
     foley_prompt: str = ""
     allow_foley_fallback: bool = False
     preview_start: float = 0.0
@@ -109,6 +112,9 @@ class RemixRequest(BaseModel):
     spatial_format: Optional[str] = None
     ambisonics_order: Optional[int] = Field(default=None, ge=1, le=7)
     target_lufs: Optional[float] = None
+    loudness_mode: Optional[str] = None
+    dialog_pan_mode: Optional[str] = None
+    enable_dialog_ducking: Optional[bool] = None
 
 
 class AgentHeartbeatRequest(BaseModel):
@@ -269,6 +275,47 @@ def _normalize_quality(preset: str) -> str:
     if q in ("auto", "high", "standard", "fast"):
         return q
     return "auto"
+
+
+def _normalize_dialog_pan_mode(mode: Optional[str]) -> str:
+    """セリフ定位モード（cinema / immersive）を正規化する。"""
+    m = (mode or "cinema").strip().lower()
+    return "immersive" if m == "immersive" else "cinema"
+
+
+def _resolve_loudness_request(
+    loudness_mode: Optional[str],
+    target_lufs: Optional[float],
+    fallback_mode: Optional[str] = None,
+    fallback_lufs: Optional[float] = None,
+) -> tuple[str, Optional[float]]:
+    """loudness_mode と target_lufs を後方互換を保って解決する。"""
+    if loudness_mode is not None:
+        lm = str(loudness_mode).strip().lower()
+        if lm in ("match_original", "match", "auto"):
+            return "match_original", None
+        if target_lufs is not None:
+            return "fixed", float(target_lufs)
+        if fallback_lufs is not None:
+            return "fixed", float(fallback_lufs)
+        return "fixed", -18.0
+
+    # loudness_mode 未指定かつ target_lufs に数値がある既存呼び出しは "fixed" とする
+    if target_lufs is not None:
+        return "fixed", float(target_lufs)
+
+    # 両方未指定時はフォールバック（新規ジョブでは match_original、再Mix時は元設定を維持）
+    if fallback_mode is not None:
+        fm = str(fallback_mode).strip().lower()
+        if fm in ("match_original", "match", "auto"):
+            return "match_original", None
+        if fallback_lufs is not None:
+            return "fixed", float(fallback_lufs)
+        return "fixed", -18.0
+
+    if fallback_lufs is not None:
+        return "fixed", float(fallback_lufs)
+    return "match_original", None
 
 
 def _job_dir(job_id: str) -> Path:
@@ -1118,6 +1165,11 @@ def api_create_job(req: CreateJobRequest) -> dict[str, Any]:
         req.spatial_format, req.ambisonics_order
     )
     quality_preset = _normalize_quality(req.quality_preset)
+    loudness_mode, target_lufs = _resolve_loudness_request(
+        req.loudness_mode, req.target_lufs
+    )
+    dialog_pan_mode = _normalize_dialog_pan_mode(req.dialog_pan_mode)
+    enable_dialog_ducking = bool(req.enable_dialog_ducking)
     preview_start = max(0.0, float(req.preview_start or 0.0))
     preview_duration = (
         max(1.0, float(req.preview_duration))
@@ -1138,7 +1190,10 @@ def api_create_job(req: CreateJobRequest) -> dict[str, Any]:
         "spatial_format": spatial_format,
         "ambisonics_order": ambi_order,
         "quality_preset": quality_preset,
-        "target_lufs": float(req.target_lufs),
+        "loudness_mode": loudness_mode,
+        "target_lufs": target_lufs,
+        "dialog_pan_mode": dialog_pan_mode,
+        "enable_dialog_ducking": enable_dialog_ducking,
         "foley_prompt": (req.foley_prompt or "").strip(),
         "allow_foley_fallback": bool(req.allow_foley_fallback),
         "preview_start": preview_start,
@@ -1331,6 +1386,11 @@ def api_job_remix(job_id: str, req: RemixRequest) -> dict[str, Any]:
                 detail="ジョブが現在処理中のため、完了後に再Mixを実行してください",
             )
         orig_req = st.get("request") or {}
+        orig_mix = (
+            updated_scene.get("mix_settings")
+            if isinstance(updated_scene.get("mix_settings"), dict)
+            else {}
+        )
         if req.spatial_format is not None:
             raw_fmt = req.spatial_format
             raw_order = req.ambisonics_order
@@ -1342,11 +1402,39 @@ def api_job_remix(job_id: str, req: RemixRequest) -> dict[str, Any]:
                 else orig_req.get("ambisonics_order")
             )
         spatial_format, ambi_order = _normalize_spatial_format(raw_fmt, raw_order)
-        target_lufs = float(
-            req.target_lufs
-            if req.target_lufs is not None
-            else orig_req.get("target_lufs", -18.0)
+
+        fallback_lufs = (
+            orig_req.get("target_lufs")
+            if orig_req.get("target_lufs") is not None
+            else orig_mix.get("target_lufs")
         )
+        loudness_mode, target_lufs = _resolve_loudness_request(
+            req.loudness_mode,
+            req.target_lufs,
+            fallback_mode=orig_req.get("loudness_mode") or orig_mix.get("loudness_mode"),
+            fallback_lufs=fallback_lufs,
+        )
+        raw_pan_mode = (
+            req.dialog_pan_mode
+            if req.dialog_pan_mode is not None
+            else (orig_req.get("dialog_pan_mode") or orig_mix.get("dialog_pan_mode") or "cinema")
+        )
+        dialog_pan_mode = _normalize_dialog_pan_mode(raw_pan_mode)
+        if req.enable_dialog_ducking is not None:
+            enable_dialog_ducking = bool(req.enable_dialog_ducking)
+        elif orig_req.get("enable_dialog_ducking") is not None:
+            enable_dialog_ducking = bool(orig_req.get("enable_dialog_ducking"))
+        elif orig_mix.get("enable_dialog_ducking") is not None:
+            enable_dialog_ducking = bool(orig_mix.get("enable_dialog_ducking"))
+        else:
+            enable_dialog_ducking = True
+
+        lufs_label = (
+            "元音声に合わせる (Match Original)"
+            if loudness_mode == "match_original" or target_lufs is None
+            else f"{target_lufs:.1f} LKFS"
+        )
+
         st["status"] = "remixing"
         st["stage"] = "remix"
         st["progress"] = 10.0
@@ -1354,7 +1442,7 @@ def api_job_remix(job_id: str, req: RemixRequest) -> dict[str, Any]:
         st["cancel_requested"] = False
         _append_log(
             st,
-            f"3D空間配置の再Mixを開始しました（形式: {spatial_format} / 目標: {target_lufs:.1f} LKFS）。",
+            f"3D空間配置の再Mixを開始しました（形式: {spatial_format} / 目標: {lufs_label} / セリフ定位: {dialog_pan_mode} / ダッキング: {'ON' if enable_dialog_ducking else 'OFF'}）。",
             actor="user",
             stage="remix",
         )
@@ -1365,17 +1453,36 @@ def api_job_remix(job_id: str, req: RemixRequest) -> dict[str, Any]:
     try:
         from app.pipeline import remix_job
 
+        sig_params = inspect.signature(remix_job).parameters
+        has_var_kw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values()
+        )
         remix_kwargs: dict[str, Any] = {
             "spatial_format": spatial_format,
-            "target_lufs": target_lufs,
             "progress_cb": progress_cb,
             "log_cb": log_cb,
         }
-        if ambi_order is not None and "ambisonics_order" in inspect.signature(remix_job).parameters:
+        if "loudness_mode" in sig_params or has_var_kw:
+            remix_kwargs["loudness_mode"] = loudness_mode
+            remix_kwargs["target_lufs"] = target_lufs
+        else:
+            remix_kwargs["target_lufs"] = (
+                float(target_lufs) if target_lufs is not None else -18.0
+            )
+        if ambi_order is not None and ("ambisonics_order" in sig_params or has_var_kw):
             remix_kwargs["ambisonics_order"] = ambi_order
+        if "dialog_pan_mode" in sig_params or has_var_kw:
+            remix_kwargs["dialog_pan_mode"] = dialog_pan_mode
+        if "enable_dialog_ducking" in sig_params or has_var_kw:
+            remix_kwargs["enable_dialog_ducking"] = enable_dialog_ducking
+
+        scene_file = jdir / "scene.json"
+        prev_scene_mtime = scene_file.stat().st_mtime_ns if scene_file.is_file() else None
         new_result = remix_job(jdir, updated_scene, **remix_kwargs)
-        # 念のため編集後 scene.json を確実に最新化
-        _atomic_write_json(jdir / "scene.json", updated_scene)
+        cur_scene_mtime = scene_file.stat().st_mtime_ns if scene_file.is_file() else None
+        # pipeline.remix_job が scene.json を更新済みなら保持し、未生成/未更新時のみ書き込む
+        if cur_scene_mtime is None or cur_scene_mtime == prev_scene_mtime:
+            _atomic_write_json(scene_file, updated_scene)
 
         with _state_lock:
             st = _read_job_state(job_id) or {"job_id": job_id}
@@ -1386,7 +1493,18 @@ def api_job_remix(job_id: str, req: RemixRequest) -> dict[str, Any]:
             if isinstance(st.get("request"), dict):
                 st["request"]["spatial_format"] = spatial_format
                 st["request"]["ambisonics_order"] = ambi_order
-                st["request"]["target_lufs"] = target_lufs
+                st["request"]["loudness_mode"] = loudness_mode
+                if (
+                    loudness_mode == "match_original"
+                    and req.loudness_mode is None
+                    and req.target_lufs is None
+                ):
+                    # 明示指定なしの再Mix時は元の target_lufs 設定（None 等）を壊さず維持する
+                    pass
+                else:
+                    st["request"]["target_lufs"] = target_lufs
+                st["request"]["dialog_pan_mode"] = dialog_pan_mode
+                st["request"]["enable_dialog_ducking"] = enable_dialog_ducking
             st["result"] = new_result
             st["error"] = None
             elapsed = round(_now_ts() - t0, 2)

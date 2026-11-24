@@ -456,17 +456,30 @@
               <div class="field-group">
                 <label for="select-lufs">目標ラウドネス（ITU-R BS.1770-4）</label>
                 <select id="select-lufs" class="studio-select">
+                  <option value="match_original" selected>元音声に合わせる（A/B 等音量・推奨）</option>
+                  <option value="-14">Web / ヘッドホン推奨 (-14 LKFS)</option>
+                  <option value="-18">Dolby Atmos 配信基準 (-18 LKFS)</option>
                   <option value="-24">Cinema 映画劇場基準 (-24 LKFS)</option>
-                  <option value="-18" selected>Dolby Atmos 配信基準 (-18 LKFS)</option>
-                  <option value="-14">Web / YouTube 基準 (-14 LKFS)</option>
                 </select>
               </div>
+            </div>
+
+            <div class="field-group mt-sm">
+              <label for="select-dialog-pan-mode">セリフ空間定位モード</label>
+              <select id="select-dialog-pan-mode" class="studio-select">
+                <option value="cinema" selected>🎬 シネマ（映画ダビング準拠・センター軸）</option>
+                <option value="immersive">🎧 イマーシブ（広角立体定位）</option>
+              </select>
             </div>
 
             <div class="option-checks">
               <label class="toggle-line">
                 <input id="chk-dereverb" type="checkbox" checked>
                 <span class="toggle-label">セリフの残響除去（Dereverb）を有効にする <small>部屋の響きを抑えて3D定位をくっきり再現</small></span>
+              </label>
+              <label class="toggle-line">
+                <input id="chk-dialog-ducking" type="checkbox" checked>
+                <span class="toggle-label">セリフ優先ダッキングを有効にする <small>発話中のみBGM・効果音を自然に抑えて声を明瞭化</small></span>
               </label>
             </div>
 
@@ -830,7 +843,7 @@
           <!-- 再Mix設定＆実行ボタン -->
           <div class="remix-action-bar">
             <div class="remix-params">
-              <div class="field-group">
+              <div class="field-group field-span-2">
                 <label for="remix-format">出力フォーマット</label>
                 <select id="remix-format" class="studio-select studio-select-sm">
                   <option value="atmos">Dolby Atmos 互換 (ADM BWF + 7.1.4・完全フリー)</option>
@@ -843,15 +856,29 @@
               <div class="field-group">
                 <label for="remix-lufs">目標LUFS</label>
                 <select id="remix-lufs" class="studio-select studio-select-sm">
-                  <option value="-24">-24 LKFS (Cinema)</option>
-                  <option value="-18" selected>-18 LKFS (Atmos)</option>
+                  <option value="match_original" selected>元音声に合わせる</option>
                   <option value="-14">-14 LKFS (Web)</option>
+                  <option value="-18">-18 LKFS (Atmos)</option>
+                  <option value="-24">-24 LKFS (Cinema)</option>
+                </select>
+              </div>
+              <div class="field-group">
+                <label for="remix-dialog-pan-mode">セリフ定位モード</label>
+                <select id="remix-dialog-pan-mode" class="studio-select studio-select-sm">
+                  <option value="cinema" selected>🎬 シネマ（映画基準）</option>
+                  <option value="immersive">🎧 イマーシブ（広角）</option>
                 </select>
               </div>
             </div>
-            <button id="btn-remix-apply" class="btn btn-amber btn-remix" type="button">
-              <span>🔄 この配置で再Mix</span>
-            </button>
+            <div class="remix-footer-row">
+              <label class="toggle-line remix-ducking-toggle">
+                <input id="chk-remix-ducking" type="checkbox" checked>
+                <span class="toggle-label">セリフ優先ダッキングを有効にする</span>
+              </label>
+              <button id="btn-remix-apply" class="btn btn-amber btn-remix" type="button">
+                <span>🔄 この配置で再Mix</span>
+              </button>
+            </div>
           </div>
 
           <!-- 個別ステム試聴＆DL -->

@@ -204,42 +204,62 @@ def direction_to_unit_vector(azimuth_deg: float, elevation_deg: float) -> np.nda
 # ---------------------------------------------------------------------------
 
 
-def distance_direct_gain(distance_m: float, ref_distance_m: float = 1.0) -> float:
-    """逆距離則ベースの直接音ゲイン（安全な近距離クランプ付き）。
+def distance_direct_gain(
+    distance_m: float,
+    ref_distance_m: float = 1.0,
+    role: str = "sfx",
+) -> float:
+    """逆距離則ベースの直接音ゲイン（安全な近距離クランプ＆セリフ専用 Perspective 付き）。
 
-    1.0m -> 1.0 (0 dB), 2.0m -> -5.4 dB, 8.0m -> -16.3 dB。
+    - role != "dialog": 1.0m -> 1.0 (0 dB), 2.0m -> -5.4 dB, 8.0m -> -16.3 dB
+    - role == "dialog": 2.0m -> 1.0 (0 dB), clip((2.0 / d) ** 0.50, 0.38, 1.22)
     """
     d = float(clamp_distance_m(distance_m))
+    if str(role or "sfx").strip().lower() == "dialog":
+        return float(np.clip((2.0 / d) ** 0.50, 0.38, 1.22))
     return float((ref_distance_m / d) ** 0.9)
 
 
-def distance_reverb_send(distance_m: float, rt60_sec: float = 0.45) -> float:
+def distance_reverb_send(
+    distance_m: float,
+    rt60_sec: float = 0.45,
+    role: str = "sfx",
+) -> float:
     """距離に応じたリバーブセンド量。
 
     実空間では拡散音場レベルは距離に対してほぼ一定（遠方で緩やかに増加）のため、
     直接音が 1/d で減衰するのと相まって Direct-to-Reverb 比が距離で大きく変化しつつ、
     遠距離の総音量もしっかり減衰する物理バランスを保つ。
+    role == "dialog" の場合は明瞭度保護のため通常の 0.55 倍に抑制する。
     """
     d = float(clamp_distance_m(distance_m))
     rt_scale = math.sqrt(max(0.15, min(float(rt60_sec), 3.0)) / 0.45)
     # 1.0m -> 約0.09 (非常にドライ), 8.0m -> 約0.18 (残響比大幅増かつ総音量は1.0mより約10dB減衰)
     base = 0.065 + 0.028 * math.log2(max(d, 0.5) / 0.5)
-    return float(min(0.32, base * rt_scale))
+    send = min(0.32, base * rt_scale)
+    if str(role or "sfx").strip().lower() == "dialog":
+        send *= 0.55
+    return float(send)
 
 
-def air_absorption_cutoff_hz(distance_m: float) -> float:
+def air_absorption_cutoff_hz(distance_m: float, role: str = "sfx") -> float:
     """距離依存の空気吸収 LPF カットオフ周波数 (Hz)。
 
-    1.0m 以下はほぼフラット (20kHz)、8.0m では約 3.4kHz まで滑らかに高域が減衰する。
+    1.0m 以下（dialog は 2.0m 以下）はほぼフラット (20kHz)、遠距離では滑らかに高域が減衰する。
     """
     d = float(clamp_distance_m(distance_m))
-    excess = max(0.0, d - 1.0)
+    ref_d = 2.0 if str(role or "sfx").strip().lower() == "dialog" else 1.0
+    excess = max(0.0, d - ref_d)
     return float(max(2200.0, 20000.0 / (1.0 + 0.70 * excess)))
 
 
-def air_absorption_response(freqs_hz: np.ndarray, distance_m: float) -> np.ndarray:
+def air_absorption_response(
+    freqs_hz: np.ndarray,
+    distance_m: float,
+    role: str = "sfx",
+) -> np.ndarray:
     """最小位相 1次空気吸収ローパスフィルタの複素周波数応答。"""
-    fc = air_absorption_cutoff_hz(distance_m)
+    fc = air_absorption_cutoff_hz(distance_m, role=role)
     if fc >= 19900.0:
         return np.ones_like(freqs_hz, dtype=np.complex128)
     ratio = freqs_hz / fc
@@ -445,6 +465,7 @@ class HRTFEngine:
         self.ir_len = int(ir_len)
         self.source_name = "physical_woodworth_brown_duda"
         self.fallback_reason: str | None = None
+        self.diffuse_field_eq_applied: bool = False
 
         self._use_sofa = False
         self._sofa_dirs: np.ndarray | None = None
@@ -455,6 +476,102 @@ class HRTFEngine:
 
         if sofa_path is not None and str(sofa_path).strip():
             self._try_load_sofa(Path(sofa_path))
+
+    @staticmethod
+    def _apply_diffuse_field_eq(
+        irs: np.ndarray,
+        sample_rate: int,
+        dirs: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """全測定点平均の拡散音場等化（最小位相実ケプストラム逆フィルタ）と正面 0dB 正規化を適用する。"""
+        n_meas, _, n_ir = irs.shape
+        if n_meas == 0 or n_ir < 16 or sample_rate <= 0:
+            return irs.astype(np.float32, copy=False)
+
+        n_fft = max(4096, 1 << (n_ir * 4 - 1).bit_length())
+        freqs = np.fft.rfftfreq(n_fft, d=1.0 / float(sample_rate))
+        spec = np.fft.rfft(irs.astype(np.float64), n=n_fft, axis=2)
+        p_df = np.mean(np.abs(spec) ** 2, axis=(0, 1))
+
+        # 対数周波数軸で 1/6 オクターブ相当（FWHM = 1/6 oct）のガウス平滑化を適用
+        p_smooth = p_df.copy()
+        pos_mask = freqs > 0.0
+        if np.any(pos_mask):
+            f_pos = freqs[pos_mask]
+            log_f = np.log2(f_pos)
+            sigma_oct = (1.0 / 6.0) / 2.35482
+            diff = log_f[:, np.newaxis] - log_f[np.newaxis, :]
+            weights = np.exp(-0.5 * (diff / sigma_oct) ** 2)
+            weights /= np.sum(weights, axis=1, keepdims=True)
+            p_smooth[pos_mask] = weights @ p_df[pos_mask]
+            p_smooth[0] = p_smooth[1]
+
+        # 基準レベル P_ref: 300Hz〜1500Hz の平均パワー
+        ref_mask = (freqs >= 300.0) & (freqs <= 1500.0)
+        if not np.any(ref_mask):
+            ref_mask = pos_mask
+        p_ref = float(np.mean(p_smooth[ref_mask])) if np.any(ref_mask) else 1.0
+
+        raw_gain = np.sqrt(max(p_ref, 1e-12) / np.maximum(p_smooth, 1e-12))
+        gain_db = 20.0 * np.log10(np.maximum(raw_gain, 1e-12))
+
+        # 60Hz 以下と 14kHz 以上は 0 dB へ滑らかにコサインテーパーし、[-20 dB, +16 dB] にクランプ
+        w_band = np.ones_like(freqs)
+        w_band[freqs <= 20.0] = 0.0
+        low_m = (freqs > 20.0) & (freqs < 60.0)
+        if np.any(low_m):
+            log_ratio = (np.log2(freqs[low_m]) - math.log2(20.0)) / (math.log2(60.0) - math.log2(20.0))
+            w_band[low_m] = 0.5 * (1.0 - np.cos(math.pi * log_ratio))
+
+        hi_end = min(20000.0, 0.48 * float(sample_rate))
+        if hi_end > 14000.0:
+            w_band[freqs >= hi_end] = 0.0
+            hi_m = (freqs > 14000.0) & (freqs < hi_end)
+            if np.any(hi_m):
+                w_band[hi_m] = 0.5 * (1.0 + np.cos(math.pi * (freqs[hi_m] - 14000.0) / (hi_end - 14000.0)))
+
+        gain_db = np.clip(gain_db * w_band, -20.0, 16.0)
+        mag = 10.0 ** (gain_db / 20.0)
+
+        # 実ケプストラム法による因果最小位相逆応答 H_eq を生成（プリリンギングゼロ・ITD非破壊）
+        log_mag = np.log(np.maximum(mag, 1e-12))
+        cep = np.fft.irfft(log_mag, n=n_fft)
+        win = np.zeros(n_fft, dtype=np.float64)
+        win[0] = 1.0
+        win[1 : n_fft // 2] = 2.0
+        win[n_fft // 2] = 1.0
+        h_eq_spec = np.exp(np.fft.rfft(cep * win, n=n_fft))
+        h_eq = np.fft.irfft(h_eq_spec, n=n_fft)
+
+        # 全 HRIR へ畳み込み（長さ n_ir、末尾 16 サンプルコサインテーパー）
+        n_conv = 1 << (n_ir + n_fft - 1).bit_length()
+        h_eq_fft = np.fft.rfft(h_eq, n=n_conv)
+        ir_fft = np.fft.rfft(irs.astype(np.float64), n=n_conv, axis=2)
+        irs_eq = np.fft.irfft(ir_fft * h_eq_fft[np.newaxis, np.newaxis, :], n=n_conv, axis=2)[:, :, :n_ir]
+
+        taper_len = min(16, max(1, n_ir // 4))
+        taper = 0.5 * (1.0 + np.cos(np.linspace(0.0, math.pi, taper_len, dtype=np.float64)))
+        irs_eq[:, :, -taper_len:] *= taper[np.newaxis, np.newaxis, :]
+
+        # 正面 (0°, 0°) 最近傍測定点の 200Hz〜4000Hz 平均振幅（両耳 RMS）を 1.0 (0 dB) に正規化
+        n_eval = max(2048, 1 << (n_ir * 2 - 1).bit_length())
+        f_ev = np.fft.rfftfreq(n_eval, d=1.0 / float(sample_rate))
+        m_mid = (f_ev >= 200.0) & (f_ev <= 4000.0)
+        if not np.any(m_mid):
+            m_mid = f_ev > 0.0
+
+        if dirs is not None and dirs.shape[0] == n_meas:
+            front_idx = int(np.argmax(dirs[:, 0]))
+            h_front = np.fft.rfft(irs_eq[front_idx], n=n_eval, axis=1)
+            front_amp = float(np.sqrt(np.mean(np.abs(h_front[:, m_mid]) ** 2)))
+        else:
+            h_all = np.fft.rfft(irs_eq, n=n_eval, axis=2)
+            front_amp = float(np.sqrt(np.mean(np.abs(h_all[:, :, m_mid]) ** 2)))
+
+        if front_amp > 1e-9:
+            irs_eq *= 1.0 / front_amp
+
+        return irs_eq.astype(np.float32)
 
     def _try_load_sofa(self, path: Path) -> None:
         """SimpleFreeFieldHRIR 形式の SOFA (HDF5/NetCDF) を読み込む。失敗時は物理モデルへ自動フォールバック。"""
@@ -491,6 +608,13 @@ class HRTFEngine:
             el_rad = np.radians(positions[:, 1].astype(np.float64))
             c_el = np.cos(el_rad)
             dirs = np.stack([c_el * np.cos(az_rad), c_el * np.sin(az_rad), np.sin(el_rad)], axis=1)
+
+        # 少数測定点の単体テスト用合成 SOFA (n_meas < 8) を除き、拡散音場等化＋正面 0dB 正規化を適用
+        if irs.shape[0] >= 8:
+            irs = self._apply_diffuse_field_eq(irs, self.sample_rate, dirs=dirs)
+            self.diffuse_field_eq_applied = True
+        else:
+            self.diffuse_field_eq_applied = False
 
         # 各 HRIR の立ち上がり遅延（ピーク/エネルギー重心ベース）を事前計測（補間時のコムフィルタ低減用）
         onsets = np.zeros((irs.shape[0], 2), dtype=np.float64)
@@ -634,6 +758,7 @@ class HRTFEngine:
         rt60_sec: float = 0.45,
         block_size: int = 2048,
         apply_distance: bool = True,
+        role: str = "sfx",
     ) -> tuple[np.ndarray, np.ndarray]:
         """単一モノラル音源を 50% オーバーラップ Hann 窓クロスフェードで連続バイノーラル定位する。
 
@@ -684,9 +809,9 @@ class HRTFEngine:
             dist = float(dist_arr[i])
 
             if apply_distance:
-                g_dir = distance_direct_gain(dist)
-                g_rev = distance_reverb_send(dist, rt60_sec=rt60_sec)
-                h_air = air_absorption_response(freqs, dist)
+                g_dir = distance_direct_gain(dist, role=role)
+                g_rev = distance_reverb_send(dist, rt60_sec=rt60_sec, role=role)
+                h_air = air_absorption_response(freqs, dist, role=role)
             else:
                 g_dir = 1.0
                 g_rev = 0.0
