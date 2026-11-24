@@ -6,6 +6,37 @@ AI エージェント（Claude Code / Antigravity / MCP 対応クライアント
 
 ---
 
+## アプリ画面
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>1. PC動作環境チェック ＆ スペック別ガイド</strong><br>
+      <img src="docs/images/01_env_diagnostics.png" alt="PC動作環境チェック＆スペック別ガイド" width="100%"><br>
+      <sub>CPU・GPU（CUDA / MPS / VRAM）・RAM・FFmpeg・SoundSeparator 共有状況を自動診断し、Tier S〜C 別の推奨動画長と使用モデルを案内します。</sub>
+    </td>
+    <td width="50%" valign="top">
+      <strong>2. 映像アップロード ＆ 360°空間設定（Step 1）</strong><br>
+      <img src="docs/images/02_upload_settings.png" alt="映像アップロード＆サラウンド制作設定" width="100%"><br>
+      <sub>処理モード、Dolby Atmos 互換 / Ambisonics（1〜7次）規格、SFX 4層分解、AIダビング監督、360°ワールド空間拡張を設定して実行します。</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>3. AIダビング監督演出 ＆ 360°想定空間（Step 3）</strong><br>
+      <img src="docs/images/03_director_360.png" alt="AIダビング監督演出＆シーン温度分析" width="100%"><br>
+      <sub>シーン温度コンタクトシートと 360°想定空間（後方包囲・頭上ハイト・画面外通過）を確認し、JSON 編集から数秒で監督演出を再適用できます。</sub>
+    </td>
+    <td width="50%" valign="top">
+      <strong>4. 3Dトップダウン空間レーダー ＆ ミキサー（Step 3）</strong><br>
+      <img src="docs/images/04_spatial_radar_mixer.png" alt="3Dトップダウン空間レーダー＆音源トラックミキサー" width="100%"><br>
+      <sub>全方位（±180°）・距離（0.5〜12m）・仰角（±90°）・ゲインを視覚的に微調整し、再分離なしで再 Mix・個別ステム試聴が可能です。</sub>
+    </td>
+  </tr>
+</table>
+
+---
+
 ## 主な機能
 
 1. **PC動作環境チェック ＆ スペック別おすすめガイド（クロスプラットフォーム対応）**
@@ -96,6 +127,25 @@ run.bat
 
 ブラウザで **`http://127.0.0.1:8780`** が自動的に開きます（ポートは環境変数 `CINESS_PORT` で変更可能）。
 起動後、右上の **「AIモデル管理」** から必要なモデルを取得してください（隣接 `SoundSeparator` や `~/AI/HunyuanVideo-Foley` がある場合は自動で検出・共有されます）。
+
+---
+
+## 簡単な使い方（3ステップ）
+
+- **事前準備（初回のみ）**
+  - `setup.bat`（macOS / Linux は `./setup.sh`）を実行後、`run.bat`（同 `./run.sh`）で **`http://127.0.0.1:8780`** を開きます。
+  - 右上の **「📦 AIモデル管理」** から必要なモデル（音源分離・MIT KEMAR SOFA HRTF・無音 Foley 等）を取得します（隣接フォルダに `SoundSeparator` がある場合は導入済みモデルを自動共有します）。
+
+1. **Step 1：映像アップロード ＆ 設定**
+   - 動画ファイル（MP4 / MOV / MKV / WebM）をドラッグ＆ドロップします。
+   - 処理モード（`自動判定` / `有音リミックス` / `無音Foley生成`）、サラウンド規格（`Dolby Atmos 互換` または `Ambisonics 1・3・5・7次`）、各種演出オプション（`SFX 4層分解` / `AIダビング監督演出` / `360°ワールド空間拡張`）を確認して **「▶ 処理開始」** をクリックします。
+2. **Step 2：リアルタイム処理モニター**
+   - 映像解析・音源/話者分離・SFX 4層化・360°空間マスタリングの進行とログを確認します（`tools/ciness_agent.py watch` または MCP クライアント接続中は自動で受注・実行されます）。
+3. **Step 3：A/B比較・3D空間編集・書き出し**
+   - ヘッドホンを装着し、**元音声 ⇔ バイノーラル** 切替プレイヤーで立体音響の差を試聴します。
+   - **「AIダビング監督演出 ＆ シーン温度分析」** パネルで、コンタクトシートや 360°想定空間（後方包囲・頭上ハイト・画面外通過）を確認し、必要に応じて監督プランを微調整して再適用します。
+   - **「インタラクティブ 3D トップダウン空間レーダー ＆ ミキサー」** で各音源ノードの方位角（`±180°`）・距離・仰角（`±90°`）・音量ゲインを調整し、**「この配置で再Mix」** で再分離なしの高速リミックスを行います。
+   - 完成したバイノーラル映像（MP4）、Dolby Atmos 互換（ADM BWF / 7.1.4 WAV）、Ambisonics（AmbiX WAV）、分離ステム ZIP をダウンロードします。
 
 ---
 
