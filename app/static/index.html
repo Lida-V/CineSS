@@ -1,0 +1,887 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CineSS — 映像サラウンドMixMaster &amp; バイノーラルスタジオ</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%230b1120'/><circle cx='50' cy='50' r='34' fill='none' stroke='%2322d3ee' stroke-width='5'/><circle cx='50' cy='50' r='16' fill='none' stroke='%23f59e0b' stroke-width='4'/><circle cx='50' cy='50' r='6' fill='%2322d3ee'/></svg>">
+</head>
+<body>
+  <!-- 背景アンビエント・ダビングステージ演出 -->
+  <div class="stage-bg" aria-hidden="true">
+    <div class="stage-glow glow-cyan"></div>
+    <div class="stage-glow glow-amber"></div>
+    <div class="stage-grid"></div>
+  </div>
+
+  <!-- ヘッダー -->
+  <header class="app-header">
+    <div class="header-inner">
+      <div class="brand-block">
+        <div class="brand-emblem" aria-hidden="true">
+          <span class="ring ring-outer"></span>
+          <span class="ring ring-inner"></span>
+          <span class="core-dot"></span>
+        </div>
+        <div class="brand-text">
+          <h1><span class="brand-main">Cine</span><span class="brand-accent">SS</span></h1>
+          <p class="brand-sub">映像サラウンドMixMaster &amp; バイノーラルスタジオ</p>
+        </div>
+      </div>
+
+      <div class="header-controls">
+        <div id="agent-status-badge" class="agent-badge is-offline" role="status" aria-live="polite" title="AIエージェント連携ステータス">
+          <span class="agent-dot"></span>
+          <span class="agent-icon">🤖</span>
+          <span id="agent-status-text">エージェント接続状態を確認中…</span>
+        </div>
+
+        <button id="btn-recheck-system" class="btn btn-ghost" type="button" title="CPU・GPU・RAM・モデル連携を再診断">
+          <span class="btn-icon">🩺</span> PC環境を再診断
+        </button>
+
+        <button id="btn-open-models" class="btn btn-outline-cyan" type="button" title="SoundSeparator共有モデルおよびCineSS追加モデルの管理">
+          <span class="btn-icon">📦</span> AIモデル管理
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- メインコンテナ -->
+  <main class="app-main">
+    <!-- トースト通知エリア -->
+    <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+    <!-- =================================================================
+         セクション0: PC動作環境チェック＆スペック別ガイドパネル
+    ================================================================== -->
+    <section id="system-section" class="panel system-panel" aria-labelledby="system-heading">
+      <div class="panel-head">
+        <div class="panel-title-wrap">
+          <span class="eyebrow">HARDWARE DIAGNOSTICS &amp; SPEC ADVISOR</span>
+          <h2 id="system-heading">PC動作環境チェック＆スペック別ガイド</h2>
+        </div>
+        <div class="overall-badges">
+          <span id="overall-status-pill" class="status-pill is-loading">診断中…</span>
+          <span id="tier-pill" class="tier-pill hidden">TIER -</span>
+        </div>
+      </div>
+
+      <!-- CPU / GPU / RAM 独立3カード -->
+      <div class="hw-grid">
+        <article id="hw-card-cpu" class="hw-card">
+          <div class="hw-card-head">
+            <div class="hw-label">
+              <span class="hw-icon">🧠</span>
+              <span>CPU（プロセッサ）</span>
+            </div>
+            <span id="cpu-status-badge" class="verdict-badge is-loading">確認中</span>
+          </div>
+          <div id="cpu-value" class="hw-value">計測中…</div>
+          <div id="cpu-meta" class="hw-meta">-- コア / -- スレッド</div>
+          <p id="cpu-note" class="hw-note">CPU性能とスレッド数を評価しています…</p>
+        </article>
+
+        <article id="hw-card-gpu" class="hw-card">
+          <div class="hw-card-head">
+            <div class="hw-label">
+              <span class="hw-icon">🎮</span>
+              <span>GPU（CUDA / VRAM）</span>
+            </div>
+            <span id="gpu-status-badge" class="verdict-badge is-loading">確認中</span>
+          </div>
+          <div id="gpu-value" class="hw-value">計測中…</div>
+          <div id="gpu-meta" class="hw-meta">VRAM 空き -- / 総容量 -- GB</div>
+          <p id="gpu-note" class="hw-note">GPUアクセラレーションと空きVRAMを確認しています…</p>
+        </article>
+
+        <article id="hw-card-ram" class="hw-card">
+          <div class="hw-card-head">
+            <div class="hw-label">
+              <span class="hw-icon">💾</span>
+              <span>メモリ（RAM）</span>
+            </div>
+            <span id="ram-status-badge" class="verdict-badge is-loading">確認中</span>
+          </div>
+          <div id="ram-value" class="hw-value">計測中…</div>
+          <div id="ram-meta" class="hw-meta">利用可能 -- / 総容量 -- GB</div>
+          <p id="ram-note" class="hw-note">長尺音声処理・モデル展開に必要なメモリを確認しています…</p>
+        </article>
+      </div>
+
+      <!-- FFmpeg / ディスク / SoundSeparator 連携サブバッジ行 -->
+      <div class="aux-env-bar">
+        <div id="badge-ffmpeg" class="aux-badge">
+          <span class="aux-dot"></span>
+          <span class="aux-title">FFmpeg</span>
+          <span id="ffmpeg-detail" class="aux-detail">確認中…</span>
+        </div>
+        <div id="badge-disk" class="aux-badge">
+          <span class="aux-dot"></span>
+          <span class="aux-title">ディスク空き</span>
+          <span id="disk-detail" class="aux-detail">確認中…</span>
+        </div>
+        <div id="badge-soundsep" class="aux-badge">
+          <span class="aux-dot"></span>
+          <span class="aux-title">SoundSeparator連携</span>
+          <span id="soundsep-detail" class="aux-detail">確認中…</span>
+        </div>
+        <div id="badge-ambi-limit" class="aux-badge">
+          <span class="aux-dot"></span>
+          <span class="aux-title">Ambisonics推奨上限</span>
+          <span id="ambi-limit-detail" class="aux-detail">確認中…</span>
+        </div>
+      </div>
+
+      <!-- PCスペック別 推奨動画長＆使用モデル・クオリティ品質案内パネル（2カラム） -->
+      <div class="spec-guide-wrap">
+        <div class="spec-guide-head">
+          <h3>このPCでの推奨動画長・選定モデル・期待クオリティ</h3>
+          <span id="tier-label-text" class="spec-tier-desc">実PCの計測値から最適な処理プランを算出しています…</span>
+        </div>
+
+        <div class="spec-guide-grid">
+          <!-- 有音動画カラム -->
+          <article id="guide-voiced" class="guide-card">
+            <div class="guide-card-head">
+              <div>
+                <span class="guide-tag tag-cyan">🎙️ 有音動画モード</span>
+                <h4>音声分解 ＋ 話者別声分け ＋ 3D空間Mix</h4>
+              </div>
+              <div class="guide-grade-wrap">
+                <span id="voiced-status-badge" class="verdict-badge is-loading">確認中</span>
+                <span id="voiced-grade-badge" class="grade-badge">Grade -</span>
+              </div>
+            </div>
+
+            <div id="voiced-alert" class="guide-alert hidden"></div>
+
+            <div class="guide-metrics-row">
+              <div class="guide-metric">
+                <span class="metric-k">快適推奨長</span>
+                <strong id="voiced-comfortable" class="metric-v">--</strong>
+              </div>
+              <div class="guide-metric">
+                <span class="metric-k">上限目安</span>
+                <strong id="voiced-max" class="metric-v">--</strong>
+              </div>
+              <div class="guide-metric">
+                <span class="metric-k">期待クオリティ</span>
+                <strong id="voiced-quality-label" class="metric-v">--</strong>
+              </div>
+            </div>
+
+            <div class="guide-models-box">
+              <div class="guide-models-title">選定される使用モデル</div>
+              <dl id="voiced-models-list" class="model-kv-list">
+                <dt>音源分離</dt><dd id="voiced-model-sep">--</dd>
+                <dt>話者分離</dt><dd id="voiced-model-diar">--</dd>
+                <dt>重なり処理</dt><dd id="voiced-model-overlap">--</dd>
+                <dt>映像解析</dt><dd id="voiced-model-vision">--</dd>
+              </dl>
+            </div>
+
+            <p id="voiced-reason" class="guide-reason">診断結果を待機しています…</p>
+          </article>
+
+          <!-- 無音動画カラム -->
+          <article id="guide-silent" class="guide-card">
+            <div class="guide-card-head">
+              <div>
+                <span class="guide-tag tag-amber">🎬 無音動画モード</span>
+                <h4>HunyuanVideo-Foley生成 ＋ 3D空間Mix</h4>
+              </div>
+              <div class="guide-grade-wrap">
+                <span id="silent-status-badge" class="verdict-badge is-loading">確認中</span>
+                <span id="silent-grade-badge" class="grade-badge">Grade -</span>
+              </div>
+            </div>
+
+            <div id="silent-alert" class="guide-alert hidden"></div>
+
+            <div class="guide-metrics-row">
+              <div class="guide-metric">
+                <span class="metric-k">快適推奨長</span>
+                <strong id="silent-comfortable" class="metric-v">--</strong>
+              </div>
+              <div class="guide-metric">
+                <span class="metric-k">上限目安</span>
+                <strong id="silent-max" class="metric-v">--</strong>
+              </div>
+              <div class="guide-metric">
+                <span class="metric-k">期待クオリティ</span>
+                <strong id="silent-quality-label" class="metric-v">--</strong>
+              </div>
+            </div>
+
+            <div class="guide-models-box">
+              <div class="guide-models-title">選定される使用モデル</div>
+              <dl id="silent-models-list" class="model-kv-list">
+                <dt>Foley生成</dt><dd id="silent-model-foley">--</dd>
+                <dt>VRAM節約</dt><dd id="silent-model-offload">--</dd>
+                <dt>映像解析</dt><dd id="silent-model-vision">--</dd>
+              </dl>
+            </div>
+
+            <p id="silent-reason" class="guide-reason">診断結果を待機しています…</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- ステップインジケータ -->
+    <nav class="stepper" aria-label="制作ワークフロー">
+      <button id="step-tab-1" class="step-item is-active" type="button" data-step="1">
+        <span class="step-num">01</span>
+        <span class="step-text">映像アップロード &amp; 設定</span>
+      </button>
+      <span class="step-connector" aria-hidden="true"></span>
+      <button id="step-tab-2" class="step-item" type="button" data-step="2">
+        <span class="step-num">02</span>
+        <span class="step-text">リアルタイム処理モニター</span>
+      </button>
+      <span class="step-connector" aria-hidden="true"></span>
+      <button id="step-tab-3" class="step-item" type="button" data-step="3">
+        <span class="step-num">03</span>
+        <span class="step-text">3D空間ステージ &amp; A/B試聴</span>
+      </button>
+    </nav>
+
+    <!-- =================================================================
+         ステップ1: 映像アップロード＆設定パネル
+    ================================================================== -->
+    <section id="step1-section" class="panel workspace-panel" aria-labelledby="step1-heading">
+      <div class="panel-head">
+        <div class="panel-title-wrap">
+          <span class="eyebrow">STEP 01 · SOURCE &amp; MIX CONFIGURATION</span>
+          <h2 id="step1-heading">映像アップロード ＆ サラウンド制作設定</h2>
+        </div>
+      </div>
+
+      <div class="step1-layout">
+        <!-- 左カラム：動画ドロップゾーン＆プレビュー＆自動検査結果 -->
+        <div class="upload-column">
+          <div id="dropzone" class="dropzone" role="button" tabindex="0" aria-label="動画ファイルをドロップまたはクリックして選択">
+            <div class="dz-icon-wrap">
+              <span class="dz-icon">🎞️</span>
+            </div>
+            <div class="dz-copy">
+              <p class="dz-title">動画ファイルをここにドロップ</p>
+              <p class="dz-sub">または <span class="dz-link">ファイルを選択</span>（MP4 / MOV / MKV / WebM）</p>
+              <p class="dz-hint">音声の有無を自動判定し、有音リミックス／無音Foley生成を最適提案します</p>
+            </div>
+            <input id="video-file-input" type="file" accept="video/mp4,video/quicktime,video/x-matroska,video/webm,.mp4,.mov,.mkv,.webm" hidden>
+          </div>
+
+          <!-- アップロード中プログレス -->
+          <div id="upload-progress-box" class="upload-progress hidden">
+            <div class="spinner-sm"></div>
+            <span id="upload-progress-text">動画をアップロードして映像・音声特性を検査中…</span>
+          </div>
+
+          <!-- 動画プレビュー＆メタ情報カード -->
+          <div id="video-preview-card" class="video-preview-card hidden">
+            <div class="preview-video-wrap">
+              <video id="upload-preview-video" controls playsinline preload="metadata"></video>
+              <button id="btn-change-video" class="btn btn-xs btn-ghost preview-change-btn" type="button">別の動画に変更</button>
+            </div>
+            <div class="preview-meta">
+              <div class="preview-filename-row">
+                <strong id="preview-filename" class="preview-filename">--</strong>
+                <span id="preview-audio-badge" class="meta-badge">--</span>
+              </div>
+              <div class="preview-badges">
+                <span id="meta-duration" class="meta-chip">⏱ --</span>
+                <span id="meta-resolution" class="meta-chip">📐 --</span>
+                <span id="meta-fps" class="meta-chip">🎞 -- fps</span>
+                <span id="meta-rms" class="meta-chip">🔊 --</span>
+              </div>
+            </div>
+
+            <!-- 動画×PCスペック適合プラン診断バナー -->
+            <div id="video-plan-banner" class="plan-banner hidden">
+              <div class="plan-banner-head">
+                <span id="plan-status-badge" class="verdict-badge">確認中</span>
+                <strong id="plan-headline">この動画の処理プラン</strong>
+                <span id="plan-eta" class="plan-eta"></span>
+              </div>
+              <ul id="plan-warnings" class="plan-warnings"></ul>
+              <div id="plan-summary" class="plan-summary"></div>
+            </div>
+          </div>
+
+          <!-- お試し区間切り出しコントロール -->
+          <div id="preview-trim-box" class="sub-card trim-box">
+            <label class="toggle-line">
+              <input id="chk-preview-trim" type="checkbox">
+              <span class="toggle-label"><strong>お試し区間を指定して処理する</strong>（長尺動画の事前確認・短縮テスト用）</span>
+            </label>
+            <div id="preview-trim-fields" class="trim-fields hidden">
+              <div class="field-inline">
+                <label for="input-preview-start">開始位置（秒）</label>
+                <input id="input-preview-start" class="studio-input" type="number" min="0" step="0.5" value="0">
+              </div>
+              <div class="field-inline">
+                <label for="input-preview-duration">切り出し長さ（秒）</label>
+                <input id="input-preview-duration" class="studio-input" type="number" min="2" max="600" step="1" value="15">
+              </div>
+              <p class="field-hint">指定した区間だけを切り出して空間Mix＆バイノーラル出力します。</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- 右カラム：処理モード・サラウンド規格・詳細設定・処理開始 -->
+        <div class="config-column">
+          <!-- 処理モード -->
+          <div class="config-group">
+            <div class="config-label-row">
+              <span class="config-num">A</span>
+              <h3>処理モード</h3>
+            </div>
+            <div class="radio-grid cols-3" role="radiogroup" aria-label="処理モード">
+              <label class="select-card">
+                <input type="radio" name="proc_mode" value="auto" checked>
+                <div class="select-card-body">
+                  <div class="sc-title">✨ 自動判定</div>
+                  <div class="sc-desc">有音なら分解リミックス、無音ならFoley生成を自動選択</div>
+                </div>
+              </label>
+              <label class="select-card">
+                <input type="radio" name="proc_mode" value="voiced">
+                <div class="select-card-body">
+                  <div class="sc-title">🎙️ 有音リミックス</div>
+                  <div class="sc-desc">音源分解＋人物別声分け＋映像位置3D再現</div>
+                </div>
+              </label>
+              <label class="select-card">
+                <input type="radio" name="proc_mode" value="silent_foley">
+                <div class="select-card-body">
+                  <div class="sc-title">🎬 無音Foley生成</div>
+                  <div class="sc-desc">HunyuanVideo-Foley効果音生成＋空間Mix</div>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <!-- サラウンド規格選択 -->
+          <div class="config-group">
+            <div class="config-label-row">
+              <span class="config-num">B</span>
+              <h3>サラウンド規格（マスター出力 ＋ バイノーラル）</h3>
+            </div>
+            <div class="radio-grid cols-2" role="radiogroup" aria-label="サラウンド規格">
+              <label class="select-card is-spatial">
+                <input type="radio" name="spatial_family" value="atmos" checked>
+                <div class="select-card-body">
+                  <div class="sc-badge badge-cyan">完全フリー・国際標準</div>
+                  <div class="sc-title">Dolby Atmos 互換（ADM BWF）</div>
+                  <div class="sc-desc">ITU-R BS.2076 準拠 ADM BWF + 7.1.4 Bed + Dynamic Objects + 内蔵HRTF直接バイノーラル</div>
+                  <div class="sc-footnote">DaVinci Resolve / EAR / Reaper 等と互換（TV配信用 .ec3 (JOC) のみ外部対応ツールが必要）</div>
+                </div>
+              </label>
+              <label class="select-card is-spatial">
+                <input type="radio" name="spatial_family" value="ambisonics">
+                <div class="select-card-body">
+                  <div class="sc-badge badge-amber">1〜7次対応・360°音場</div>
+                  <div class="sc-title">Ambisonics（AmbiX ACN / SN3D）</div>
+                  <div class="sc-desc">高解像度360°球面音場 + Max-rE 仮想デコード + バイノーラル（IEM / SPARTA 準拠）</div>
+                  <div class="sc-footnote">次数を 1次(4ch)〜7次(64ch) から選択可能 · 3.5GB超は自動でRF64書き出し</div>
+                </div>
+              </label>
+            </div>
+
+            <!-- Ambisonics 次数セレクタ（1次 / 3次[推奨] / 5次 / 7次）＋ 容量・スペック適合バー -->
+            <div id="ambisonics-order-panel" class="ambi-order-panel hidden">
+              <div class="ambi-order-head">
+                <span class="ambi-order-title">🌐 Ambisonics 次数を選択（チャンネル数 = (N+1)²）</span>
+                <span id="ambi-order-verdict" class="verdict-badge is-ok">✅ 快適</span>
+              </div>
+              <div class="ambi-order-grid" role="radiogroup" aria-label="Ambisonics次数">
+                <label class="order-pill">
+                  <input type="radio" name="spatial_format" value="ambisonics_foa" data-order="1">
+                  <span class="order-pill-body">
+                    <strong>1次 FOA</strong>
+                    <small>4 ch · 軽量高速</small>
+                  </span>
+                </label>
+                <label class="order-pill">
+                  <input type="radio" name="spatial_format" value="ambisonics_hoa" data-order="3" checked>
+                  <span class="order-pill-body">
+                    <strong>3次 HOA <em class="rec-tag">推奨</em></strong>
+                    <small>16 ch · 標準高精細</small>
+                  </span>
+                </label>
+                <label class="order-pill">
+                  <input type="radio" name="spatial_format" value="ambisonics_hoa5" data-order="5">
+                  <span class="order-pill-body">
+                    <strong>5次 HOA</strong>
+                    <small>36 ch · 超高精細</small>
+                  </span>
+                </label>
+                <label class="order-pill">
+                  <input type="radio" name="spatial_format" value="ambisonics_hoa7" data-order="7">
+                  <span class="order-pill-body">
+                    <strong>7次 HOA</strong>
+                    <small>64 ch · 最大解像度</small>
+                  </span>
+                </label>
+              </div>
+              <div id="ambi-capacity-bar" class="ambi-capacity-bar">
+                <span id="ambi-capacity-text">想定マスターWAV容量（48kHz 32bit float）を計算中…</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 品質プリセット＆ラウドネス＆詳細オプション -->
+          <div class="config-group">
+            <div class="config-label-row">
+              <span class="config-num">C</span>
+              <h3>品質・マスタリング・詳細設定</h3>
+            </div>
+            <div class="settings-two-col">
+              <div class="field-group">
+                <label for="select-quality">品質プリセット</label>
+                <select id="select-quality" class="studio-select">
+                  <option value="auto" selected>PC自動最適化（推奨）</option>
+                  <option value="high">高品質（高精度分離・フル解析）</option>
+                  <option value="standard">標準（品質と速度のバランス）</option>
+                  <option value="fast">軽量高速（素早くプレビュー確認）</option>
+                </select>
+              </div>
+              <div class="field-group">
+                <label for="select-lufs">目標ラウドネス（ITU-R BS.1770-4）</label>
+                <select id="select-lufs" class="studio-select">
+                  <option value="-24">Cinema 映画劇場基準 (-24 LKFS)</option>
+                  <option value="-18" selected>Dolby Atmos 配信基準 (-18 LKFS)</option>
+                  <option value="-14">Web / YouTube 基準 (-14 LKFS)</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="option-checks">
+              <label class="toggle-line">
+                <input id="chk-dereverb" type="checkbox" checked>
+                <span class="toggle-label">セリフの残響除去（Dereverb）を有効にする <small>部屋の響きを抑えて3D定位をくっきり再現</small></span>
+              </label>
+            </div>
+
+            <!-- 無音Foleyオプション -->
+            <div id="foley-options-box" class="foley-options-box">
+              <label for="input-foley-prompt" class="foley-label">
+                🎬 無音動画用 Foley プロンプト（任意・英語推奨／空欄なら映像特徴から自動補助）
+              </label>
+              <input id="input-foley-prompt" class="studio-input" type="text" placeholder="例: footsteps on wet concrete, distant city traffic, soft wind ambience">
+              <label class="toggle-line mt-sm">
+                <input id="chk-foley-fallback" type="checkbox">
+                <span class="toggle-label">HunyuanVideo-Foley未取得時にプレビュー合成フォールバックを許可 <small>（動作確認・テスト用）</small></span>
+              </label>
+            </div>
+          </div>
+
+          <!-- 実行主体＆処理開始CTA -->
+          <div class="launch-bar">
+            <div class="exec-mode-wrap">
+              <span class="exec-label">実行主体</span>
+              <div class="segmented-control" role="radiogroup" aria-label="実行主体">
+                <label class="seg-option">
+                  <input type="radio" name="execution_mode" value="auto" checked>
+                  <span>⚡ 自動</span>
+                </label>
+                <label class="seg-option">
+                  <input type="radio" name="execution_mode" value="agent">
+                  <span>🤖 エージェントに依頼</span>
+                </label>
+                <label class="seg-option">
+                  <input type="radio" name="execution_mode" value="local">
+                  <span>💻 ローカル即時実行</span>
+                </label>
+              </div>
+              <p id="exec-mode-hint" class="exec-hint">接続中のエージェントがあれば自動依頼、未接続ならローカルで即座に実行します。</p>
+            </div>
+
+            <button id="btn-start-job" class="btn btn-primary btn-launch" type="button" disabled>
+              <span class="launch-icon">▶</span>
+              <span>処理開始</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 最近のジョブ履歴 -->
+      <div id="recent-jobs-wrap" class="recent-jobs-wrap hidden">
+        <div class="recent-jobs-head">
+          <h3>最近の制作ジョブ</h3>
+          <button id="btn-refresh-jobs" class="btn btn-xs btn-ghost" type="button">更新</button>
+        </div>
+        <div id="recent-jobs-list" class="recent-jobs-list"></div>
+      </div>
+    </section>
+
+    <!-- =================================================================
+         ステップ2: リアルタイム処理モニター（エージェント実行ビュー）
+    ================================================================== -->
+    <section id="step2-section" class="panel monitor-panel hidden" aria-labelledby="step2-heading">
+      <div class="panel-head">
+        <div class="panel-title-wrap">
+          <span class="eyebrow">STEP 02 · REALTIME PIPELINE &amp; AGENT MONITOR</span>
+          <h2 id="step2-heading">リアルタイム処理モニター</h2>
+        </div>
+        <div class="monitor-actions">
+          <span id="job-actor-pill" class="status-pill">待機中</span>
+          <button id="btn-cancel-job" class="btn btn-danger-outline btn-sm" type="button">⏹ 処理をキャンセル</button>
+          <button id="btn-back-step1" class="btn btn-ghost btn-sm" type="button">← 設定画面へ</button>
+        </div>
+      </div>
+
+      <!-- エージェント受注待機バナー（queued_for_agent 時のみ表示） -->
+      <div id="agent-wait-banner" class="agent-wait-banner hidden">
+        <div class="wait-banner-left">
+          <div class="pulse-ring"></div>
+          <div>
+            <strong>🤖 エージェントの受注を待っています…</strong>
+            <p>AIエージェント（<code>ciness_agent watch</code>）がジョブを検知すると自動で処理を開始します。お急ぎの場合はローカル即時実行へ切り替えられます。</p>
+          </div>
+        </div>
+        <button id="btn-switch-local" class="btn btn-amber" type="button">💻 ローカル即時実行へ切り替え</button>
+      </div>
+
+      <!-- エラーバナー（error時のみ表示） -->
+      <div id="job-error-banner" class="error-banner hidden">
+        <div class="error-banner-title">✕ 処理中にエラーが発生しました</div>
+        <p id="job-error-message" class="error-banner-msg"></p>
+      </div>
+
+      <!-- 全体進捗ヘッダー＆プログレスバー -->
+      <div class="progress-hero">
+        <div class="progress-meta-row">
+          <div>
+            <span id="monitor-job-filename" class="monitor-filename">--</span>
+            <span id="monitor-job-id" class="monitor-job-id"></span>
+          </div>
+          <div class="progress-numbers">
+            <span id="monitor-elapsed" class="monitor-elapsed">経過 0.0秒</span>
+            <strong id="monitor-percent" class="monitor-percent">0%</strong>
+          </div>
+        </div>
+        <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div id="monitor-progress-bar" class="progress-fill" style="width: 0%"></div>
+        </div>
+        <p id="monitor-current-message" class="monitor-message">準備中…</p>
+      </div>
+
+      <!-- パイプライン6段階進捗ランプ -->
+      <ol id="pipeline-stages" class="pipeline-stages">
+        <li class="stage-node" data-stage-group="vision">
+          <span class="stage-lamp"></span>
+          <span class="stage-num">01</span>
+          <span class="stage-name">映像解析</span>
+          <span class="stage-sub">人物・口元・動き抽出</span>
+        </li>
+        <li class="stage-node" data-stage-group="separate">
+          <span class="stage-lamp"></span>
+          <span class="stage-num">02</span>
+          <span class="stage-name">音声分離 / Foley</span>
+          <span class="stage-sub">DME分解 or Foley生成</span>
+        </li>
+        <li class="stage-node" data-stage-group="speakers">
+          <span class="stage-lamp"></span>
+          <span class="stage-num">03</span>
+          <span class="stage-name">話者別声分け</span>
+          <span class="stage-sub">人物別の単独化</span>
+        </li>
+        <li class="stage-node" data-stage-group="mapping">
+          <span class="stage-lamp"></span>
+          <span class="stage-num">04</span>
+          <span class="stage-name">3D軌跡マッピング</span>
+          <span class="stage-sub">話者↔映像位置同期</span>
+        </li>
+        <li class="stage-node" data-stage-group="spatial">
+          <span class="stage-lamp"></span>
+          <span class="stage-num">05</span>
+          <span class="stage-name">サラウンドMixMaster</span>
+          <span class="stage-sub">Atmos / Ambisonics構築</span>
+        </li>
+        <li class="stage-node" data-stage-group="mux">
+          <span class="stage-lamp"></span>
+          <span class="stage-num">06</span>
+          <span class="stage-name">バイノーラル出力</span>
+          <span class="stage-sub">HRTF＆映像結合</span>
+        </li>
+      </ol>
+
+      <!-- エージェント実行ログストリーム -->
+      <div class="log-console">
+        <div class="log-console-head">
+          <span>📡 エージェント / パイプライン実行ログ</span>
+          <span id="log-count" class="log-count">0 件</span>
+        </div>
+        <div id="monitor-log-stream" class="log-stream" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <!-- =================================================================
+         ステップ3: 3D空間ステージビューアー・A/B比較試聴・書き出し
+    ================================================================== -->
+    <section id="step3-section" class="panel studio-panel hidden" aria-labelledby="step3-heading">
+      <div class="panel-head">
+        <div class="panel-title-wrap">
+          <span class="eyebrow">STEP 03 · 3D SPATIAL STAGE · A/B AUDITION · MASTER EXPORT</span>
+          <h2 id="step3-heading">3D空間ステージ ＆ バイノーラルA/B試聴スタジオ</h2>
+        </div>
+        <div class="studio-head-actions">
+          <span class="headphone-badge">🎧 ヘッドホン着用推奨（バイノーラル立体音響）</span>
+          <button id="btn-new-project" class="btn btn-ghost btn-sm" type="button">＋ 新しい動画を作る</button>
+        </div>
+      </div>
+
+      <!-- 上段：映像A/B比較プレイヤー ＋ 品質メトリクス＆書き出し -->
+      <div class="studio-top-grid">
+        <!-- A/B 比較試聴プレイヤー -->
+        <div class="player-card">
+          <div class="player-stage">
+            <video id="studio-video" playsinline preload="auto"></video>
+            <div id="ab-overlay-badge" class="ab-overlay-badge is-binaural">🎧 バイノーラル立体音響</div>
+          </div>
+
+          <!-- トランスポート＆シークバー -->
+          <div class="transport-bar">
+            <button id="btn-play-toggle" class="btn btn-primary btn-icon-round" type="button" aria-label="再生・一時停止">▶</button>
+            <span id="time-current" class="timecode">00:00.0</span>
+            <input id="studio-seek" class="seek-slider" type="range" min="0" max="100" step="0.01" value="0" aria-label="再生位置">
+            <span id="time-duration" class="timecode">00:00.0</span>
+          </div>
+
+          <!-- ワンクリック A/B 切替トグル ＆ L/R メーター -->
+          <div class="ab-control-row">
+            <div class="ab-toggle-group" role="group" aria-label="音声A/B比較切替">
+              <button id="btn-ab-original" class="ab-btn" type="button" data-source="original">
+                <span class="ab-tag">A</span>
+                <span>元音声</span>
+              </button>
+              <button id="btn-ab-binaural" class="ab-btn is-active" type="button" data-source="binaural">
+                <span class="ab-tag">B</span>
+                <span>バイノーラル出力</span>
+              </button>
+            </div>
+
+            <div class="meter-cluster" aria-label="L/R出力音量メーター">
+              <div class="meter-row">
+                <span class="meter-ch">L</span>
+                <div class="meter-track"><div id="meter-l-fill" class="meter-fill"></div></div>
+              </div>
+              <div class="meter-row">
+                <span class="meter-ch">R</span>
+                <div class="meter-track"><div id="meter-r-fill" class="meter-fill"></div></div>
+              </div>
+            </div>
+          </div>
+          <p id="ab-engine-status" class="ab-status-note">Web Audio シームレスA/B比較エンジン待機中…</p>
+        </div>
+
+        <!-- 品質メトリクス＆書き出しカード -->
+        <div class="metrics-export-card">
+          <div class="sub-head">
+            <h3>マスタリング品質メトリクス</h3>
+            <span id="result-format-badge" class="status-pill is-ok">--</span>
+          </div>
+
+          <div class="metrics-grid">
+            <div class="metric-tile">
+              <span class="mt-label">実測ラウドネス</span>
+              <strong id="metric-lufs" class="mt-val">-- LKFS</strong>
+            </div>
+            <div class="metric-tile">
+              <span class="mt-label">True Peak</span>
+              <strong id="metric-peak" class="mt-val">-- dBTP</strong>
+            </div>
+            <div class="metric-tile">
+              <span class="mt-label">左右バランス (L-R)</span>
+              <strong id="metric-balance" class="mt-val">-- dB</strong>
+            </div>
+            <div class="metric-tile">
+              <span class="mt-label">使用 HRTF</span>
+              <strong id="metric-hrtf" class="mt-val mt-val-sm">--</strong>
+            </div>
+            <div class="metric-tile">
+              <span class="mt-label">出力チャンネル</span>
+              <strong id="metric-channels" class="mt-val mt-val-sm">--</strong>
+            </div>
+            <div class="metric-tile">
+              <span class="mt-label">処理時間</span>
+              <strong id="metric-elapsed" class="mt-val mt-val-sm">--</strong>
+            </div>
+          </div>
+
+          <div class="export-section">
+            <h3>マスター書き出し ＆ ダウンロード</h3>
+            <div class="download-grid">
+              <a id="dl-binaural-video" class="dl-btn dl-primary" href="#" download>
+                <span class="dl-ico">🎧</span>
+                <span class="dl-text"><strong>バイノーラル映像</strong><small>MP4（映像＋立体音響）</small></span>
+              </a>
+              <a id="dl-binaural-audio" class="dl-btn" href="#" download>
+                <span class="dl-ico">🎵</span>
+                <span class="dl-text"><strong>バイノーラル音声</strong><small>48kHz WAV ステレオ</small></span>
+              </a>
+              <a id="dl-master-spatial" class="dl-btn" href="#" download>
+                <span class="dl-ico">🔊</span>
+                <span class="dl-text"><strong id="dl-master-spatial-label">サラウンドマスター</strong><small id="dl-master-spatial-sub">ADM BWF / AmbiX WAV</small></span>
+              </a>
+              <a id="dl-surround-714" class="dl-btn hidden" href="#" download>
+                <span class="dl-ico">🎚️</span>
+                <span class="dl-text"><strong>7.1.4 12ch WAV</strong><small>Atmos 確認用ミックス</small></span>
+              </a>
+              <a id="dl-stems-zip" class="dl-btn" href="#" download>
+                <span class="dl-ico">📦</span>
+                <span class="dl-text"><strong>分離・話者別ステム一式</strong><small>全トラック ZIP</small></span>
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 下段：インタラクティブ 3D 空間レーダー（Canvas）＋ 右側トラックミキサー -->
+      <div class="spatial-editor-grid">
+        <!-- 左：トップダウン3D空間レーダー -->
+        <div class="radar-card">
+          <div class="radar-head">
+            <div>
+              <h3>インタラクティブ 3D トップダウン空間レーダー</h3>
+              <p class="radar-sub">各音源ノードをドラッグして方位角・距離を直感調整（再生時刻に同期して移動表示）</p>
+            </div>
+            <div class="radar-legend">
+              <span class="legend-item"><i class="dot-dialog"></i>話者/セリフ</span>
+              <span class="legend-item"><i class="dot-sfx"></i>効果音/Foley</span>
+              <span class="legend-item"><i class="dot-music"></i>BGM/環境音</span>
+            </div>
+          </div>
+          <div class="radar-canvas-wrap">
+            <canvas id="spatial-radar-canvas" width="540" height="540" aria-label="3D空間音響レーダー"></canvas>
+            <div id="radar-hover-tip" class="radar-tip hidden"></div>
+          </div>
+          <div class="radar-footer">
+            <span>正面 0°（画面中央） · 左 -90° · 右 +90° · 距離 0.5m〜12m</span>
+            <button id="btn-reset-scene" class="btn btn-xs btn-ghost" type="button">↺ 初期配置に戻す</button>
+          </div>
+        </div>
+
+        <!-- 右：トラックミキサー＆再Mixコントロール -->
+        <div class="mixer-card">
+          <div class="mixer-head">
+            <h3>音源トラックミキサー ＆ 再Mix</h3>
+            <span id="scene-dirty-badge" class="dirty-badge hidden">未反映の変更あり</span>
+          </div>
+
+          <!-- 音源トラック一覧 -->
+          <div id="track-list" class="track-list"></div>
+
+          <!-- 選択中オブジェクトの詳細スライダー -->
+          <div id="selected-track-inspector" class="track-inspector">
+            <div class="inspector-head">
+              <strong id="insp-title">音源を選択してください</strong>
+              <span id="insp-role-badge" class="meta-chip">--</span>
+            </div>
+
+            <div class="slider-grid">
+              <label class="slider-row">
+                <div class="slider-label-row">
+                  <span>🔊 音量ゲイン</span>
+                  <output id="val-gain">0.0 dB</output>
+                </div>
+                <input id="slider-gain" type="range" min="-24" max="12" step="0.5" value="0">
+              </label>
+
+              <label class="slider-row">
+                <div class="slider-label-row">
+                  <span>🧭 方位角（左− / 右＋）</span>
+                  <output id="val-azimuth">0°</output>
+                </div>
+                <input id="slider-azimuth" type="range" min="-180" max="180" step="1" value="0">
+              </label>
+
+              <label class="slider-row">
+                <div class="slider-label-row">
+                  <span>📏 距離（近いほどクリア・大音量）</span>
+                  <output id="val-distance">2.0 m</output>
+                </div>
+                <input id="slider-distance" type="range" min="0.5" max="12.0" step="0.1" value="2.0">
+              </label>
+
+              <label class="slider-row">
+                <div class="slider-label-row">
+                  <span>⬆️ 仰角（高さ）</span>
+                  <output id="val-elevation">0°</output>
+                </div>
+                <input id="slider-elevation" type="range" min="-45" max="45" step="1" value="0">
+              </label>
+            </div>
+
+            <label class="toggle-line mt-sm">
+              <input id="chk-apply-all-kf" type="checkbox" checked>
+              <span class="toggle-label">全フレームの軌跡に角度・距離変更を一括適用する <small>（OFF時は現在時刻付近のみ変更）</small></span>
+            </label>
+          </div>
+
+          <!-- 再Mix設定＆実行ボタン -->
+          <div class="remix-action-bar">
+            <div class="remix-params">
+              <div class="field-group">
+                <label for="remix-format">出力フォーマット</label>
+                <select id="remix-format" class="studio-select studio-select-sm">
+                  <option value="atmos">Dolby Atmos 互換 (ADM BWF + 7.1.4・完全フリー)</option>
+                  <option value="ambisonics_foa">Ambisonics 1次 FOA (4ch AmbiX)</option>
+                  <option value="ambisonics_hoa">Ambisonics 3次 HOA (16ch AmbiX・推奨)</option>
+                  <option value="ambisonics_hoa5">Ambisonics 5次 HOA (36ch AmbiX)</option>
+                  <option value="ambisonics_hoa7">Ambisonics 7次 HOA (64ch AmbiX・最大)</option>
+                </select>
+              </div>
+              <div class="field-group">
+                <label for="remix-lufs">目標LUFS</label>
+                <select id="remix-lufs" class="studio-select studio-select-sm">
+                  <option value="-24">-24 LKFS (Cinema)</option>
+                  <option value="-18" selected>-18 LKFS (Atmos)</option>
+                  <option value="-14">-14 LKFS (Web)</option>
+                </select>
+              </div>
+            </div>
+            <button id="btn-remix-apply" class="btn btn-amber btn-remix" type="button">
+              <span>🔄 この配置で再Mix</span>
+            </button>
+          </div>
+
+          <!-- 個別ステム試聴＆DL -->
+          <div id="individual-stems-box" class="stems-drawer hidden">
+            <div class="stems-drawer-head">個別ステム試聴・ダウンロード</div>
+            <div id="individual-stems-list" class="stems-chip-list"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- =================================================================
+       AIモデル管理モーダル
+  ================================================================== -->
+  <div id="models-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="models-modal-title">
+    <div class="modal-dialog">
+      <div class="modal-head">
+        <div>
+          <span class="eyebrow">AI MODEL REGISTRY · EXPLICIT DOWNLOAD ONLY</span>
+          <h2 id="models-modal-title">📦 AIモデル管理（SoundSeparator共有 ＆ CineSS追加モデル）</h2>
+        </div>
+        <button id="btn-close-models" class="btn btn-icon-close" type="button" aria-label="閉じる">✕</button>
+      </div>
+      <div class="modal-notice">
+        <p>CineSS は推論中にモデルを勝手に自動ダウンロードしません。SoundSeparator の導入済みモデルは緑バッジ「SoundSeparator共有」として自動で再利用されます。追加モデル（MIT KEMAR SOFA HRTF や HunyuanVideo-Foley 等）は以下から明示的に取得してください。</p>
+        <button id="btn-refresh-models" class="btn btn-xs btn-ghost" type="button">🔄 状態を再読み込み</button>
+      </div>
+      <div id="models-modal-body" class="modal-body">
+        <div class="loading-placeholder">モデルカタログを読み込んでいます…</div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

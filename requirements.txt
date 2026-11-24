@@ -1,0 +1,19 @@
+# CineSS 依存パッケージ（Python 3.11 環境用）
+# 注意:
+# 1. PyTorch (CUDA 12.4) は setup.bat で先に --index-url https://download.pytorch.org/whl/cu124 から導入する。
+# 2. audio-separator は絶対に導入しないこと（既存のCUDA版PyTorchをCPU版に置換しようとするため）。
+# 3. 追加の torch 依存ライブラリを導入する場合は必ず --no-deps で既存 torch を保護する。
+
+numpy>=1.26,<3
+scipy>=1.11
+soundfile>=0.12
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+opencv-python-headless>=4.9
+pyloudnorm>=0.1.1
+psutil>=5.9
+httpx>=0.27
+requests>=2.31
+h5py>=3.10
+soxr>=0.3.7

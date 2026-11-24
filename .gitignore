@@ -1,0 +1,47 @@
+# Python / 仮想環境
+.venv/
+.cache/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 環境変数・ローカル秘密情報
+.env
+.env.*
+!.env.example
+
+# ダウンロード済みAIモデル（利用者がモデル管理から明示的に取得）
+models/*.ckpt
+models/*.chpt
+models/*.th
+models/*.pt
+models/*.pth
+models/*.safetensors
+models/*.sofa
+models/*.bin
+models/*.partial
+models/hunyuanvideo-foley/
+models/nemotron-3-diarization/
+models/nemotron-reuse/
+models/sepformer/
+models/depth-anything-v2-small/
+models/hrtf/*.sofa
+
+# 外部推論コード（別途配置する場合）
+engine/
+
+# 出力・ジョブ・メディア生成物
+output/
+*.wav
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.zip
+
+# OS
+Thumbs.db
+.DS_Store
+*.log
+*.tmp

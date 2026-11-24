@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ciness": {
+      "command": ".venv/Scripts/python.exe",
+      "args": ["-X", "utf8", "tools/ciness_mcp.py"],
+      "env": {
+        "PYTHONUTF8": "1",
+        "HF_HUB_OFFLINE": "1"
+      }
+    }
+  }
+}
